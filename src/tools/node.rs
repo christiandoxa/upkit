@@ -14,7 +14,7 @@ struct NodeIndexEntry {
     lts: serde_json::Value, // false or string (codename)
 }
 
-fn node_os_arch(ctx: &Ctx) -> (String, String) {
+pub fn node_os_arch(ctx: &Ctx) -> (String, String) {
     let os = match ctx.os.as_str() {
         "linux" => "linux",
         "macos" => "darwin",
@@ -33,7 +33,7 @@ fn node_os_arch(ctx: &Ctx) -> (String, String) {
     (os, arch)
 }
 
-pub(crate) fn check_node(ctx: &Ctx) -> Result<ToolReport> {
+pub fn check_node(ctx: &Ctx) -> Result<ToolReport> {
     let installed = which_or_none("node")
         .and_then(|_| run_capture("node", &["--version"]).ok())
         .and_then(|out| Version::parse_loose(&out));
@@ -56,7 +56,7 @@ pub(crate) fn check_node(ctx: &Ctx) -> Result<ToolReport> {
     })
 }
 
-fn node_latest_lts(ctx: &Ctx) -> Result<Version> {
+pub fn node_latest_lts(ctx: &Ctx) -> Result<Version> {
     let url = "https://nodejs.org/dist/index.json";
     let idx: Vec<NodeIndexEntry> = http_get_json(ctx, url)?;
     // Index is usually newest-first, but we'll be defensive.
@@ -80,7 +80,7 @@ fn node_latest_lts(ctx: &Ctx) -> Result<Version> {
     best.ok_or_else(|| anyhow!("could not determine latest Node LTS"))
 }
 
-fn node_artifact_name(ctx: &Ctx, v: &Version) -> Result<String> {
+pub fn node_artifact_name(ctx: &Ctx, v: &Version) -> Result<String> {
     let (os, arch) = node_os_arch(ctx);
     // Prefer .tar.xz for unix, but fall back to .tar.gz.
     let base = format!("node-v{}-{}-{}", v.to_string(), os, arch);
@@ -91,7 +91,7 @@ fn node_artifact_name(ctx: &Ctx, v: &Version) -> Result<String> {
     Ok(format!("{base}.tar.xz"))
 }
 
-fn node_shasums(ctx: &Ctx, version_tag: &str) -> Result<HashMap<String, String>> {
+pub fn node_shasums(ctx: &Ctx, version_tag: &str) -> Result<HashMap<String, String>> {
     // version_tag like "v24.11.1"
     let url = format!("https://nodejs.org/dist/{}/SHASUMS256.txt", version_tag);
     let text = http_get_text(ctx, &url)?;
@@ -108,7 +108,7 @@ fn node_shasums(ctx: &Ctx, version_tag: &str) -> Result<HashMap<String, String>>
     Ok(map)
 }
 
-pub(crate) fn update_node(ctx: &Ctx) -> Result<()> {
+pub fn update_node(ctx: &Ctx) -> Result<()> {
     if ctx.offline {
         bail!("offline mode enabled; Node update requires network access");
     }
@@ -171,11 +171,8 @@ pub(crate) fn update_node(ctx: &Ctx) -> Result<()> {
     let active = tool_root.join("active");
     atomic_symlink(&extracted, &active)?;
 
-    link_dir_bins(
-        &active.join("bin"),
-        &ctx.bindir,
-        &["node", "npm", "npx", "corepack"],
-    )?;
+    let bin_dir = active.join("bin");
+    link_dir_bins(&bin_dir, &ctx.bindir, &["node", "npm", "npx", "corepack"])?;
 
     info(ctx, format!("node updated to {}", latest.to_string()));
     Ok(())

@@ -15,12 +15,12 @@ struct GhRelease {
 }
 
 #[derive(Debug, Deserialize)]
-struct GhAsset {
-    name: String,
-    browser_download_url: String,
+pub struct GhAsset {
+    pub name: String,
+    pub browser_download_url: String,
 }
 
-pub(crate) fn check_python(ctx: &Ctx) -> Result<ToolReport> {
+pub fn check_python(ctx: &Ctx) -> Result<ToolReport> {
     let installed = which_or_none("python3")
         .and_then(|_| run_capture("python3", &["--version"]).ok())
         .and_then(|out| Version::parse_loose(&out))
@@ -52,7 +52,7 @@ pub(crate) fn check_python(ctx: &Ctx) -> Result<ToolReport> {
     })
 }
 
-fn python_target(ctx: &Ctx) -> Result<&'static str> {
+pub fn python_target(ctx: &Ctx) -> Result<&'static str> {
     // Minimal targets; extend as needed.
     match (ctx.os.as_str(), ctx.arch.as_str()) {
         ("linux", "x86_64") => Ok("x86_64-unknown-linux-gnu"),
@@ -67,7 +67,7 @@ fn python_target(ctx: &Ctx) -> Result<&'static str> {
     }
 }
 
-fn python_latest(ctx: &Ctx) -> Result<Version> {
+pub fn python_latest(ctx: &Ctx) -> Result<Version> {
     // Pick the highest CPython version found in latest release assets.
     // API: /releases/latest
     let url = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest";
@@ -105,7 +105,7 @@ fn python_latest(ctx: &Ctx) -> Result<Version> {
     })
 }
 
-fn python_pick_asset(ctx: &Ctx, want: &Version) -> Result<GhAsset> {
+pub fn python_pick_asset(ctx: &Ctx, want: &Version) -> Result<GhAsset> {
     let url = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest";
     let rel: GhRelease = http_get_json(ctx, url)?;
 
@@ -137,7 +137,7 @@ fn python_pick_asset(ctx: &Ctx, want: &Version) -> Result<GhAsset> {
         .ok_or_else(|| anyhow!("no python asset found for {}", want.to_string()))
 }
 
-pub(crate) fn update_python(ctx: &Ctx) -> Result<()> {
+pub fn update_python(ctx: &Ctx) -> Result<()> {
     if ctx.offline {
         bail!("offline mode enabled; Python update requires network access");
     }

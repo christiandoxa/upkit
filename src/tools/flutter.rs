@@ -1,10 +1,9 @@
+use crate::{
+    Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, http_get_json, info, run_output,
+    run_status, which_or_none,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
-use std::process::{Command, Stdio};
-
-use crate::{
-    Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, http_get_json, info, which_or_none,
-};
 
 #[derive(Debug, Deserialize)]
 struct FlutterReleases {
@@ -18,7 +17,7 @@ struct FlutterReleaseEntry {
     // archive, hash, dart_sdk_version, release_date, etc. exist, but we only need version+channel
 }
 
-fn flutter_releases_url(ctx: &Ctx) -> Result<&'static str> {
+pub fn flutter_releases_url(ctx: &Ctx) -> Result<&'static str> {
     // official buckets provide per-OS JSON
     match ctx.os.as_str() {
         "linux" => {
@@ -34,7 +33,7 @@ fn flutter_releases_url(ctx: &Ctx) -> Result<&'static str> {
     }
 }
 
-fn flutter_latest_stable(ctx: &Ctx) -> Result<Version> {
+pub fn flutter_latest_stable(ctx: &Ctx) -> Result<Version> {
     let url = flutter_releases_url(ctx)?;
     let data: FlutterReleases = http_get_json(ctx, url)?;
     let mut best: Option<Version> = None;
@@ -43,19 +42,15 @@ fn flutter_latest_stable(ctx: &Ctx) -> Result<Version> {
             if best.as_ref().map(|b| &v > b).unwrap_or(true) {
                 best = Some(v);
             }
+            let _ = &best;
         }
     }
     best.ok_or_else(|| anyhow!("could not determine flutter latest stable"))
 }
 
-fn flutter_installed_version() -> Option<Version> {
+pub fn flutter_installed_version() -> Option<Version> {
     // flutter --version --machine outputs JSON
-    let out = Command::new("flutter")
-        .args(["--version", "--machine"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    let out = run_output("flutter", &["--version", "--machine"]).ok()?;
     if !out.status.success() {
         return None;
     }
@@ -64,7 +59,7 @@ fn flutter_installed_version() -> Option<Version> {
     Version::parse_loose(s)
 }
 
-pub(crate) fn check_flutter(ctx: &Ctx) -> Result<ToolReport> {
+pub fn check_flutter(ctx: &Ctx) -> Result<ToolReport> {
     let installed = if which_or_none("flutter").is_some() {
         flutter_installed_version()
     } else {
@@ -89,7 +84,7 @@ pub(crate) fn check_flutter(ctx: &Ctx) -> Result<ToolReport> {
     })
 }
 
-pub(crate) fn update_flutter(ctx: &Ctx) -> Result<()> {
+pub fn update_flutter(ctx: &Ctx) -> Result<()> {
     if ctx.offline {
         bail!("offline mode enabled; Flutter update requires network access");
     }
@@ -109,10 +104,7 @@ pub(crate) fn update_flutter(ctx: &Ctx) -> Result<()> {
         return Ok(());
     }
 
-    let status = Command::new("flutter")
-        .arg("upgrade")
-        .status()
-        .context("failed to run flutter upgrade")?;
+    let status = run_status("flutter", &["upgrade"]).context("failed to run flutter upgrade")?;
     if !status.success() {
         bail!("flutter upgrade failed");
     }

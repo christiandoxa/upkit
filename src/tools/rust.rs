@@ -5,7 +5,7 @@ use crate::{
     which_or_none,
 };
 
-pub(crate) fn check_rust(ctx: &Ctx) -> Result<ToolReport> {
+pub fn check_rust(ctx: &Ctx) -> Result<ToolReport> {
     let installed = which_or_none("rustc")
         .and_then(|_| run_capture("rustc", &["--version"]).ok())
         .and_then(|out| Version::parse_loose(&out));
@@ -28,7 +28,7 @@ pub(crate) fn check_rust(ctx: &Ctx) -> Result<ToolReport> {
     })
 }
 
-fn rust_latest_stable(ctx: &Ctx) -> Result<Version> {
+pub fn rust_latest_stable(ctx: &Ctx) -> Result<Version> {
     // Parse stable channel manifest.
     // URL is documented in Rust Forge channel layout.
     let url = "https://static.rust-lang.org/dist/channel-rust-stable.toml";
@@ -46,7 +46,7 @@ fn rust_latest_stable(ctx: &Ctx) -> Result<Version> {
         .ok_or_else(|| anyhow!("could not parse rustc version from manifest: {s}"))
 }
 
-pub(crate) fn update_rust(ctx: &Ctx) -> Result<()> {
+pub fn update_rust(ctx: &Ctx) -> Result<()> {
     if ctx.offline {
         bail!("offline mode enabled; Rust update requires network access");
     }

@@ -2,6 +2,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(coverage)");
     if let Some(hash) = git_hash() {
         println!("cargo:rustc-env=UPKIT_GIT_HASH={hash}");
     }

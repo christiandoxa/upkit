@@ -23,7 +23,7 @@ struct GoFile {
     sha256: String,
 }
 
-fn go_os_arch(ctx: &Ctx) -> (String, String) {
+pub fn go_os_arch(ctx: &Ctx) -> (String, String) {
     let os = match ctx.os.as_str() {
         "linux" => "linux",
         "macos" => "darwin",
@@ -42,7 +42,7 @@ fn go_os_arch(ctx: &Ctx) -> (String, String) {
     (os, arch)
 }
 
-pub(crate) fn check_go(ctx: &Ctx) -> Result<ToolReport> {
+pub fn check_go(ctx: &Ctx) -> Result<ToolReport> {
     let installed = which_or_none("go")
         .and_then(|_| run_capture("go", &["version"]).ok())
         .and_then(|out| Version::parse_loose(&out));
@@ -70,7 +70,7 @@ pub(crate) fn check_go(ctx: &Ctx) -> Result<ToolReport> {
     })
 }
 
-fn go_latest(ctx: &Ctx) -> Result<Version> {
+pub fn go_latest(ctx: &Ctx) -> Result<Version> {
     let url = "https://go.dev/dl/?mode=json";
     let releases: Vec<GoRelease> = http_get_json(ctx, url)?;
     let stable = releases
@@ -83,12 +83,13 @@ fn go_latest(ctx: &Ctx) -> Result<Version> {
             if best.as_ref().map(|b| &v > b).unwrap_or(true) {
                 best = Some(v);
             }
+            let _ = &best;
         }
     }
     best.ok_or_else(|| anyhow!("could not determine latest Go version"))
 }
 
-fn go_pick_file(ctx: &Ctx, want_version: &Version) -> Result<(String, String)> {
+pub fn go_pick_file(ctx: &Ctx, want_version: &Version) -> Result<(String, String)> {
     // returns (download_url, sha256)
     let url = "https://go.dev/dl/?mode=json";
     let releases: Vec<GoRelease> = http_get_json(ctx, url)?;
@@ -114,7 +115,7 @@ fn go_pick_file(ctx: &Ctx, want_version: &Version) -> Result<(String, String)> {
     bail!("no Go archive found for this OS/arch")
 }
 
-pub(crate) fn update_go(ctx: &Ctx) -> Result<()> {
+pub fn update_go(ctx: &Ctx) -> Result<()> {
     if ctx.offline {
         bail!("offline mode enabled; Go update requires network access");
     }
