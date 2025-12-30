@@ -59,6 +59,7 @@ fn python_pick_asset_and_check() {
     assert!(asset.name.contains("x86_64-unknown-linux-gnu"));
 
     set_which("python3", None);
+    set_which("python", None);
     set_http_plan(
         url,
         vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
