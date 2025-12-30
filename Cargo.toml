@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "One CLI to check & update Go/Rust/Node/Python/Flutter (hybrid built-in + direct-download)."
+readme = "README.md"
 repository = "https://github.com/christiandoxa/upkit"
 keywords = ["cli", "updater", "toolchain", "devtools"]
 categories = ["command-line-utilities"]
