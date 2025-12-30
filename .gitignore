@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+*.pdb
+/tests
+Cargo.lock
+
+# IntelliJ / Rust plugin
+*.iml
+.idea/
