@@ -445,6 +445,38 @@ fn download_to_temp_branches() {
 }
 
 #[test]
+fn http_get_no_test_response_left() {
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let prompt = Arc::new(TestPrompt::default());
+    let ctx = base_ctx(dir.path().join("home"), dir.path().join("bin"), prompt);
+    let url = "https://example.com/no-response";
+    set_http_plan(url, Vec::new());
+    let err = match http_get(&ctx, url) {
+        Ok(_) => panic!("expected error"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("no test response left"));
+}
+
+#[test]
+fn http_get_missing_plan_entry() {
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let prompt = Arc::new(TestPrompt::default());
+    let ctx = base_ctx(dir.path().join("home"), dir.path().join("bin"), prompt);
+    set_http_plan(
+        "https://example.com/known",
+        vec![Ok(MockResponse::new(b"ok".to_vec(), None))],
+    );
+    let err = match http_get(&ctx, "https://example.com/unknown") {
+        Ok(_) => panic!("expected error"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("no test response left"));
+}
+
+#[test]
 fn filesystem_helpers() {
     let dir = tempdir().unwrap();
     let target = dir.path().join("target");

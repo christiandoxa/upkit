@@ -1,5 +1,3 @@
-#![cfg(not(coverage))]
-
 use std::process::Command;
 
 #[test]

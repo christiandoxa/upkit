@@ -101,6 +101,21 @@ fn flutter_installed_and_check() {
 }
 
 #[test]
+fn flutter_check_not_installed() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = ctx_with_dirs();
+    set_which("flutter", None);
+    let url = "https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json";
+    let json = r#"{"releases":[{"channel":"stable","version":"3.1.0"}]}"#;
+    set_http_plan(
+        url,
+        vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
+    );
+    let report = check_flutter(&ctx).unwrap();
+    assert!(matches!(report.status, Status::NotInstalled));
+}
+
+#[test]
 fn update_flutter_paths() {
     let _guard = reset_guard();
     let (mut ctx, _dir) = ctx_with_dirs();

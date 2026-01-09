@@ -87,6 +87,24 @@ fn rust_check_outdated() {
 }
 
 #[test]
+fn rust_check_not_installed() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = ctx_with_dirs();
+    let url = "https://static.rust-lang.org/dist/channel-rust-stable.toml";
+    let toml = r#"
+        [pkg.rustc]
+        version = "1.77.1 (abc 2024-01-01)"
+    "#;
+    set_http_plan(
+        url,
+        vec![Ok(MockResponse::new(toml.as_bytes().to_vec(), None))],
+    );
+    set_which("rustc", None);
+    let report = check_rust(&ctx).unwrap();
+    assert!(matches!(report.status, Status::NotInstalled));
+}
+
+#[test]
 fn update_rust_paths() {
     let _guard = reset_guard();
     let (mut ctx, _dir) = ctx_with_dirs();
@@ -127,6 +145,54 @@ fn update_rust_paths() {
         &["update", "stable"],
         output_with_status(0, b"", b""),
     );
+    update_rust(&ctx).unwrap();
+}
+
+#[test]
+fn update_rust_missing_rustup() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = ctx_with_dirs();
+    let url = "https://static.rust-lang.org/dist/channel-rust-stable.toml";
+    let toml = r#"
+        [pkg.rustc]
+        version = "1.77.1 (abc 2024-01-01)"
+    "#;
+    set_http_plan(
+        url,
+        vec![Ok(MockResponse::new(toml.as_bytes().to_vec(), None))],
+    );
+    set_which("rustc", Some(PathBuf::from("/bin/rustc")));
+    set_run_output(
+        "rustc",
+        &["--version"],
+        output_with_status(0, b"rustc 1.77.0 (abc 2024-01-01)", b""),
+    );
+    set_which("rustup", None);
+    let err = update_rust(&ctx).unwrap_err();
+    assert!(err.to_string().contains("rustup not found"));
+}
+
+#[test]
+fn update_rust_dry_run() {
+    let _guard = reset_guard();
+    let (mut ctx, _dir) = ctx_with_dirs();
+    ctx.dry_run = true;
+    let url = "https://static.rust-lang.org/dist/channel-rust-stable.toml";
+    let toml = r#"
+        [pkg.rustc]
+        version = "1.77.1 (abc 2024-01-01)"
+    "#;
+    set_http_plan(
+        url,
+        vec![Ok(MockResponse::new(toml.as_bytes().to_vec(), None))],
+    );
+    set_which("rustc", Some(PathBuf::from("/bin/rustc")));
+    set_run_output(
+        "rustc",
+        &["--version"],
+        output_with_status(0, b"rustc 1.77.0 (abc 2024-01-01)", b""),
+    );
+    set_which("rustup", Some(PathBuf::from("/bin/rustup")));
     update_rust(&ctx).unwrap();
 }
 

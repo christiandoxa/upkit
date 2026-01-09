@@ -41,6 +41,14 @@ Update tools interactively:
 upkit update
 ```
 
+Interactive selection uses letter codes (comma-separated), for example:
+
+```bash
+# Choose items shown as a), b), c), ...
+upkit update
+# Input example: a,c,f
+```
+
 Update a specific tool:
 
 ```bash

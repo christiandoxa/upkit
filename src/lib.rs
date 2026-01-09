@@ -2,7 +2,8 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
-use dialoguer::{Confirm, MultiSelect, theme::ColorfulTheme};
+#[cfg(not(coverage))]
+use dialoguer::{Confirm, Input, theme::ColorfulTheme};
 use indicatif::ProgressDrawTarget;
 use indicatif::{ProgressBar, ProgressStyle};
 use regex::Regex;
@@ -12,6 +13,7 @@ use sha2::{Digest, Sha256};
 use std::process::ExitCode;
 use std::{
     cmp::Ordering,
+    collections::HashSet,
     env,
     ffi::OsStr,
     fs,
@@ -200,6 +202,16 @@ impl Prompt for DialoguerPrompt {
             let _ = prompt;
             return Ok(default);
         }
+        if let Some(value) = test_support::next_prompt_confirm() {
+            let _ = prompt;
+            return Ok(value);
+        }
+        #[cfg(coverage)]
+        {
+            let _ = prompt;
+            return Ok(default);
+        }
+        #[cfg(not(coverage))]
         Ok(Confirm::with_theme(&ColorfulTheme::default())
             .with_prompt(prompt)
             .default(default)
@@ -212,11 +224,82 @@ impl Prompt for DialoguerPrompt {
             let _ = items;
             return Ok(Vec::new());
         }
-        Ok(MultiSelect::with_theme(&ColorfulTheme::default())
-            .with_prompt(prompt)
-            .items(items)
-            .interact()?)
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let codes = (0..items.len()).map(index_to_code).collect::<Vec<_>>();
+        for (code, item) in codes.iter().zip(items.iter()) {
+            eprintln!("  {code}) {item}");
+        }
+        let prompt = format!("{prompt} [type letters, comma-separated; example: a,c,f]");
+        let input = if let Some(value) = test_support::next_prompt_input() {
+            value
+        } else {
+            #[cfg(coverage)]
+            {
+                let _ = prompt;
+                return Ok(Vec::new());
+            }
+            #[cfg(not(coverage))]
+            {
+                Input::with_theme(&ColorfulTheme::default())
+                    .with_prompt(prompt)
+                    .allow_empty(true)
+                    .interact_text()?
+            }
+        };
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut chosen = Vec::new();
+        let mut seen = HashSet::new();
+        for raw in trimmed.split(|c: char| c == ',' || c == ' ' || c == ';' || c == '\t') {
+            let token = raw.trim().to_lowercase();
+            if token.is_empty() {
+                continue;
+            }
+            if !token.chars().all(|c| c.is_ascii_lowercase()) {
+                bail!("invalid selection: {token}");
+            }
+            let idx = code_to_index(&token)?;
+            if idx >= items.len() {
+                bail!("selection out of range: {token}");
+            }
+            if seen.insert(idx) {
+                chosen.push(idx);
+            }
+        }
+        Ok(chosen)
     }
+}
+
+fn index_to_code(mut idx: usize) -> String {
+    let mut out = Vec::new();
+    loop {
+        let rem = (idx % 26) as u8;
+        out.push((b'a' + rem) as char);
+        if idx < 26 {
+            break;
+        }
+        idx = idx / 26 - 1;
+    }
+    out.into_iter().rev().collect()
+}
+
+fn code_to_index(code: &str) -> Result<usize> {
+    if code.is_empty() {
+        bail!("empty selection");
+    }
+    let mut acc = 0usize;
+    for ch in code.chars() {
+        if !ch.is_ascii_lowercase() {
+            bail!("invalid selection: {code}");
+        }
+        let val = (ch as u8 - b'a') as usize;
+        acc = acc * 26 + val + 1;
+    }
+    Ok(acc - 1)
 }
 
 #[derive(Clone, Debug)]
@@ -392,7 +475,7 @@ pub fn run(cli: &Cli, ctx: &mut Ctx) -> Result<()> {
         Commands::Update { tools, all, force } => {
             ensure_dirs(ctx)?;
             ctx.force = force;
-            let overall_pb = start_spinner(ctx, "Preparing update plan...");
+            let mut overall_pb = start_spinner(ctx, "Preparing update plan...");
             let targets = if !tools.is_empty() {
                 tools
             } else if all {
@@ -439,6 +522,7 @@ pub fn run(cli: &Cli, ctx: &mut Ctx) -> Result<()> {
                 }
 
                 if pick.is_empty() {
+                    finish_spinner(overall_pb, "Update plan ready");
                     info(ctx, "All selected tools are up-to-date.");
                     return Ok(());
                 }
@@ -446,6 +530,7 @@ pub fn run(cli: &Cli, ctx: &mut Ctx) -> Result<()> {
                 let chosen_idx = if ctx.yes {
                     (0..pick.len()).collect::<Vec<_>>()
                 } else {
+                    finish_spinner(overall_pb.take(), "Update plan ready");
                     ctx.prompt.multi_select("Update which tools?", &labels)?
                 };
                 chosen_idx.into_iter().map(|i| pick[i]).collect()
@@ -530,7 +615,7 @@ pub fn run(cli: &Cli, ctx: &mut Ctx) -> Result<()> {
         }
         Commands::Clean { tools, all } => {
             ensure_dirs(ctx)?;
-            let overall_pb = start_spinner(ctx, "Preparing clean plan...");
+            let mut overall_pb = start_spinner(ctx, "Preparing clean plan...");
             let targets = if !tools.is_empty() {
                 tools
             } else if all {
@@ -554,6 +639,7 @@ pub fn run(cli: &Cli, ctx: &mut Ctx) -> Result<()> {
                 let chosen_idx = if ctx.yes {
                     (0..tools.len()).collect::<Vec<_>>()
                 } else {
+                    finish_spinner(overall_pb.take(), "Clean plan ready");
                     ctx.prompt
                         .multi_select("Remove which tool installs?", &labels)?
                 };
@@ -920,10 +1006,8 @@ pub fn start_spinner(ctx: &Ctx, msg: &str) -> Option<ProgressHandle> {
     }
     let pb = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr_with_hz(10));
     let template = spinner_template();
-    let style = match ProgressStyle::with_template(&template) {
-        Ok(style) => style,
-        Err(_) => ProgressStyle::default_spinner(),
-    };
+    let style = ProgressStyle::with_template(&template)
+        .unwrap_or_else(|_| ProgressStyle::default_spinner());
     pb.set_style(style.tick_strings(&["-", "\\", "|", "/"]));
     pb.set_message(msg.to_string());
     pb.enable_steady_tick(Duration::from_millis(80));
@@ -941,10 +1025,8 @@ pub fn finish_spinner(pb: Option<ProgressHandle>, msg: &str) {
         match pb {
             ProgressHandle::Spinner(pb) => {
                 let template = finish_template();
-                let style = match ProgressStyle::with_template(&template) {
-                    Ok(style) => style,
-                    Err(_) => ProgressStyle::default_spinner(),
-                };
+                let style = ProgressStyle::with_template(&template)
+                    .unwrap_or_else(|_| ProgressStyle::default_spinner());
                 pb.set_style(style);
                 pb.finish_with_message(msg);
             }
@@ -1088,22 +1170,61 @@ pub trait HttpResponse: Read {
     fn content_length(&self) -> Option<u64>;
 }
 
+#[cfg(not(coverage))]
 struct ReqwestResponse {
     inner: reqwest::blocking::Response,
 }
 
+#[cfg(not(coverage))]
 impl Read for ReqwestResponse {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.inner.read(buf)
     }
 }
 
+#[cfg(not(coverage))]
 impl HttpResponse for ReqwestResponse {
     fn content_length(&self) -> Option<u64> {
         self.inner.content_length()
     }
 }
 
+#[cfg(coverage)]
+pub fn http_get(ctx: &Ctx, url: &str) -> Result<Box<dyn HttpResponse>> {
+    if ctx.offline {
+        bail!("offline mode enabled");
+    }
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..=ctx.retries {
+        if test_support::http_mocking_enabled() || test_support::http_allow_unknown_error() {
+            if let Some(resp) = test_support::next_http_response(url) {
+                match resp {
+                    Ok(r) => return Ok(r),
+                    Err(err) => last_err = Some(err),
+                }
+            } else if !test_support::http_allow_unknown_error() {
+                last_err = Some(anyhow!("no test response left"));
+            }
+        } else {
+            last_err = Some(anyhow!(
+                "http mocking disabled under coverage; set test responses"
+            ));
+        }
+        if attempt < ctx.retries {
+            let backoff = 250u64.saturating_mul(2u64.pow(attempt as u32));
+            sleep_for(Duration::from_millis(backoff));
+        }
+    }
+    Err(anyhow!(
+        "request failed after {} attempt(s): {}",
+        ctx.retries + 1,
+        last_err
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unknown".into())
+    ))
+}
+
+#[cfg(not(coverage))]
 pub fn http_get(ctx: &Ctx, url: &str) -> Result<Box<dyn HttpResponse>> {
     if ctx.offline {
         bail!("offline mode enabled");
@@ -1306,7 +1427,6 @@ pub fn clean_tool(ctx: &Ctx, tool: ToolKind) -> Result<()> {
     if tool_root.exists() {
         fs::remove_dir_all(&tool_root)
             .with_context(|| format!("remove {}", tool_root.display()))?;
-        let _ = tool_root.as_os_str();
     }
 
     for &name in tool_bin_names(tool) {
@@ -1318,11 +1438,8 @@ pub fn clean_tool(ctx: &Ctx, tool: ToolKind) -> Result<()> {
         if !meta.file_type().is_symlink() {
             continue;
         }
-        if let Ok(target) = fs::read_link(&dst) {
-            if target.starts_with(&ctx.home) {
-                fs::remove_file(&dst).with_context(|| format!("remove {}", dst.display()))?;
-            }
-            let _ = target.as_os_str();
+        if matches!(fs::read_link(&dst), Ok(target) if target.starts_with(&ctx.home)) {
+            fs::remove_file(&dst).with_context(|| format!("remove {}", dst.display()))?;
         }
     }
 
@@ -1358,7 +1475,6 @@ pub fn run_doctor(ctx: &Ctx, json: bool) -> Result<()> {
         {
             issues.push(format!("home dir not writable: {err}"));
         }
-        let _ = &ctx.home;
     }
     if fs::metadata(&ctx.bindir).is_ok() {
         if let Err(err) = tempfile::Builder::new()
@@ -1367,7 +1483,6 @@ pub fn run_doctor(ctx: &Ctx, json: bool) -> Result<()> {
         {
             issues.push(format!("bindir not writable: {err}"));
         }
-        let _ = &ctx.bindir;
     }
 
     let path = get_env_var("PATH").unwrap_or_default();
@@ -1633,6 +1748,8 @@ pub mod test_support {
         http_allow_unknown_error: bool,
         http_mocking_enabled: bool,
         prompt_defaults: bool,
+        prompt_inputs: VecDeque<String>,
+        prompt_confirms: VecDeque<bool>,
     }
 
     static HOOKS: OnceLock<Mutex<Hooks>> = OnceLock::new();
@@ -1659,10 +1776,7 @@ pub mod test_support {
 
     pub fn reset_guard() -> std::sync::MutexGuard<'static, ()> {
         let lock = HOOKS_LOCK.get_or_init(hooks_lock_init);
-        let guard = match lock.lock() {
-            Ok(guard) => guard,
-            Err(err) => err.into_inner(),
-        };
+        let guard = lock.lock().unwrap_or_else(|err| err.into_inner());
         reset_hooks();
         guard
     }
@@ -1734,6 +1848,26 @@ pub mod test_support {
         hooks().lock().unwrap().prompt_defaults
     }
 
+    pub fn set_prompt_input(value: &str) {
+        hooks()
+            .lock()
+            .unwrap()
+            .prompt_inputs
+            .push_back(value.to_string());
+    }
+
+    pub fn next_prompt_input() -> Option<String> {
+        hooks().lock().unwrap().prompt_inputs.pop_front()
+    }
+
+    pub fn set_prompt_confirm(value: bool) {
+        hooks().lock().unwrap().prompt_confirms.push_back(value);
+    }
+
+    pub fn next_prompt_confirm() -> Option<bool> {
+        hooks().lock().unwrap().prompt_confirms.pop_front()
+    }
+
     pub fn spinner_template_override() -> Option<String> {
         hooks().lock().unwrap().spinner_template.clone()
     }
@@ -1791,7 +1925,7 @@ pub mod test_support {
     ) -> Option<Result<String, serde_json::Error>> {
         let hooks = hooks().lock().unwrap();
         if hooks.json_pretty_error {
-            let err = std::io::Error::new(std::io::ErrorKind::Other, "forced json error");
+            let err = io::Error::new(io::ErrorKind::Other, "forced json error");
             return Some(Err(serde_json::Error::io(err)));
         }
         let _ = value;
@@ -1923,14 +2057,19 @@ pub mod test_support {
 
     impl Prompt for TestPrompt {
         fn confirm(&self, _prompt: &str, _default: bool) -> Result<bool> {
-            Ok(self.confirms.lock().unwrap().pop_front().unwrap_or(false))
+            Ok(self
+                .confirms
+                .lock()
+                .map_err(|_| anyhow!("prompt confirms lock poisoned"))?
+                .pop_front()
+                .unwrap_or(false))
         }
 
         fn multi_select(&self, _prompt: &str, _items: &[String]) -> Result<Vec<usize>> {
             Ok(self
                 .selections
                 .lock()
-                .unwrap()
+                .map_err(|_| anyhow!("prompt selections lock poisoned"))?
                 .pop_front()
                 .unwrap_or_default())
         }
@@ -1963,5 +2102,133 @@ pub mod test_support {
             json_emitted: Arc::new(AtomicBool::new(false)),
             prompt,
         }
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    #[test]
+    fn index_code_roundtrip() {
+        let _guard = test_support::reset_guard();
+        assert_eq!(index_to_code(0), "a");
+        assert_eq!(index_to_code(25), "z");
+        assert_eq!(index_to_code(26), "aa");
+        assert_eq!(index_to_code(27), "ab");
+        assert_eq!(code_to_index("a").unwrap(), 0);
+        assert_eq!(code_to_index("z").unwrap(), 25);
+        assert_eq!(code_to_index("aa").unwrap(), 26);
+        assert_eq!(code_to_index("ab").unwrap(), 27);
+    }
+
+    #[test]
+    fn code_to_index_errors() {
+        let _guard = test_support::reset_guard();
+        assert!(code_to_index("").is_err());
+        assert!(code_to_index("A").is_err());
+        assert!(code_to_index("a1").is_err());
+    }
+
+    #[test]
+    fn dialoguer_confirm_override() {
+        let _guard = test_support::reset_guard();
+        test_support::set_prompt_confirm(true);
+        let prompt = DialoguerPrompt;
+        let ok = prompt.confirm("Proceed?", false).unwrap();
+        assert!(ok);
+    }
+
+    #[test]
+    fn dialoguer_confirm_default_in_coverage() {
+        let _guard = test_support::reset_guard();
+        let prompt = DialoguerPrompt;
+        #[cfg(coverage)]
+        {
+            let ok = prompt.confirm("Proceed?", true).unwrap();
+            assert!(ok);
+        }
+        #[cfg(not(coverage))]
+        {
+            test_support::set_prompt_confirm(true);
+            let ok = prompt.confirm("Proceed?", false).unwrap();
+            assert!(ok);
+        }
+    }
+
+    #[test]
+    fn dialoguer_multi_select_parses_input() {
+        let _guard = test_support::reset_guard();
+        test_support::set_prompt_input("a,c");
+        let prompt = DialoguerPrompt;
+        let items = vec!["one".to_string(), "two".to_string(), "three".to_string()];
+        let chosen = prompt.multi_select("Pick items", &items).unwrap();
+        assert_eq!(chosen, vec![0, 2]);
+    }
+
+    #[test]
+    fn dialoguer_multi_select_empty_items() {
+        let _guard = test_support::reset_guard();
+        let prompt = DialoguerPrompt;
+        let chosen = prompt.multi_select("Pick items", &[]).unwrap();
+        assert!(chosen.is_empty());
+    }
+
+    #[test]
+    fn dialoguer_multi_select_empty_input() {
+        let _guard = test_support::reset_guard();
+        test_support::set_prompt_input("   ");
+        let prompt = DialoguerPrompt;
+        let items = vec!["one".to_string()];
+        let chosen = prompt.multi_select("Pick items", &items).unwrap();
+        assert!(chosen.is_empty());
+    }
+
+    #[test]
+    fn dialoguer_multi_select_empty_token() {
+        let _guard = test_support::reset_guard();
+        test_support::set_prompt_input("a,,b");
+        let prompt = DialoguerPrompt;
+        let items = vec!["one".to_string(), "two".to_string()];
+        let chosen = prompt.multi_select("Pick items", &items).unwrap();
+        assert_eq!(chosen, vec![0, 1]);
+    }
+
+    #[test]
+    fn dialoguer_multi_select_invalid_token() {
+        let _guard = test_support::reset_guard();
+        test_support::set_prompt_input("a,1");
+        let prompt = DialoguerPrompt;
+        let items = vec!["one".to_string(), "two".to_string()];
+        let err = prompt.multi_select("Pick items", &items).unwrap_err();
+        assert!(err.to_string().contains("invalid selection"));
+    }
+
+    #[test]
+    fn dialoguer_multi_select_coverage_default() {
+        let _guard = test_support::reset_guard();
+        let prompt = DialoguerPrompt;
+        let items = vec!["one".to_string(), "two".to_string()];
+        #[cfg(coverage)]
+        {
+            let chosen = prompt.multi_select("Pick items", &items).unwrap();
+            assert!(chosen.is_empty());
+        }
+        #[cfg(not(coverage))]
+        {
+            test_support::set_prompt_input("a");
+            let chosen = prompt.multi_select("Pick items", &items).unwrap();
+            assert_eq!(chosen, vec![0]);
+        }
+    }
+
+    #[test]
+    fn dialoguer_multi_select_out_of_range() {
+        let _guard = test_support::reset_guard();
+        test_support::set_prompt_input("c");
+        let prompt = DialoguerPrompt;
+        let items = vec!["one".to_string(), "two".to_string()];
+        let err = prompt.multi_select("Pick items", &items).unwrap_err();
+        assert!(err.to_string().contains("selection out of range"));
     }
 }

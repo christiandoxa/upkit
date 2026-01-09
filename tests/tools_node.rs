@@ -125,6 +125,34 @@ fn node_latest_lts_multiple_entries() {
 }
 
 #[test]
+fn node_latest_lts_string_flag() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = ctx_with_dirs();
+    let url = "https://nodejs.org/dist/index.json";
+    let json = r#"[{"version":"v20.10.0","lts":"hydrogen"},{"version":"v22.0.0","lts":false}]"#;
+    set_http_plan(
+        url,
+        vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
+    );
+    let v = node_latest_lts(&ctx).unwrap();
+    assert_eq!(v.to_string(), "20.10.0");
+}
+
+#[test]
+fn node_latest_lts_unknown_flag() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = ctx_with_dirs();
+    let url = "https://nodejs.org/dist/index.json";
+    let json = r#"[{"version":"v20.10.0","lts":null},{"version":"v20.9.0","lts":"hydrogen"}]"#;
+    set_http_plan(
+        url,
+        vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
+    );
+    let v = node_latest_lts(&ctx).unwrap();
+    assert_eq!(v.to_string(), "20.9.0");
+}
+
+#[test]
 fn node_artifact_windows_error() {
     let (mut ctx, _dir) = ctx_with_dirs();
     ctx.os = "windows".into();

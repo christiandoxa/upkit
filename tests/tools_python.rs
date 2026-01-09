@@ -37,6 +37,45 @@ fn python_target_and_latest() {
 }
 
 #[test]
+fn python_target_variants() {
+    let _guard = reset_guard();
+    let (mut ctx, _dir) = ctx_with_dirs();
+    ctx.os = "linux".into();
+    ctx.arch = "aarch64".into();
+    assert_eq!(python_target(&ctx).unwrap(), "aarch64-unknown-linux-gnu");
+
+    ctx.os = "macos".into();
+    ctx.arch = "x86_64".into();
+    assert_eq!(python_target(&ctx).unwrap(), "x86_64-apple-darwin");
+
+    ctx.arch = "aarch64".into();
+    assert_eq!(python_target(&ctx).unwrap(), "aarch64-apple-darwin");
+
+    ctx.os = "windows".into();
+    ctx.arch = "x86_64".into();
+    assert!(python_target(&ctx).is_err());
+}
+
+#[test]
+fn python_latest_no_match() {
+    let _guard = reset_guard();
+    let (mut ctx, _dir) = ctx_with_dirs();
+    ctx.os = "linux".into();
+    ctx.arch = "x86_64".into();
+    let url = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest";
+    let json = r#"{"tag_name":"v3.11.9","assets":[{"name":"cpython-3.11.9+20240224-x86_64-unknown-linux-gnu.zip","browser_download_url":"https://example.com/python.zip"},{"name":"cpython-3.11.9+20240224-aarch64-unknown-linux-gnu.tar.zst","browser_download_url":"https://example.com/python.tar.zst"}]}"#;
+    set_http_plan(
+        url,
+        vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
+    );
+    let err = python_latest(&ctx).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("could not determine latest python version")
+    );
+}
+
+#[test]
 fn python_pick_asset_and_check() {
     let _guard = reset_guard();
     let (mut ctx, _dir) = ctx_with_dirs();
@@ -66,6 +105,29 @@ fn python_pick_asset_and_check() {
     );
     let report = check_python(&ctx).unwrap();
     assert!(matches!(report.status, Status::NotInstalled));
+}
+
+#[test]
+fn python_pick_asset_install_only() {
+    let _guard = reset_guard();
+    let (mut ctx, _dir) = ctx_with_dirs();
+    ctx.os = "linux".into();
+    ctx.arch = "x86_64".into();
+
+    let url = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest";
+    let json = r#"{"tag_name":"v3.11.9","assets":[{"name":"cpython-3.11.9+20240224-x86_64-unknown-linux-gnu.tar.zst","browser_download_url":"https://example.com/python.tar.zst"},{"name":"cpython-3.11.9+20240224-x86_64-unknown-linux-gnu-install_only.tar.zst","browser_download_url":"https://example.com/python-install.tar.zst"}]}"#;
+    set_http_plan(
+        url,
+        vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
+    );
+    let v = Version {
+        major: 3,
+        minor: 11,
+        patch: 9,
+        pre: None,
+    };
+    let asset = python_pick_asset(&ctx, &v).unwrap();
+    assert!(asset.name.contains("install_only"));
 }
 
 #[test]
@@ -158,6 +220,25 @@ fn update_python_offline_and_dry_run() {
 }
 
 #[test]
+fn update_python_dry_run_logs() {
+    let _guard = reset_guard();
+    let (mut ctx, _dir) = ctx_with_dirs();
+    ctx.dry_run = true;
+    set_which("python3", None);
+    set_which("python", None);
+    let url = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest";
+    let json = r#"{"tag_name":"v3.11.9","assets":[{"name":"cpython-3.11.9+20240224-x86_64-unknown-linux-gnu.tar.zst","browser_download_url":"https://example.com/python.tgz"}]}"#;
+    set_http_plan(
+        url,
+        vec![
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+        ],
+    );
+    update_python(&ctx).unwrap();
+}
+
+#[test]
 fn update_python_up_to_date() {
     let _guard = reset_guard();
     let (ctx, _dir) = ctx_with_dirs();
@@ -226,6 +307,89 @@ fn update_python_success_and_layout_error() {
         vec![Ok(MockResponse::new(tar.clone(), Some(tar.len() as u64)))],
     );
     update_python(&ctx).unwrap();
+}
+
+#[test]
+fn update_python_layout_missing() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = ctx_with_dirs();
+    fs::create_dir_all(&ctx.bindir).unwrap();
+    set_which("python3", None);
+    set_which("python", None);
+    let url = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest";
+    let json = r#"{"tag_name":"v3.11.9","assets":[{"name":"cpython-3.11.9+20240224-x86_64-unknown-linux-gnu.tar.zst","browser_download_url":"https://example.com/python.tgz"}]}"#;
+    set_http_plan(
+        url,
+        vec![
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+        ],
+    );
+    let tar = {
+        let mut bytes = Vec::new();
+        {
+            let mut tar = tar::Builder::new(&mut bytes);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_cksum();
+            tar.append_data(&mut header, "other/bin/python", std::io::empty())
+                .unwrap();
+            tar.finish().unwrap();
+        }
+        zstd::stream::encode_all(&bytes[..], 0).unwrap()
+    };
+    set_http_plan(
+        "https://example.com/python.tgz",
+        vec![Ok(MockResponse::new(tar.clone(), Some(tar.len() as u64)))],
+    );
+    let err = update_python(&ctx).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("unexpected python-build-standalone layout")
+    );
+}
+
+#[test]
+fn update_python_install_layout() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = ctx_with_dirs();
+    fs::create_dir_all(&ctx.bindir).unwrap();
+    set_which("python3", None);
+    set_which("python", None);
+    let url = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest";
+    let json = r#"{"tag_name":"v3.11.9","assets":[{"name":"cpython-3.11.9+20240224-x86_64-unknown-linux-gnu.tar.zst","browser_download_url":"https://example.com/python.tgz"}]}"#;
+    set_http_plan(
+        url,
+        vec![
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+        ],
+    );
+    let tar = {
+        let mut bytes = Vec::new();
+        {
+            let mut tar = tar::Builder::new(&mut bytes);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_cksum();
+            tar.append_data(&mut header, "python/install/bin/python", std::io::empty())
+                .unwrap();
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_cksum();
+            tar.append_data(&mut header, "python/install/bin/python3", std::io::empty())
+                .unwrap();
+            tar.finish().unwrap();
+        }
+        zstd::stream::encode_all(&bytes[..], 0).unwrap()
+    };
+    set_http_plan(
+        "https://example.com/python.tgz",
+        vec![Ok(MockResponse::new(tar.clone(), Some(tar.len() as u64)))],
+    );
+    update_python(&ctx).unwrap();
+    let python = fs::read_link(ctx.bindir.join("python")).unwrap();
+    assert!(python.to_string_lossy().contains("install/bin/python"));
 }
 
 #[test]

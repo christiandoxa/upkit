@@ -42,7 +42,6 @@ pub fn flutter_latest_stable(ctx: &Ctx) -> Result<Version> {
             if best.as_ref().map(|b| &v > b).unwrap_or(true) {
                 best = Some(v);
             }
-            let _ = &best;
         }
     }
     best.ok_or_else(|| anyhow!("could not determine flutter latest stable"))

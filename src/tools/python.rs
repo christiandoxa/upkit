@@ -193,8 +193,13 @@ pub fn update_python(ctx: &Ctx) -> Result<()> {
     let active = tool_root.join("active");
     atomic_symlink(&extracted, &active)?;
 
-    // Link python + pip (the best effort)
-    let bin = active.join("bin");
+    // Link python + pip (the best effort; python-build-standalone uses install/bin).
+    let bin = active.join("install").join("bin");
+    let bin = if bin.exists() {
+        bin
+    } else {
+        active.join("bin")
+    };
     link_dir_bins(&bin, &ctx.bindir, &["python", "python3", "pip", "pip3"])?;
 
     info(ctx, format!("python updated to {}", latest.to_string()));

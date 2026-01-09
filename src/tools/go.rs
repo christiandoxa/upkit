@@ -83,7 +83,6 @@ pub fn go_latest(ctx: &Ctx) -> Result<Version> {
             if best.as_ref().map(|b| &v > b).unwrap_or(true) {
                 best = Some(v);
             }
-            let _ = &best;
         }
     }
     best.ok_or_else(|| anyhow!("could not determine latest Go version"))
