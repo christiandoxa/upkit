@@ -152,6 +152,30 @@ fn python_check_fallback_binary() {
 }
 
 #[test]
+fn python_check_uses_bindir() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = ctx_with_dirs();
+    fs::create_dir_all(&ctx.bindir).unwrap();
+    let bindir_python = ctx.bindir.join("python3");
+    fs::write(&bindir_python, b"").unwrap();
+    set_which("python3", None);
+    set_which("python", None);
+    set_run_output(
+        bindir_python.to_string_lossy().as_ref(),
+        &["--version"],
+        output_with_status(0, b"Python 3.11.9", b""),
+    );
+    let url = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest";
+    let json = r#"{"tag_name":"v3.11.9","assets":[{"name":"cpython-3.11.9+20240224-x86_64-unknown-linux-gnu.tar.zst","browser_download_url":"https://example.com/python.tar.zst"}]}"#;
+    set_http_plan(
+        url,
+        vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
+    );
+    let report = check_python(&ctx).unwrap();
+    assert!(matches!(report.status, Status::UpToDate));
+}
+
+#[test]
 fn python_pick_asset_missing() {
     let _guard = reset_guard();
     let (mut ctx, _dir) = ctx_with_dirs();
