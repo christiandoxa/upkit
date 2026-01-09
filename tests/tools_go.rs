@@ -109,6 +109,22 @@ fn go_latest_no_stable() {
 }
 
 #[test]
+fn go_latest_fallback_url() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = ctx_with_dirs();
+    let primary = "https://go.dev/dl/?mode=json";
+    let fallback = "https://golang.org/dl/?mode=json";
+    let json = r#"[{"version":"go1.2.3","stable":true,"files":[]}]"#;
+    set_http_plan(primary, vec![Err("no".to_string())]);
+    set_http_plan(
+        fallback,
+        vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
+    );
+    let v = go_latest(&ctx).unwrap();
+    assert_eq!(v.to_string(), "1.2.3");
+}
+
+#[test]
 fn update_go_latest_unknown() {
     let _guard = reset_guard();
     let (ctx, _dir) = ctx_with_dirs();
@@ -182,6 +198,29 @@ fn go_check_statuses() {
     set_which("go", Some(PathBuf::from("/bin/go")));
     set_run_output(
         "go",
+        &["version"],
+        output_with_status(0, b"go version go1.2.3 linux/amd64", b""),
+    );
+    let report = check_go(&ctx).unwrap();
+    assert!(matches!(report.status, Status::UpToDate));
+}
+
+#[test]
+fn go_check_uses_bindir() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = ctx_with_dirs();
+    let bindir_go = ctx.bindir.join("go");
+    fs::create_dir_all(&ctx.bindir).unwrap();
+    fs::write(&bindir_go, b"").unwrap();
+    let url = "https://go.dev/dl/?mode=json";
+    let json = r#"[{"version":"go1.2.3","stable":true,"files":[]}]"#;
+    set_http_plan(
+        url,
+        vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
+    );
+    set_which("go", None);
+    set_run_output(
+        bindir_go.to_string_lossy().as_ref(),
         &["version"],
         output_with_status(0, b"go version go1.2.3 linux/amd64", b""),
     );

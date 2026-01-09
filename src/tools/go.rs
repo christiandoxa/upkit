@@ -1,11 +1,11 @@
 use anyhow::{Result, anyhow, bail};
 use serde::Deserialize;
-use std::{env, fs};
+use std::{env, ffi::OsStr, fs};
 
 use crate::{
     Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, atomic_symlink, download_to_temp,
-    ensure_clean_dir, http_get_json, info, link_dir_bins, maybe_path_hint_for_dir, run_capture,
-    sha256_file, which_or_none,
+    ensure_clean_dir, get_env_var, home_dir, http_get_json, info, link_dir_bins,
+    maybe_path_hint_for_dir, run_capture, sha256_file, which_or_none,
 };
 
 #[derive(Debug, Deserialize)]
@@ -44,9 +44,14 @@ pub fn go_os_arch(ctx: &Ctx) -> (String, String) {
 }
 
 pub fn check_go(ctx: &Ctx) -> Result<ToolReport> {
-    let installed = which_or_none("go")
-        .and_then(|_| run_capture("go", &["version"]).ok())
-        .and_then(|out| Version::parse_loose(&out));
+    let installed = if let Some(bin) = go_bin_in_bindir(ctx) {
+        let args = [OsStr::new("version")];
+        run_capture(bin.as_os_str(), &args).ok()
+    } else {
+        which_or_none("go")
+            .and_then(|_| run_capture("go", &["version"]).ok())
+    }
+    .and_then(|out| Version::parse_loose(&out));
 
     let latest = go_latest(ctx).ok();
     let status = match (&installed, &latest) {
@@ -72,8 +77,7 @@ pub fn check_go(ctx: &Ctx) -> Result<ToolReport> {
 }
 
 pub fn go_latest(ctx: &Ctx) -> Result<Version> {
-    let url = "https://go.dev/dl/?mode=json";
-    let releases: Vec<GoRelease> = http_get_json(ctx, url)?;
+    let releases = go_releases(ctx)?;
     let stable = releases
         .into_iter()
         .filter(|r| r.stable)
@@ -91,8 +95,7 @@ pub fn go_latest(ctx: &Ctx) -> Result<Version> {
 
 pub fn go_pick_file(ctx: &Ctx, want_version: &Version) -> Result<(String, String)> {
     // returns (download_url, sha256)
-    let url = "https://go.dev/dl/?mode=json";
-    let releases: Vec<GoRelease> = http_get_json(ctx, url)?;
+    let releases = go_releases(ctx)?;
     let (os, arch) = go_os_arch(ctx);
     let want_prefix = format!(
         "go{}.{}.{}",
@@ -162,33 +165,77 @@ pub fn update_go(ctx: &Ctx) -> Result<()> {
     atomic_symlink(&extracted_go_dir, &active)?;
 
     // link binaries
-    link_dir_bins(&active.join("bin"), &ctx.bindir, &["go", "gofmt"])?;
-    maybe_hint_go_bins(ctx);
+    let active_bin = active.join("bin");
+    let go_bin = active_bin.join("go");
+    link_dir_bins(&active_bin, &ctx.bindir, &["go", "gofmt"])?;
+    maybe_hint_go_bins(ctx, Some(&go_bin));
 
     info(ctx, format!("go updated to {}", latest.to_string()));
     Ok(())
 }
 
-fn maybe_hint_go_bins(ctx: &Ctx) {
-    let gobin = go_env_value("GOBIN");
+fn maybe_hint_go_bins(ctx: &Ctx, go_bin: Option<&std::path::Path>) {
+    let gobin = go_env_value(go_bin, "GOBIN");
     if let Some(dir) = gobin {
         maybe_path_hint_for_dir(ctx, std::path::Path::new(&dir), "go GOBIN");
         return;
     }
-    for gopath in go_env_paths("GOPATH") {
+    for gopath in go_env_paths(go_bin, "GOPATH") {
         maybe_path_hint_for_dir(ctx, &gopath.join("bin"), "go GOPATH/bin");
     }
 }
 
-fn go_env_value(key: &str) -> Option<String> {
-    run_capture("go", &["env", key])
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+fn go_env_value(go_bin: Option<&std::path::Path>, key: &str) -> Option<String> {
+    if let Some(value) = get_env_var(key) {
+        let value = value.trim().to_string();
+        if !value.is_empty() {
+            return Some(value);
+        }
+    }
+    match go_bin {
+        Some(bin) => {
+            let args = [OsStr::new("env"), OsStr::new(key)];
+            run_capture(bin.as_os_str(), &args).ok()
+        }
+        None => run_capture("go", &["env", key]).ok(),
+    }
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty())
 }
 
-fn go_env_paths(key: &str) -> Vec<std::path::PathBuf> {
-    go_env_value(key)
-        .map(|value| env::split_paths(&value).collect())
-        .unwrap_or_default()
+fn go_env_paths(go_bin: Option<&std::path::Path>, key: &str) -> Vec<std::path::PathBuf> {
+    if let Some(value) = go_env_value(go_bin, key) {
+        return env::split_paths(&value).collect();
+    }
+    if key == "GOPATH" {
+        return default_gopath().into_iter().collect();
+    }
+    Vec::new()
+}
+
+fn default_gopath() -> Option<std::path::PathBuf> {
+    home_dir().map(|home| home.join("go"))
+}
+
+fn go_bin_in_bindir(ctx: &Ctx) -> Option<std::path::PathBuf> {
+    let candidate = ctx.bindir.join("go");
+    if candidate.exists() {
+        return Some(candidate);
+    }
+    None
+}
+
+fn go_releases(ctx: &Ctx) -> Result<Vec<GoRelease>> {
+    const URLS: [&str; 2] = [
+        "https://go.dev/dl/?mode=json",
+        "https://golang.org/dl/?mode=json",
+    ];
+    let mut last_err: Option<anyhow::Error> = None;
+    for url in URLS {
+        match http_get_json::<Vec<GoRelease>>(ctx, url) {
+            Ok(releases) => return Ok(releases),
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("could not fetch Go releases")))
 }

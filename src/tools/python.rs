@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow, bail};
 use regex::Regex;
 use serde::Deserialize;
-use std::{env, fs};
+use std::{env, ffi::OsStr, fs, path::PathBuf};
 
 use crate::{
     Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, atomic_symlink, download_to_temp,
@@ -22,14 +22,24 @@ pub struct GhAsset {
 }
 
 pub fn check_python(ctx: &Ctx) -> Result<ToolReport> {
-    let installed = which_or_none("python3")
-        .and_then(|_| run_capture("python3", &["--version"]).ok())
-        .and_then(|out| Version::parse_loose(&out))
-        .or_else(|| {
+    let installed = if let Some(bin) = python_bin_in_bindir(ctx, "python3") {
+        let args = [OsStr::new("--version")];
+        run_capture(bin.as_os_str(), &args).ok()
+    } else {
+        which_or_none("python3")
+            .and_then(|_| run_capture("python3", &["--version"]).ok())
+    }
+    .and_then(|out| Version::parse_loose(&out))
+    .or_else(|| {
+        if let Some(bin) = python_bin_in_bindir(ctx, "python") {
+            let args = [OsStr::new("--version")];
+            run_capture(bin.as_os_str(), &args).ok()
+        } else {
             which_or_none("python")
                 .and_then(|_| run_capture("python", &["--version"]).ok())
-                .and_then(|out| Version::parse_loose(&out))
-        });
+        }
+        .and_then(|out| Version::parse_loose(&out))
+    });
 
     let latest = python_latest(ctx).ok();
     let status = match (&installed, &latest) {
@@ -222,7 +232,12 @@ fn python_user_base(active: &std::path::Path) -> Option<std::path::PathBuf> {
     } else {
         active.join("bin").join("python3")
     };
-    run_capture(&python, &["-m", "site", "--user-base"])
+    let args = [
+        OsStr::new("-m"),
+        OsStr::new("site"),
+        OsStr::new("--user-base"),
+    ];
+    run_capture(python.as_os_str(), &args)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -235,4 +250,12 @@ fn default_python_user_base() -> Option<std::path::PathBuf> {
         .filter(|value| !value.trim().is_empty())
         .map(std::path::PathBuf::from)
         .or_else(|| home_dir().map(|home| home.join(".local")))
+}
+
+fn python_bin_in_bindir(ctx: &Ctx, name: &str) -> Option<PathBuf> {
+    let candidate = ctx.bindir.join(name);
+    if candidate.exists() {
+        return Some(candidate);
+    }
+    None
 }

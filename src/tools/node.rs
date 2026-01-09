@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow, bail};
 use serde::Deserialize;
-use std::{collections::HashMap, fs};
+use std::{collections::HashMap, ffi::OsStr, fs, path::PathBuf};
 
 use crate::{
     Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, atomic_symlink, download_to_temp,
@@ -34,9 +34,14 @@ pub fn node_os_arch(ctx: &Ctx) -> (String, String) {
 }
 
 pub fn check_node(ctx: &Ctx) -> Result<ToolReport> {
-    let installed = which_or_none("node")
-        .and_then(|_| run_capture("node", &["--version"]).ok())
-        .and_then(|out| Version::parse_loose(&out));
+    let installed = if let Some(bin) = node_bin_in_bindir(ctx) {
+        let args = [OsStr::new("--version")];
+        run_capture(bin.as_os_str(), &args).ok()
+    } else {
+        which_or_none("node")
+            .and_then(|_| run_capture("node", &["--version"]).ok())
+    }
+    .and_then(|out| Version::parse_loose(&out));
 
     let latest = node_latest_lts(ctx).ok();
     let status = match (&installed, &latest) {
@@ -183,15 +188,36 @@ pub fn update_node(ctx: &Ctx) -> Result<()> {
 fn ensure_npm_prefix(active: &std::path::Path) -> Result<()> {
     let desired_prefix = active.to_string_lossy().to_string();
     let npm_path = active.join("bin").join("npm");
-    let current_prefix = run_capture(&npm_path, &["config", "get", "prefix"])
+    if !npm_path.exists() {
+        return Ok(());
+    }
+    let current_prefix = {
+        let args = [
+            OsStr::new("config"),
+            OsStr::new("get"),
+            OsStr::new("prefix"),
+        ];
+        run_capture(npm_path.as_os_str(), &args)
+    }
         .ok()
         .map(|value| value.trim().to_string());
     if current_prefix.as_deref() == Some(desired_prefix.as_str()) {
         return Ok(());
     }
-    run_capture(
-        &npm_path,
-        &["config", "set", "prefix", desired_prefix.as_str()],
-    )?;
+    let args = [
+        OsStr::new("config"),
+        OsStr::new("set"),
+        OsStr::new("prefix"),
+        OsStr::new(desired_prefix.as_str()),
+    ];
+    run_capture(npm_path.as_os_str(), &args)?;
     Ok(())
+}
+
+fn node_bin_in_bindir(ctx: &Ctx) -> Option<PathBuf> {
+    let candidate = ctx.bindir.join("node");
+    if candidate.exists() {
+        return Some(candidate);
+    }
+    None
 }

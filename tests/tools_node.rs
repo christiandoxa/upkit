@@ -194,6 +194,29 @@ fn node_check_statuses() {
 }
 
 #[test]
+fn node_check_uses_bindir() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = ctx_with_dirs();
+    fs::create_dir_all(&ctx.bindir).unwrap();
+    let bindir_node = ctx.bindir.join("node");
+    fs::write(&bindir_node, b"").unwrap();
+    let idx_url = "https://nodejs.org/dist/index.json";
+    let json = r#"[{"version":"v1.2.3","lts":true}]"#;
+    set_http_plan(
+        idx_url,
+        vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
+    );
+    set_which("node", None);
+    set_run_output(
+        bindir_node.to_string_lossy().as_ref(),
+        &["--version"],
+        output_with_status(0, b"v1.2.3", b""),
+    );
+    let report = check_node(&ctx).unwrap();
+    assert!(matches!(report.status, Status::UpToDate));
+}
+
+#[test]
 fn node_check_outdated() {
     let _guard = reset_guard();
     let (ctx, _dir) = ctx_with_dirs();
