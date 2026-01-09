@@ -1,9 +1,10 @@
 use crate::{
-    Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, http_get_json, info, run_output,
-    run_status, which_or_none,
+    Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, home_dir, http_get_json, info,
+    maybe_path_hint_for_dir, run_output, run_status, which_or_none,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
+use std::{env, ffi::OsStr, path::{Path, PathBuf}};
 
 #[derive(Debug, Deserialize)]
 struct FlutterReleases {
@@ -47,9 +48,13 @@ pub fn flutter_latest_stable(ctx: &Ctx) -> Result<Version> {
     best.ok_or_else(|| anyhow!("could not determine flutter latest stable"))
 }
 
-pub fn flutter_installed_version() -> Option<Version> {
+pub fn flutter_installed_version(bin: Option<&Path>) -> Option<Version> {
     // flutter --version --machine outputs JSON
-    let out = run_output("flutter", &["--version", "--machine"]).ok()?;
+    let args = [OsStr::new("--version"), OsStr::new("--machine")];
+    let out = match bin {
+        Some(bin) => run_output(bin.as_os_str(), &args).ok()?,
+        None => run_output("flutter", &["--version", "--machine"]).ok()?,
+    };
     if !out.status.success() {
         return None;
     }
@@ -59,8 +64,10 @@ pub fn flutter_installed_version() -> Option<Version> {
 }
 
 pub fn check_flutter(ctx: &Ctx) -> Result<ToolReport> {
-    let installed = if which_or_none("flutter").is_some() {
-        flutter_installed_version()
+    let installed = if let Some(bin) = flutter_bin_in_bindir(ctx) {
+        flutter_installed_version(Some(&bin))
+    } else if which_or_none("flutter").is_some() {
+        flutter_installed_version(None)
     } else {
         None
     };
@@ -88,7 +95,8 @@ pub fn update_flutter(ctx: &Ctx) -> Result<()> {
         bail!("offline mode enabled; Flutter update requires network access");
     }
     let report = check_flutter(ctx)?;
-    if which_or_none("flutter").is_none() {
+    let bindir_flutter = flutter_bin_in_bindir(ctx);
+    if bindir_flutter.is_none() && which_or_none("flutter").is_none() {
         bail!("flutter not found in PATH; install Flutter SDK first");
     }
 
@@ -103,10 +111,38 @@ pub fn update_flutter(ctx: &Ctx) -> Result<()> {
         return Ok(());
     }
 
-    let status = run_status("flutter", &["upgrade"]).context("failed to run flutter upgrade")?;
+    let status = if let Some(bin) = bindir_flutter {
+        let args = [OsStr::new("upgrade")];
+        run_status(bin.as_os_str(), &args).context("failed to run flutter upgrade")?
+    } else {
+        run_status("flutter", &["upgrade"]).context("failed to run flutter upgrade")?
+    };
     if !status.success() {
         bail!("flutter upgrade failed");
     }
+    maybe_hint_flutter_bins(ctx);
     info(ctx, "flutter updated");
     Ok(())
+}
+
+fn maybe_hint_flutter_bins(ctx: &Ctx) {
+    if let Some(pub_cache) = pub_cache_dir() {
+        maybe_path_hint_for_dir(ctx, &pub_cache.join("bin"), "pub cache bin");
+    }
+}
+
+fn pub_cache_dir() -> Option<PathBuf> {
+    env::var("PUB_CACHE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(".pub-cache")))
+}
+
+fn flutter_bin_in_bindir(ctx: &Ctx) -> Option<PathBuf> {
+    let candidate = ctx.bindir.join("flutter");
+    if candidate.exists() {
+        return Some(candidate);
+    }
+    None
 }

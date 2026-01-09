@@ -7,7 +7,7 @@ use dialoguer::{Confirm, Input, theme::ColorfulTheme};
 use indicatif::ProgressDrawTarget;
 use indicatif::{ProgressBar, ProgressStyle};
 use regex::Regex;
-use reqwest::blocking::Client;
+use reqwest::{Certificate, blocking::Client};
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use std::process::ExitCode;
@@ -741,10 +741,17 @@ pub fn make_ctx(cli: &Cli) -> Result<Ctx> {
     if let Some(err) = test_support::make_ctx_error() {
         bail!(err);
     }
-    let http = Client::builder()
+    let mut http_builder = Client::builder()
         .user_agent("upkit/0.1 (github.com/christiandoxa/upkit)")
-        .timeout(Duration::from_secs(cli.timeout))
-        .build()?;
+        .timeout(Duration::from_secs(cli.timeout));
+    if let Some(cert_path) = get_env_var("SSL_CERT_FILE") {
+        let pem = fs::read(&cert_path)
+            .with_context(|| format!("read SSL_CERT_FILE {}", cert_path))?;
+        let cert = Certificate::from_pem(&pem)
+            .with_context(|| format!("parse SSL_CERT_FILE {}", cert_path))?;
+        http_builder = http_builder.add_root_certificate(cert);
+    }
+    let http = http_builder.build()?;
 
     let home = cli.home.clone().unwrap_or_else(|| {
         data_local_dir()
@@ -856,11 +863,16 @@ pub fn print_reports(ctx: &Ctx, reports: &[ToolReport]) {
 }
 
 pub fn maybe_path_hint(ctx: &Ctx) {
+    maybe_path_hint_for_dir(ctx, &ctx.bindir, "upkit");
+}
+
+pub fn maybe_path_hint_for_dir(ctx: &Ctx, dir: &Path, label: &str) {
     if ctx.quiet {
         return;
     }
+    let dir_str = dir.to_string_lossy();
     let path = get_env_var("PATH").unwrap_or_default();
-    if path.split(':').any(|p| p == ctx.bindir.to_string_lossy()) {
+    if env::split_paths(&path).any(|p| p == dir) {
         return;
     }
     let shell = get_env_var("SHELL").unwrap_or_default();
@@ -874,11 +886,11 @@ pub fn maybe_path_hint(ctx: &Ctx) {
         "~/.profile"
     };
     let rc_path = expand_tilde(rc);
-    let bindir_str = ctx.bindir.to_string_lossy().to_string();
+    let dir_string = dir_str.to_string();
     let already_configured = rc_path
         .as_ref()
         .and_then(|p| fs::read_to_string(p).ok())
-        .map(|content| content.contains(&bindir_str))
+        .map(|content| content.contains(&dir_string))
         .unwrap_or(false);
     if already_configured {
         return;
@@ -891,11 +903,14 @@ pub fn maybe_path_hint(ctx: &Ctx) {
         }
     };
     let line = if shell.ends_with("fish") {
-        format!("\n# upkit\nset -gx PATH {} $PATH\n", ctx.bindir.display())
+        format!(
+            "\n# upkit ({label})\nset -gx PATH {} $PATH\n",
+            dir.display()
+        )
     } else {
         format!(
-            "\n# upkit\nexport PATH=\"{}:$PATH\"\n",
-            ctx.bindir.display()
+            "\n# upkit ({label})\nexport PATH=\"{}:$PATH\"\n",
+            dir.display()
         )
     };
     match fs::OpenOptions::new()
@@ -1429,6 +1444,9 @@ pub fn clean_tool(ctx: &Ctx, tool: ToolKind) -> Result<()> {
             .with_context(|| format!("remove {}", tool_root.display()))?;
     }
 
+    let bindir_readonly = fs::metadata(&ctx.bindir)
+        .map(|meta| meta.permissions().readonly())
+        .unwrap_or(false);
     for &name in tool_bin_names(tool) {
         let dst = ctx.bindir.join(name);
         let meta = match fs::symlink_metadata(&dst) {
@@ -1439,6 +1457,9 @@ pub fn clean_tool(ctx: &Ctx, tool: ToolKind) -> Result<()> {
             continue;
         }
         if matches!(fs::read_link(&dst), Ok(target) if target.starts_with(&ctx.home)) {
+            if bindir_readonly {
+                bail!("remove {} failed: bindir is not writable", dst.display());
+            }
             fs::remove_file(&dst).with_context(|| format!("remove {}", dst.display()))?;
         }
     }

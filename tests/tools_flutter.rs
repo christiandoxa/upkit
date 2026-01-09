@@ -72,7 +72,7 @@ fn flutter_installed_and_check() {
         &["--version", "--machine"],
         output_with_status(0, br#"{"frameworkVersion":"3.1.0"}"#, b""),
     );
-    let v = flutter_installed_version().unwrap();
+    let v = flutter_installed_version(None).unwrap();
     assert_eq!(v.to_string(), "3.1.0");
 
     let url = "https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json";
@@ -113,6 +113,29 @@ fn flutter_check_not_installed() {
     );
     let report = check_flutter(&ctx).unwrap();
     assert!(matches!(report.status, Status::NotInstalled));
+}
+
+#[test]
+fn flutter_check_uses_bindir() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = ctx_with_dirs();
+    let bindir_flutter = ctx.bindir.join("flutter");
+    std::fs::create_dir_all(&ctx.bindir).unwrap();
+    std::fs::write(&bindir_flutter, b"").unwrap();
+    set_which("flutter", None);
+    set_run_output(
+        bindir_flutter.to_string_lossy().as_ref(),
+        &["--version", "--machine"],
+        output_with_status(0, br#"{"frameworkVersion":"3.1.0"}"#, b""),
+    );
+    let url = "https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json";
+    let json = r#"{"releases":[{"channel":"stable","version":"3.1.0"}]}"#;
+    set_http_plan(
+        url,
+        vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
+    );
+    let report = check_flutter(&ctx).unwrap();
+    assert!(matches!(report.status, Status::UpToDate));
 }
 
 #[test]
