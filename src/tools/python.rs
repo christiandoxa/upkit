@@ -1,11 +1,12 @@
 use anyhow::{Result, anyhow, bail};
 use regex::Regex;
 use serde::Deserialize;
-use std::fs;
+use std::{env, fs};
 
 use crate::{
     Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, atomic_symlink, download_to_temp,
-    ensure_clean_dir, http_get_json, info, link_dir_bins, run_capture, which_or_none,
+    ensure_clean_dir, home_dir, http_get_json, info, link_dir_bins, maybe_path_hint_for_dir,
+    run_capture, which_or_none,
 };
 
 #[derive(Debug, Deserialize)]
@@ -201,7 +202,37 @@ pub fn update_python(ctx: &Ctx) -> Result<()> {
         active.join("bin")
     };
     link_dir_bins(&bin, &ctx.bindir, &["python", "python3", "pip", "pip3"])?;
+    maybe_hint_python_bins(ctx, &active);
 
     info(ctx, format!("python updated to {}", latest.to_string()));
     Ok(())
+}
+
+fn maybe_hint_python_bins(ctx: &Ctx, active: &std::path::Path) {
+    let user_base = python_user_base(active).or_else(default_python_user_base);
+    if let Some(base) = user_base {
+        maybe_path_hint_for_dir(ctx, &base.join("bin"), "python user base bin");
+    }
+}
+
+fn python_user_base(active: &std::path::Path) -> Option<std::path::PathBuf> {
+    let python = active.join("install").join("bin").join("python3");
+    let python = if python.exists() {
+        python
+    } else {
+        active.join("bin").join("python3")
+    };
+    run_capture(&python, &["-m", "site", "--user-base"])
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+fn default_python_user_base() -> Option<std::path::PathBuf> {
+    env::var("PYTHONUSERBASE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(".local")))
 }

@@ -1,9 +1,10 @@
 use crate::{
-    Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, http_get_json, info, run_output,
-    run_status, which_or_none,
+    Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, home_dir, http_get_json, info,
+    maybe_path_hint_for_dir, run_output, run_status, which_or_none,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
+use std::{env, path::PathBuf};
 
 #[derive(Debug, Deserialize)]
 struct FlutterReleases {
@@ -107,6 +108,21 @@ pub fn update_flutter(ctx: &Ctx) -> Result<()> {
     if !status.success() {
         bail!("flutter upgrade failed");
     }
+    maybe_hint_flutter_bins(ctx);
     info(ctx, "flutter updated");
     Ok(())
+}
+
+fn maybe_hint_flutter_bins(ctx: &Ctx) {
+    if let Some(pub_cache) = pub_cache_dir() {
+        maybe_path_hint_for_dir(ctx, &pub_cache.join("bin"), "pub cache bin");
+    }
+}
+
+fn pub_cache_dir() -> Option<PathBuf> {
+    env::var("PUB_CACHE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(".pub-cache")))
 }

@@ -856,11 +856,16 @@ pub fn print_reports(ctx: &Ctx, reports: &[ToolReport]) {
 }
 
 pub fn maybe_path_hint(ctx: &Ctx) {
+    maybe_path_hint_for_dir(ctx, &ctx.bindir, "upkit");
+}
+
+pub fn maybe_path_hint_for_dir(ctx: &Ctx, dir: &Path, label: &str) {
     if ctx.quiet {
         return;
     }
+    let dir_str = dir.to_string_lossy();
     let path = get_env_var("PATH").unwrap_or_default();
-    if path.split(':').any(|p| p == ctx.bindir.to_string_lossy()) {
+    if env::split_paths(&path).any(|p| p == dir) {
         return;
     }
     let shell = get_env_var("SHELL").unwrap_or_default();
@@ -874,11 +879,11 @@ pub fn maybe_path_hint(ctx: &Ctx) {
         "~/.profile"
     };
     let rc_path = expand_tilde(rc);
-    let bindir_str = ctx.bindir.to_string_lossy().to_string();
+    let dir_string = dir_str.to_string();
     let already_configured = rc_path
         .as_ref()
         .and_then(|p| fs::read_to_string(p).ok())
-        .map(|content| content.contains(&bindir_str))
+        .map(|content| content.contains(&dir_string))
         .unwrap_or(false);
     if already_configured {
         return;
@@ -891,11 +896,14 @@ pub fn maybe_path_hint(ctx: &Ctx) {
         }
     };
     let line = if shell.ends_with("fish") {
-        format!("\n# upkit\nset -gx PATH {} $PATH\n", ctx.bindir.display())
+        format!(
+            "\n# upkit ({label})\nset -gx PATH {} $PATH\n",
+            dir.display()
+        )
     } else {
         format!(
-            "\n# upkit\nexport PATH=\"{}:$PATH\"\n",
-            ctx.bindir.display()
+            "\n# upkit ({label})\nexport PATH=\"{}:$PATH\"\n",
+            dir.display()
         )
     };
     match fs::OpenOptions::new()

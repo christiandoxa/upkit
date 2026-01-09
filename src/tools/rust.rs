@@ -1,9 +1,10 @@
 use anyhow::{Result, anyhow, bail};
 
 use crate::{
-    Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, http_get_text, info, run_capture,
-    which_or_none,
+    Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, home_dir, http_get_text, info,
+    maybe_path_hint_for_dir, run_capture, which_or_none,
 };
+use std::{env, path::PathBuf};
 
 pub fn check_rust(ctx: &Ctx) -> Result<ToolReport> {
     let installed = which_or_none("rustc")
@@ -67,6 +68,22 @@ pub fn update_rust(ctx: &Ctx) -> Result<()> {
     }
 
     let _ = run_capture("rustup", &["update", "stable"])?;
+    maybe_hint_rust_bins(ctx);
     info(ctx, "rust updated");
     Ok(())
+}
+
+fn maybe_hint_rust_bins(ctx: &Ctx) {
+    if let Some(cargo_bin) = cargo_bin_dir() {
+        maybe_path_hint_for_dir(ctx, &cargo_bin, "cargo bin");
+    }
+}
+
+fn cargo_bin_dir() -> Option<PathBuf> {
+    let cargo_home = env::var("CARGO_HOME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(".cargo")))?;
+    Some(cargo_home.join("bin"))
 }

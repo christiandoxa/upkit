@@ -1,10 +1,11 @@
 use anyhow::{Result, anyhow, bail};
 use serde::Deserialize;
-use std::fs;
+use std::{env, fs};
 
 use crate::{
     Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, atomic_symlink, download_to_temp,
-    ensure_clean_dir, http_get_json, info, link_dir_bins, run_capture, sha256_file, which_or_none,
+    ensure_clean_dir, http_get_json, info, link_dir_bins, maybe_path_hint_for_dir, run_capture,
+    sha256_file, which_or_none,
 };
 
 #[derive(Debug, Deserialize)]
@@ -162,7 +163,32 @@ pub fn update_go(ctx: &Ctx) -> Result<()> {
 
     // link binaries
     link_dir_bins(&active.join("bin"), &ctx.bindir, &["go", "gofmt"])?;
+    maybe_hint_go_bins(ctx);
 
     info(ctx, format!("go updated to {}", latest.to_string()));
     Ok(())
+}
+
+fn maybe_hint_go_bins(ctx: &Ctx) {
+    let gobin = go_env_value("GOBIN");
+    if let Some(dir) = gobin {
+        maybe_path_hint_for_dir(ctx, std::path::Path::new(&dir), "go GOBIN");
+        return;
+    }
+    for gopath in go_env_paths("GOPATH") {
+        maybe_path_hint_for_dir(ctx, &gopath.join("bin"), "go GOPATH/bin");
+    }
+}
+
+fn go_env_value(key: &str) -> Option<String> {
+    run_capture("go", &["env", key])
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn go_env_paths(key: &str) -> Vec<std::path::PathBuf> {
+    go_env_value(key)
+        .map(|value| env::split_paths(&value).collect())
+        .unwrap_or_default()
 }
