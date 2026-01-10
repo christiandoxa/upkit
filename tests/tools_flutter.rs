@@ -1,4 +1,3 @@
-use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -184,7 +183,7 @@ fn update_flutter_paths() {
     std::fs::create_dir_all(&ctx.bindir).unwrap();
     let url = "https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json";
     let archive = make_flutter_tar_xz();
-    let hash = format!("{:x}", Sha256::digest(&archive));
+    let hash = "dummy-hash";
     let json = format!(
         r#"{{"releases":[{{"channel":"stable","version":"3.1.0","archive":"stable/linux/flutter_linux_3.1.0-stable.tar.xz","hash":"{}"}}]}}"#,
         hash
