@@ -1073,8 +1073,8 @@ fn download_to_temp_partial_progress() {
     ctx.progress_overwrite = false;
     let url = "https://example.com/partial";
     set_http_plan(url, vec![Ok(MockResponse::new(vec![1, 2], Some(5)))]);
-    let tmp = download_to_temp(&ctx, url).unwrap();
-    assert_eq!(fs::read(tmp.path()).unwrap(), vec![1, 2]);
+    let err = download_to_temp(&ctx, url).unwrap_err();
+    assert!(err.to_string().contains("download incomplete"));
 }
 
 #[test]

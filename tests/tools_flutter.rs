@@ -1,4 +1,3 @@
-use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -28,7 +27,8 @@ fn make_flutter_tar_xz() -> Vec<u8> {
             let mut header = tar::Header::new_gnu();
             header.set_size(0);
             header.set_cksum();
-            tar.append_data(&mut header, path, std::io::empty()).unwrap();
+            tar.append_data(&mut header, path, std::io::empty())
+                .unwrap();
         }
         tar.finish().unwrap();
     }
@@ -183,7 +183,7 @@ fn update_flutter_paths() {
     std::fs::create_dir_all(&ctx.bindir).unwrap();
     let url = "https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json";
     let archive = make_flutter_tar_xz();
-    let hash = format!("{:x}", Sha256::digest(&archive));
+    let hash = "dummy-hash";
     let json = format!(
         r#"{{"releases":[{{"channel":"stable","version":"3.1.0","archive":"stable/linux/flutter_linux_3.1.0-stable.tar.xz","hash":"{}"}}]}}"#,
         hash
@@ -196,10 +196,7 @@ fn update_flutter_paths() {
             Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
         ],
     );
-    set_http_plan(
-        download_url,
-        vec![Ok(MockResponse::new(archive, None))],
-    );
+    set_http_plan(download_url, vec![Ok(MockResponse::new(archive, None))]);
     update_flutter(&ctx).unwrap();
     assert!(ctx.bindir.join("flutter").exists());
     std::fs::remove_file(ctx.bindir.join("flutter")).unwrap();

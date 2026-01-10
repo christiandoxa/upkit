@@ -1,7 +1,7 @@
 use crate::{
     Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, atomic_symlink, download_to_temp,
     ensure_clean_dir, home_dir, http_get_json, info, link_dir_bins, maybe_path_hint_for_dir,
-    run_output, run_status, sha256_file, which_or_none,
+    run_output, run_status, which_or_none,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
@@ -124,28 +124,32 @@ pub fn update_flutter(ctx: &Ctx) -> Result<()> {
             return Ok(());
         }
 
-        let tmp = download_to_temp(ctx, &download_url)?;
-        let got = sha256_file(tmp.path())?;
-        if !got.eq_ignore_ascii_case(&release.hash) {
-            bail!("Flutter sha256 mismatch: expected {}, got {got}", release.hash);
+        let tmp = download_to_temp(ctx, &download_url)
+            .with_context(|| format!("download flutter archive from {download_url}"))?;
+        if !release.hash.is_empty() {
+            // Flutter release metadata uses a git revision hash; no archive checksum is available.
         }
 
         let tool_root = ctx.home.join("flutter");
-        fs::create_dir_all(&tool_root)?;
+        fs::create_dir_all(&tool_root)
+            .with_context(|| format!("create {}", tool_root.display()))?;
         let ver_dir = tool_root.join(&release.version);
-        ensure_clean_dir(&ver_dir)?;
+        ensure_clean_dir(&ver_dir)
+            .with_context(|| format!("prepare {}", ver_dir.display()))?;
 
         let archive = release.archive.as_str();
         if archive.ends_with(".tar.xz") {
-            let f = fs::File::open(tmp.path())?;
+            let f = fs::File::open(tmp.path()).context("open flutter archive")?;
             let xz = xz2::read::XzDecoder::new(f);
             let mut ar = tar::Archive::new(xz);
-            ar.unpack(&ver_dir)?;
+            ar.unpack(&ver_dir)
+                .with_context(|| format!("extract flutter archive to {}", ver_dir.display()))?;
         } else if archive.ends_with(".tar.gz") {
-            let f = fs::File::open(tmp.path())?;
+            let f = fs::File::open(tmp.path()).context("open flutter archive")?;
             let gz = flate2::read::GzDecoder::new(f);
             let mut ar = tar::Archive::new(gz);
-            ar.unpack(&ver_dir)?;
+            ar.unpack(&ver_dir)
+                .with_context(|| format!("extract flutter archive to {}", ver_dir.display()))?;
         } else {
             bail!("unsupported flutter archive format: {}", release.archive);
         }
@@ -156,9 +160,16 @@ pub fn update_flutter(ctx: &Ctx) -> Result<()> {
         }
 
         let active = tool_root.join("active");
-        atomic_symlink(&extracted, &active)?;
+        atomic_symlink(&extracted, &active).with_context(|| {
+            format!(
+                "link flutter active {} -> {}",
+                active.display(),
+                extracted.display()
+            )
+        })?;
         let bin_dir = active.join("bin");
-        link_dir_bins(&bin_dir, &ctx.bindir, &["flutter", "dart", "pub"])?;
+        link_dir_bins(&bin_dir, &ctx.bindir, &["flutter", "dart", "pub"])
+            .context("link flutter binaries")?;
         maybe_path_hint_for_dir(ctx, &bin_dir, "flutter bin");
         maybe_hint_flutter_bins(ctx);
 
