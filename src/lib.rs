@@ -38,55 +38,55 @@ pub mod tools;
 #[command(about = "Check and update Go/Rust/Node/Python/Flutter", long_about = None)]
 pub struct Cli {
     /// Print JSON instead of pretty text
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub json: bool,
 
     /// Assume "yes" for prompts (non-interactive)
-    #[arg(short = 'y', long)]
+    #[arg(short = 'y', long, global = true)]
     pub yes: bool,
 
     /// Increase verbosity (-v, -vv)
-    #[arg(short = 'v', long, action = clap::ArgAction::Count)]
+    #[arg(short = 'v', long, action = clap::ArgAction::Count, global = true)]
     pub verbose: u8,
 
     /// Suppress non-error output
-    #[arg(short = 'q', long)]
+    #[arg(short = 'q', long, global = true)]
     pub quiet: bool,
 
     /// Disable ANSI colors
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub no_color: bool,
 
     /// Don't perform actions; only show what would happen
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub dry_run: bool,
 
     /// Disable progress indicators
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub no_progress: bool,
 
     /// Disable network access (skip latest checks and downloads)
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub offline: bool,
 
     /// Network timeout in seconds
-    #[arg(long, default_value_t = 60)]
+    #[arg(long, default_value_t = 60, global = true)]
     pub timeout: u64,
 
     /// Retry failed network requests this many times
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, default_value_t = 2, global = true)]
     pub retries: u8,
 
     /// Limit which tools to operate on
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, global = true)]
     pub only: Option<ToolKind>,
 
     /// Where upkit stores tool installs (default: ~/.local/share/upkit)
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub home: Option<PathBuf>,
 
     /// Where upkit places symlinks (default: ~/.local/bin)
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub bindir: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -113,6 +113,14 @@ pub enum Commands {
         /// Tools to clean (skips interactive selection)
         tools: Vec<ToolKind>,
         /// Clean all tools (skip interactive selection)
+        #[arg(long)]
+        all: bool,
+    },
+    /// Uninstall managed tool installs and symlinks
+    Uninstall {
+        /// Tools to uninstall (skips interactive selection)
+        tools: Vec<ToolKind>,
+        /// Uninstall all tools (skip interactive selection)
         #[arg(long)]
         all: bool,
     },
@@ -614,100 +622,10 @@ pub fn run(cli: &Cli, ctx: &mut Ctx) -> Result<()> {
             maybe_path_hint(ctx);
         }
         Commands::Clean { tools, all } => {
-            ensure_dirs(ctx)?;
-            let mut overall_pb = start_spinner(ctx, "Preparing clean plan...");
-            let targets = if !tools.is_empty() {
-                tools
-            } else if all {
-                select_kinds(cli.only)
-            } else {
-                if !ctx.stdin_is_tty && !ctx.yes {
-                    return Err(anyhow!(
-                        "non-interactive mode: pass tool names, or use --all/--yes to accept defaults"
-                    ));
-                }
-                if cli.json && !ctx.yes {
-                    return Err(anyhow!(
-                        "JSON mode requires --yes or explicit tool selection"
-                    ));
-                }
-                let tools = select_kinds(cli.only);
-                let labels = tools
-                    .iter()
-                    .map(|t| t.as_str().to_string())
-                    .collect::<Vec<_>>();
-                let chosen_idx = if ctx.yes {
-                    (0..tools.len()).collect::<Vec<_>>()
-                } else {
-                    finish_spinner(overall_pb.take(), "Clean plan ready");
-                    ctx.prompt
-                        .multi_select("Remove which tool installs?", &labels)?
-                };
-                chosen_idx.into_iter().map(|i| tools[i]).collect()
-            };
-            finish_spinner(overall_pb, "Clean plan ready");
-
-            if targets.is_empty() {
-                info(ctx, "Nothing selected.");
-                return Ok(());
-            }
-
-            if !ctx.yes {
-                let mut summary = String::new();
-                for t in &targets {
-                    summary.push_str(&format!("- {}\n", t.as_str()));
-                }
-                info(ctx, format!("Clean plan:\n{summary}"));
-                let ok = ctx.prompt.confirm("Proceed?", false)?;
-                if !ok {
-                    info(ctx, "Canceled.");
-                    return Ok(());
-                }
-            }
-
-            let mut failures = Vec::new();
-            let mut results = Vec::new();
-            for t in targets {
-                let pb = start_spinner(ctx, &format!("Cleaning {}", t.as_str()));
-                let result = clean_tool(ctx, t);
-                if let Err(err) = result {
-                    finish_spinner(pb, &format!("Failed to clean {}", t.as_str()));
-                    if !cli.json {
-                        error(format!("Failed to clean {}: {err}", t.as_str()));
-                    }
-                    failures.push(format!("- {}: {err}", t.as_str()));
-                    results.push(serde_json::json!({
-                        "tool": t.as_str(),
-                        "ok": false,
-                        "error": err.to_string(),
-                    }));
-                } else {
-                    finish_spinner(pb, &format!("Cleaned {}", t.as_str()));
-                    results.push(serde_json::json!({
-                        "tool": t.as_str(),
-                        "ok": true,
-                    }));
-                }
-            }
-            if !failures.is_empty() {
-                if cli.json {
-                    let payload = serde_json::json!({
-                        "command": "clean",
-                        "ok": false,
-                        "results": results,
-                    });
-                    emit_json(ctx, payload)?;
-                }
-                return Err(anyhow!("some clean steps failed:\n{}", failures.join("\n")));
-            }
-            if cli.json {
-                let payload = serde_json::json!({
-                    "command": "clean",
-                    "ok": true,
-                    "results": results,
-                });
-                emit_json(ctx, payload)?;
-            }
+            run_clean_command(ctx, cli, tools, all, CleanAction::Clean)?;
+        }
+        Commands::Uninstall { tools, all } => {
+            run_clean_command(ctx, cli, tools, all, CleanAction::Uninstall)?;
         }
         Commands::Doctor => {
             ensure_dirs(ctx)?;
@@ -734,6 +652,142 @@ pub fn run(cli: &Cli, ctx: &mut Ctx) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+#[derive(Copy, Clone, Debug)]
+enum CleanAction {
+    Clean,
+    Uninstall,
+}
+
+impl CleanAction {
+    fn verb(self) -> &'static str {
+        match self {
+            CleanAction::Clean => "clean",
+            CleanAction::Uninstall => "uninstall",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            CleanAction::Clean => "Clean",
+            CleanAction::Uninstall => "Uninstall",
+        }
+    }
+
+    fn prompt(self) -> &'static str {
+        match self {
+            CleanAction::Clean => "Remove which tool installs?",
+            CleanAction::Uninstall => "Uninstall which tool installs?",
+        }
+    }
+}
+
+fn run_clean_command(
+    ctx: &Ctx,
+    cli: &Cli,
+    tools: Vec<ToolKind>,
+    all: bool,
+    action: CleanAction,
+) -> Result<()> {
+    ensure_dirs(ctx)?;
+    let mut overall_pb = start_spinner(ctx, &format!("Preparing {} plan...", action.verb()));
+    let targets = if !tools.is_empty() {
+        tools
+    } else if all {
+        select_kinds(cli.only)
+    } else {
+        if !ctx.stdin_is_tty && !ctx.yes {
+            return Err(anyhow!(
+                "non-interactive mode: pass tool names, or use --all/--yes to accept defaults"
+            ));
+        }
+        if cli.json && !ctx.yes {
+            return Err(anyhow!(
+                "JSON mode requires --yes or explicit tool selection"
+            ));
+        }
+        let tools = select_kinds(cli.only);
+        let labels = tools
+            .iter()
+            .map(|t| t.as_str().to_string())
+            .collect::<Vec<_>>();
+        let chosen_idx = if ctx.yes {
+            (0..tools.len()).collect::<Vec<_>>()
+        } else {
+            finish_spinner(overall_pb.take(), &format!("{} plan ready", action.title()));
+            ctx.prompt.multi_select(action.prompt(), &labels)?
+        };
+        chosen_idx.into_iter().map(|i| tools[i]).collect()
+    };
+    finish_spinner(overall_pb, &format!("{} plan ready", action.title()));
+
+    if targets.is_empty() {
+        info(ctx, "Nothing selected.");
+        return Ok(());
+    }
+
+    if !ctx.yes {
+        let mut summary = String::new();
+        for t in &targets {
+            summary.push_str(&format!("- {}\n", t.as_str()));
+        }
+        info(ctx, format!("{} plan:\n{summary}", action.title()));
+        let ok = ctx.prompt.confirm("Proceed?", false)?;
+        if !ok {
+            info(ctx, "Canceled.");
+            return Ok(());
+        }
+    }
+
+    let mut failures = Vec::new();
+    let mut results = Vec::new();
+    for t in targets {
+        let pb = start_spinner(ctx, &format!("{} {}", action.title(), t.as_str()));
+        let result = clean_tool(ctx, t);
+        if let Err(err) = result {
+            finish_spinner(pb, &format!("Failed to {} {}", action.verb(), t.as_str()));
+            if !cli.json {
+                error(format!("Failed to {} {}: {err}", action.verb(), t.as_str()));
+            }
+            failures.push(format!("- {}: {err}", t.as_str()));
+            results.push(serde_json::json!({
+                "tool": t.as_str(),
+                "ok": false,
+                "error": err.to_string(),
+            }));
+        } else {
+            finish_spinner(pb, &format!("{}ed {}", action.title(), t.as_str()));
+            results.push(serde_json::json!({
+                "tool": t.as_str(),
+                "ok": true,
+            }));
+        }
+    }
+    if !failures.is_empty() {
+        if cli.json {
+            let payload = serde_json::json!({
+                "command": action.verb(),
+                "ok": false,
+                "results": results,
+            });
+            emit_json(ctx, payload)?;
+        }
+        return Err(anyhow!(
+            "some {} steps failed:\n{}",
+            action.verb(),
+            failures.join("\n")
+        ));
+    }
+    if cli.json {
+        let payload = serde_json::json!({
+            "command": action.verb(),
+            "ok": true,
+            "results": results,
+        });
+        emit_json(ctx, payload)?;
+    }
     Ok(())
 }
 
@@ -1425,7 +1479,8 @@ pub fn tool_bin_names(tool: ToolKind) -> &'static [&'static str] {
         ToolKind::Go => &["go", "gofmt"],
         ToolKind::Node => &["node", "npm", "npx", "corepack"],
         ToolKind::Python => &["python", "python3", "pip", "pip3"],
-        ToolKind::Rust | ToolKind::Flutter => &[],
+        ToolKind::Flutter => &["flutter", "dart", "pub"],
+        ToolKind::Rust => &[],
     }
 }
 
@@ -1725,6 +1780,7 @@ pub fn map_error_to_exit_code(err: &anyhow::Error) -> u8 {
     let msg = err.to_string();
     if msg.starts_with("some updates failed")
         || msg.starts_with("some clean steps failed")
+        || msg.starts_with("some uninstall steps failed")
         || msg.starts_with("doctor found")
     {
         2

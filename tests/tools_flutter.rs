@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -18,6 +19,22 @@ fn ctx_with_dirs() -> (Ctx, tempfile::TempDir) {
     (ctx, dir)
 }
 
+fn make_flutter_tar_xz() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    {
+        let enc = xz2::write::XzEncoder::new(&mut bytes, 6);
+        let mut tar = tar::Builder::new(enc);
+        for path in ["flutter/bin/flutter", "flutter/bin/dart", "flutter/bin/pub"] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_cksum();
+            tar.append_data(&mut header, path, std::io::empty()).unwrap();
+        }
+        tar.finish().unwrap();
+    }
+    bytes
+}
+
 #[test]
 fn flutter_releases_url_and_latest() {
     let (mut ctx, _dir) = ctx_with_dirs();
@@ -33,10 +50,13 @@ fn flutter_releases_url_and_latest() {
     let _guard = reset_guard();
     ctx.os = "linux".into();
     let url = "https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json";
-    let json = r#"{"releases":[{"channel":"stable","version":"3.10.0"},{"channel":"stable","version":"3.9.0"},{"channel":"beta","version":"4.0.0"}]}"#;
+    let json = r#"{"releases":[{"channel":"stable","version":"3.10.0","archive":"stable/linux/flutter_linux_3.10.0-stable.tar.xz","hash":"abc"},{"channel":"stable","version":"3.9.0","archive":"stable/linux/flutter_linux_3.9.0-stable.tar.xz","hash":"def"},{"channel":"beta","version":"4.0.0","archive":"beta/linux/flutter_linux_4.0.0-beta.tar.xz","hash":"ghi"}]}"#;
     set_http_plan(
         url,
-        vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
+        vec![
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+        ],
     );
     let v = flutter_latest_stable(&ctx).unwrap();
     assert_eq!(v.to_string(), "3.10.0");
@@ -48,10 +68,13 @@ fn flutter_latest_no_stable() {
     let (mut ctx, _dir) = ctx_with_dirs();
     ctx.os = "linux".into();
     let url = "https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json";
-    let json = r#"{"releases":[{"channel":"beta","version":"4.0.0"}]}"#;
+    let json = r#"{"releases":[{"channel":"beta","version":"4.0.0","archive":"beta/linux/flutter_linux_4.0.0-beta.tar.xz","hash":"abc"}]}"#;
     set_http_plan(
         url,
-        vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
+        vec![
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+        ],
     );
     let err = flutter_latest_stable(&ctx).unwrap_err();
     assert!(err.to_string().contains("flutter latest stable"));
@@ -76,10 +99,13 @@ fn flutter_installed_and_check() {
     assert_eq!(v.to_string(), "3.1.0");
 
     let url = "https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json";
-    let json = r#"{"releases":[{"channel":"stable","version":"3.1.0"}]}"#;
+    let json = r#"{"releases":[{"channel":"stable","version":"3.1.0","archive":"stable/linux/flutter_linux_3.1.0-stable.tar.xz","hash":"abc"}]}"#;
     set_http_plan(
         url,
-        vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
+        vec![
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+        ],
     );
     let report = check_flutter(&ctx).unwrap();
     assert!(matches!(report.status, Status::UpToDate));
@@ -87,7 +113,8 @@ fn flutter_installed_and_check() {
     set_http_plan(
         url,
         vec![Ok(MockResponse::new(
-            br#"{"releases":[{"channel":"stable","version":"3.2.0"}]}"#.to_vec(),
+            br#"{"releases":[{"channel":"stable","version":"3.2.0","archive":"stable/linux/flutter_linux_3.2.0-stable.tar.xz","hash":"abc"}]}"#
+                .to_vec(),
             None,
         ))],
     );
@@ -106,10 +133,13 @@ fn flutter_check_not_installed() {
     let (ctx, _dir) = ctx_with_dirs();
     set_which("flutter", None);
     let url = "https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json";
-    let json = r#"{"releases":[{"channel":"stable","version":"3.1.0"}]}"#;
+    let json = r#"{"releases":[{"channel":"stable","version":"3.1.0","archive":"stable/linux/flutter_linux_3.1.0-stable.tar.xz","hash":"abc"}]}"#;
     set_http_plan(
         url,
-        vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
+        vec![
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+        ],
     );
     let report = check_flutter(&ctx).unwrap();
     assert!(matches!(report.status, Status::NotInstalled));
@@ -129,10 +159,13 @@ fn flutter_check_uses_bindir() {
         output_with_status(0, br#"{"frameworkVersion":"3.1.0"}"#, b""),
     );
     let url = "https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json";
-    let json = r#"{"releases":[{"channel":"stable","version":"3.1.0"}]}"#;
+    let json = r#"{"releases":[{"channel":"stable","version":"3.1.0","archive":"stable/linux/flutter_linux_3.1.0-stable.tar.xz","hash":"abc"}]}"#;
     set_http_plan(
         url,
-        vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
+        vec![
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+        ],
     );
     let report = check_flutter(&ctx).unwrap();
     assert!(matches!(report.status, Status::UpToDate));
@@ -147,11 +180,31 @@ fn update_flutter_paths() {
 
     ctx.offline = false;
     set_which("flutter", None);
-    assert!(update_flutter(&ctx).is_err());
+    std::fs::create_dir_all(&ctx.bindir).unwrap();
+    let url = "https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json";
+    let archive = make_flutter_tar_xz();
+    let hash = format!("{:x}", Sha256::digest(&archive));
+    let json = format!(
+        r#"{{"releases":[{{"channel":"stable","version":"3.1.0","archive":"stable/linux/flutter_linux_3.1.0-stable.tar.xz","hash":"{}"}}]}}"#,
+        hash
+    );
+    let download_url = "https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_3.1.0-stable.tar.xz";
+    set_http_plan(
+        url,
+        vec![
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+        ],
+    );
+    set_http_plan(
+        download_url,
+        vec![Ok(MockResponse::new(archive, None))],
+    );
+    update_flutter(&ctx).unwrap();
+    assert!(ctx.bindir.join("flutter").exists());
+    std::fs::remove_file(ctx.bindir.join("flutter")).unwrap();
 
     set_which("flutter", Some(PathBuf::from("/bin/flutter")));
-    let url = "https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json";
-    let json = r#"{"releases":[{"channel":"stable","version":"3.1.0"}]}"#;
     set_http_plan(
         url,
         vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],

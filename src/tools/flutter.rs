@@ -1,10 +1,16 @@
 use crate::{
-    Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, home_dir, http_get_json, info,
-    maybe_path_hint_for_dir, run_output, run_status, which_or_none,
+    Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, atomic_symlink, download_to_temp,
+    ensure_clean_dir, home_dir, http_get_json, info, link_dir_bins, maybe_path_hint_for_dir,
+    run_output, run_status, sha256_file, which_or_none,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
-use std::{env, ffi::OsStr, path::{Path, PathBuf}};
+use std::{
+    env,
+    ffi::OsStr,
+    fs,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Deserialize)]
 struct FlutterReleases {
@@ -15,7 +21,8 @@ struct FlutterReleases {
 struct FlutterReleaseEntry {
     channel: String,
     version: String,
-    // archive, hash, dart_sdk_version, release_date, etc. exist, but we only need version+channel
+    archive: String,
+    hash: String,
 }
 
 pub fn flutter_releases_url(ctx: &Ctx) -> Result<&'static str> {
@@ -34,18 +41,25 @@ pub fn flutter_releases_url(ctx: &Ctx) -> Result<&'static str> {
     }
 }
 
-pub fn flutter_latest_stable(ctx: &Ctx) -> Result<Version> {
+fn flutter_latest_stable_release(ctx: &Ctx) -> Result<FlutterReleaseEntry> {
     let url = flutter_releases_url(ctx)?;
     let data: FlutterReleases = http_get_json(ctx, url)?;
-    let mut best: Option<Version> = None;
+    let mut best: Option<(Version, FlutterReleaseEntry)> = None;
     for r in data.releases.into_iter().filter(|r| r.channel == "stable") {
         if let Some(v) = Version::parse_loose(&r.version) {
-            if best.as_ref().map(|b| &v > b).unwrap_or(true) {
-                best = Some(v);
+            if best.as_ref().map(|(b, _)| &v > b).unwrap_or(true) {
+                best = Some((v, r));
             }
         }
     }
-    best.ok_or_else(|| anyhow!("could not determine flutter latest stable"))
+    best.map(|(_, r)| r)
+        .ok_or_else(|| anyhow!("could not determine flutter latest stable"))
+}
+
+pub fn flutter_latest_stable(ctx: &Ctx) -> Result<Version> {
+    let release = flutter_latest_stable_release(ctx)?;
+    Version::parse_loose(&release.version)
+        .ok_or_else(|| anyhow!("could not parse flutter version {}", release.version))
 }
 
 pub fn flutter_installed_version(bin: Option<&Path>) -> Option<Version> {
@@ -96,8 +110,60 @@ pub fn update_flutter(ctx: &Ctx) -> Result<()> {
     }
     let report = check_flutter(ctx)?;
     let bindir_flutter = flutter_bin_in_bindir(ctx);
-    if bindir_flutter.is_none() && which_or_none("flutter").is_none() {
-        bail!("flutter not found in PATH; install Flutter SDK first");
+    let flutter_in_path = which_or_none("flutter").is_some();
+
+    if bindir_flutter.is_none() && !flutter_in_path {
+        let release = flutter_latest_stable_release(ctx)?;
+        info(ctx, format!("Installing flutter {}", release.version));
+        let download_url = format!(
+            "https://storage.googleapis.com/flutter_infra_release/releases/{}",
+            release.archive
+        );
+        if ctx.dry_run {
+            info(ctx, format!("[dry-run] would download {download_url}"));
+            return Ok(());
+        }
+
+        let tmp = download_to_temp(ctx, &download_url)?;
+        let got = sha256_file(tmp.path())?;
+        if !got.eq_ignore_ascii_case(&release.hash) {
+            bail!("Flutter sha256 mismatch: expected {}, got {got}", release.hash);
+        }
+
+        let tool_root = ctx.home.join("flutter");
+        fs::create_dir_all(&tool_root)?;
+        let ver_dir = tool_root.join(&release.version);
+        ensure_clean_dir(&ver_dir)?;
+
+        let archive = release.archive.as_str();
+        if archive.ends_with(".tar.xz") {
+            let f = fs::File::open(tmp.path())?;
+            let xz = xz2::read::XzDecoder::new(f);
+            let mut ar = tar::Archive::new(xz);
+            ar.unpack(&ver_dir)?;
+        } else if archive.ends_with(".tar.gz") {
+            let f = fs::File::open(tmp.path())?;
+            let gz = flate2::read::GzDecoder::new(f);
+            let mut ar = tar::Archive::new(gz);
+            ar.unpack(&ver_dir)?;
+        } else {
+            bail!("unsupported flutter archive format: {}", release.archive);
+        }
+
+        let extracted = ver_dir.join("flutter");
+        if !extracted.exists() {
+            bail!("unexpected flutter archive layout (missing flutter/ directory)");
+        }
+
+        let active = tool_root.join("active");
+        atomic_symlink(&extracted, &active)?;
+        let bin_dir = active.join("bin");
+        link_dir_bins(&bin_dir, &ctx.bindir, &["flutter", "dart", "pub"])?;
+        maybe_path_hint_for_dir(ctx, &bin_dir, "flutter bin");
+        maybe_hint_flutter_bins(ctx);
+
+        info(ctx, "flutter installed");
+        return Ok(());
     }
 
     if matches!(report.status, Status::UpToDate) && !ctx.force {

@@ -365,6 +365,8 @@ fn reports_json_and_errors() {
 
     let err = anyhow::anyhow!("some updates failed: test");
     assert_eq!(map_error_to_exit_code(&err), 2);
+    let err = anyhow::anyhow!("some uninstall steps failed: test");
+    assert_eq!(map_error_to_exit_code(&err), 2);
     let err = anyhow::anyhow!("non-interactive mode");
     assert_eq!(map_error_to_exit_code(&err), 3);
     let err = anyhow::anyhow!("other");
@@ -765,6 +767,10 @@ fn run_command_paths_check_update_clean() {
     let tool_root = home.join("go");
     fs::write(&tool_root, b"not a dir").unwrap();
     assert!(run(&cli, &mut ctx).is_err());
+
+    let cli = Cli::parse_from(["upkit", "-y", "--dry-run", "uninstall", "go"]);
+    let mut ctx = ctx_from_cli(&cli, home.clone(), bindir.clone(), prompt.clone());
+    run(&cli, &mut ctx).unwrap();
 }
 
 #[test]
@@ -1012,7 +1018,10 @@ fn colorize_and_tool_bins_variants() {
         &["python", "python3", "pip", "pip3"]
     );
     assert!(tool_bin_names(ToolKind::Rust).is_empty());
-    assert!(tool_bin_names(ToolKind::Flutter).is_empty());
+    assert_eq!(
+        tool_bin_names(ToolKind::Flutter),
+        &["flutter", "dart", "pub"]
+    );
 }
 
 #[test]

@@ -5,7 +5,7 @@ use std::{collections::HashMap, ffi::OsStr, fs, path::PathBuf};
 use crate::{
     Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, atomic_symlink, download_to_temp,
     ensure_clean_dir, http_get_json, http_get_text, info, link_dir_bins,
-    maybe_path_hint_for_dir, run_capture, sha256_file, which_or_none,
+    maybe_path_hint_for_dir, run_capture, sha256_file, warn, which_or_none,
 };
 
 #[derive(Debug, Deserialize)]
@@ -178,7 +178,9 @@ pub fn update_node(ctx: &Ctx) -> Result<()> {
 
     let bin_dir = active.join("bin");
     link_dir_bins(&bin_dir, &ctx.bindir, &["node", "npm", "npx", "corepack"])?;
-    ensure_npm_prefix(&active)?;
+    if let Err(err) = ensure_npm_prefix(&active) {
+        warn(ctx, format!("Failed to set npm prefix: {err}"));
+    }
     maybe_path_hint_for_dir(ctx, &bin_dir, "npm global bin");
 
     info(ctx, format!("node updated to {}", latest.to_string()));
