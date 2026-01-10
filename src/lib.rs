@@ -189,6 +189,7 @@ pub struct Ctx {
     pub no_progress: bool,
     pub offline: bool,
     pub retries: u8,
+    pub timeout: u64,
     pub force: bool,
     pub json: bool,
     pub use_color: bool,
@@ -799,8 +800,8 @@ pub fn make_ctx(cli: &Cli) -> Result<Ctx> {
         .user_agent("upkit/0.1 (github.com/christiandoxa/upkit)")
         .timeout(Duration::from_secs(cli.timeout));
     if let Some(cert_path) = get_env_var("SSL_CERT_FILE") {
-        let pem = fs::read(&cert_path)
-            .with_context(|| format!("read SSL_CERT_FILE {}", cert_path))?;
+        let pem =
+            fs::read(&cert_path).with_context(|| format!("read SSL_CERT_FILE {}", cert_path))?;
         let cert = Certificate::from_pem(&pem)
             .with_context(|| format!("parse SSL_CERT_FILE {}", cert_path))?;
         http_builder = http_builder.add_root_certificate(cert);
@@ -843,6 +844,7 @@ pub fn make_ctx(cli: &Cli) -> Result<Ctx> {
         no_progress: cli.no_progress,
         offline: cli.offline,
         retries: cli.retries,
+        timeout: cli.timeout,
         force: false,
         json: cli.json,
         use_color,
@@ -924,11 +926,6 @@ pub fn maybe_path_hint_for_dir(ctx: &Ctx, dir: &Path, label: &str) {
     if ctx.quiet {
         return;
     }
-    let dir_str = dir.to_string_lossy();
-    let path = get_env_var("PATH").unwrap_or_default();
-    if env::split_paths(&path).any(|p| p == dir) {
-        return;
-    }
     let shell = get_env_var("SHELL").unwrap_or_default();
     let rc = if shell.ends_with("zsh") {
         "~/.zshrc"
@@ -939,41 +936,77 @@ pub fn maybe_path_hint_for_dir(ctx: &Ctx, dir: &Path, label: &str) {
     } else {
         "~/.profile"
     };
-    let rc_path = expand_tilde(rc);
-    let dir_string = dir_str.to_string();
-    let already_configured = rc_path
-        .as_ref()
-        .and_then(|p| fs::read_to_string(p).ok())
-        .map(|content| content.contains(&dir_string))
-        .unwrap_or(false);
-    if already_configured {
-        return;
-    }
-    let rc_path = match rc_path {
+    let rc_path = match expand_tilde(rc) {
         Some(p) => p,
         None => {
             warn(ctx, "Could not resolve shell rc file to update PATH.");
             return;
         }
     };
-    let line = if shell.ends_with("fish") {
-        format!(
-            "\n# upkit ({label})\nset -gx PATH {} $PATH\n",
-            dir.display()
-        )
-    } else {
-        format!(
-            "\n# upkit ({label})\nexport PATH=\"{}:$PATH\"\n",
-            dir.display()
-        )
-    };
+
+    let label_line = format!("# upkit ({label})");
+    let path_line = path_hint_line(&shell, dir);
+    let dir_string = dir.to_string_lossy().to_string();
+    let existing = fs::read_to_string(&rc_path).ok();
+    let mut found_label = false;
+    let mut updated = false;
+    let mut lines = Vec::new();
+
+    if let Some(content) = &existing {
+        let mut iter = content.lines().peekable();
+        while let Some(line) = iter.next() {
+            if line.trim_end() == label_line {
+                found_label = true;
+                lines.push(label_line.clone());
+                if let Some(next_line) = iter.peek().map(|next| next.trim_end()) {
+                    if next_line != path_line {
+                        updated = true;
+                    }
+                    iter.next();
+                } else {
+                    updated = true;
+                }
+                lines.push(path_line.clone());
+                continue;
+            }
+            lines.push(line.to_string());
+        }
+    }
+
+    if !found_label {
+        let path = get_env_var("PATH").unwrap_or_default();
+        if env::split_paths(&path).any(|p| p == dir) {
+            return;
+        }
+        let already_configured = existing
+            .as_ref()
+            .map(|content| content.contains(&dir_string))
+            .unwrap_or(false);
+        if already_configured {
+            return;
+        }
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push(label_line);
+        lines.push(path_line);
+        updated = true;
+    }
+
+    if !updated {
+        return;
+    }
+
+    let mut output = lines.join("\n");
+    output.push('\n');
     match fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .truncate(true)
         .open(&rc_path)
     {
         Ok(mut f) => {
-            if let Err(err) = write_all_checked(&mut f, line.as_bytes()) {
+            if let Err(err) = write_all_checked(&mut f, output.as_bytes()) {
                 warn(
                     ctx,
                     format!("Failed to update PATH in {}: {err}", rc_path.display()),
@@ -994,6 +1027,94 @@ pub fn maybe_path_hint_for_dir(ctx: &Ctx, dir: &Path, label: &str) {
                 format!("Failed to open {} to update PATH: {err}", rc_path.display()),
             );
         }
+    }
+}
+
+pub fn remove_path_hint_for_label(ctx: &Ctx, label: &str) {
+    if ctx.quiet {
+        return;
+    }
+    let shell = get_env_var("SHELL").unwrap_or_default();
+    let rc = if shell.ends_with("zsh") {
+        "~/.zshrc"
+    } else if shell.ends_with("fish") {
+        "~/.config/fish/config.fish"
+    } else if shell.ends_with("bash") {
+        "~/.bashrc"
+    } else {
+        "~/.profile"
+    };
+    let rc_path = match expand_tilde(rc) {
+        Some(p) => p,
+        None => {
+            warn(ctx, "Could not resolve shell rc file to update PATH.");
+            return;
+        }
+    };
+    let content = match fs::read_to_string(&rc_path) {
+        Ok(content) => content,
+        Err(_) => return,
+    };
+
+    let label_line = format!("# upkit ({label})");
+    let mut changed = false;
+    let mut lines = Vec::new();
+    let mut iter = content.lines().peekable();
+    while let Some(line) = iter.next() {
+        if line.trim_end() == label_line {
+            changed = true;
+            if let Some(next_line) = iter.peek() {
+                let trimmed = next_line.trim_start();
+                if trimmed.starts_with("export PATH=") || trimmed.starts_with("set -gx PATH") {
+                    iter.next();
+                }
+            }
+            continue;
+        }
+        lines.push(line.to_string());
+    }
+
+    if !changed {
+        return;
+    }
+    let mut output = lines.join("\n");
+    output.push('\n');
+    match fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&rc_path)
+    {
+        Ok(mut f) => {
+            if let Err(err) = write_all_checked(&mut f, output.as_bytes()) {
+                warn(
+                    ctx,
+                    format!("Failed to update PATH in {}: {err}", rc_path.display()),
+                );
+            } else {
+                info(
+                    ctx,
+                    format!(
+                        "PATH updated in {} (restart shell to apply).",
+                        rc_path.display()
+                    ),
+                );
+            }
+        }
+        Err(err) => {
+            warn(
+                ctx,
+                format!("Failed to open {} to update PATH: {err}", rc_path.display()),
+            );
+        }
+    }
+}
+
+fn path_hint_line(shell: &str, dir: &Path) -> String {
+    if shell.ends_with("fish") {
+        format!("set -gx PATH {} $PATH", dir.display())
+    } else {
+        format!("export PATH=\"{}:$PATH\"", dir.display())
     }
 }
 
@@ -1331,6 +1452,54 @@ pub fn http_get(ctx: &Ctx, url: &str) -> Result<Box<dyn HttpResponse>> {
     ))
 }
 
+#[cfg(coverage)]
+pub fn http_get_no_timeout(ctx: &Ctx, url: &str) -> Result<Box<dyn HttpResponse>> {
+    http_get(ctx, url)
+}
+
+#[cfg(not(coverage))]
+pub fn http_get_no_timeout(ctx: &Ctx, url: &str) -> Result<Box<dyn HttpResponse>> {
+    if ctx.offline {
+        bail!("offline mode enabled");
+    }
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..=ctx.retries {
+        if test_support::http_mocking_enabled() || test_support::http_allow_unknown_error() {
+            if let Some(resp) = test_support::next_http_response(url) {
+                match resp {
+                    Ok(r) => return Ok(r),
+                    Err(err) => last_err = Some(err),
+                }
+            } else if !test_support::http_allow_unknown_error() {
+                last_err = Some(anyhow!("no test response left"));
+            }
+        } else {
+            let long_timeout = ctx.timeout.saturating_mul(10).max(600);
+            let resp = ctx
+                .http
+                .get(url)
+                .timeout(Duration::from_secs(long_timeout))
+                .send();
+            match resp {
+                Ok(r) => match r.error_for_status() {
+                    Ok(r) => return Ok(Box::new(ReqwestResponse { inner: r })),
+                    Err(err) => last_err = Some(err.into()),
+                },
+                Err(err) => last_err = Some(err.into()),
+            }
+        }
+        if attempt < ctx.retries {
+            let backoff = 250u64.saturating_mul(2u64.pow(attempt as u32));
+            sleep_for(Duration::from_millis(backoff));
+        }
+    }
+    Err(anyhow!(
+        "request failed after {} attempt(s): {}",
+        ctx.retries + 1,
+        last_err.unwrap_or_else(|| anyhow!("unknown error"))
+    ))
+}
+
 pub fn http_get_json<T: DeserializeOwned>(ctx: &Ctx, url: &str) -> Result<T> {
     let mut resp = http_get(ctx, url)?;
     let mut buf = Vec::new();
@@ -1361,7 +1530,7 @@ fn sha256_file(path: &Path) -> Result<String> {
 
 pub fn download_to_temp(ctx: &Ctx, url: &str) -> Result<NamedTempFile> {
     let show_progress = progress_allowed(ctx);
-    let mut resp = http_get(ctx, url)?;
+    let mut resp = http_get_no_timeout(ctx, url)?;
     let mut tmp = NamedTempFile::new()?;
     let total = resp.content_length();
     if show_progress && progress_overwrite_allowed(ctx) {
@@ -1484,6 +1653,16 @@ pub fn tool_bin_names(tool: ToolKind) -> &'static [&'static str] {
     }
 }
 
+pub fn tool_path_hint_labels(tool: ToolKind) -> &'static [&'static str] {
+    match tool {
+        ToolKind::Go => &["go GOBIN", "go GOPATH/bin"],
+        ToolKind::Node => &["npm global bin"],
+        ToolKind::Python => &["python user base bin"],
+        ToolKind::Flutter => &["flutter bin", "pub cache bin"],
+        ToolKind::Rust => &["cargo bin"],
+    }
+}
+
 pub fn clean_tool(ctx: &Ctx, tool: ToolKind) -> Result<()> {
     let tool_root = ctx.home.join(tool.as_str());
     if ctx.dry_run {
@@ -1517,6 +1696,10 @@ pub fn clean_tool(ctx: &Ctx, tool: ToolKind) -> Result<()> {
             }
             fs::remove_file(&dst).with_context(|| format!("remove {}", dst.display()))?;
         }
+    }
+
+    for &label in tool_path_hint_labels(tool) {
+        remove_path_hint_for_label(ctx, label);
     }
 
     info(ctx, format!("cleaned {}", tool.as_str()));
@@ -2173,6 +2356,7 @@ pub mod test_support {
             no_progress: false,
             offline: false,
             retries: 0,
+            timeout: 1,
             force: false,
             json: false,
             use_color: false,

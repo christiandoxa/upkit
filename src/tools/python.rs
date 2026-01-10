@@ -26,8 +26,7 @@ pub fn check_python(ctx: &Ctx) -> Result<ToolReport> {
         let args = [OsStr::new("--version")];
         run_capture(bin.as_os_str(), &args).ok()
     } else {
-        which_or_none("python3")
-            .and_then(|_| run_capture("python3", &["--version"]).ok())
+        which_or_none("python3").and_then(|_| run_capture("python3", &["--version"]).ok())
     }
     .and_then(|out| Version::parse_loose(&out))
     .or_else(|| {
@@ -35,8 +34,7 @@ pub fn check_python(ctx: &Ctx) -> Result<ToolReport> {
             let args = [OsStr::new("--version")];
             run_capture(bin.as_os_str(), &args).ok()
         } else {
-            which_or_none("python")
-                .and_then(|_| run_capture("python", &["--version"]).ok())
+            which_or_none("python").and_then(|_| run_capture("python", &["--version"]).ok())
         }
         .and_then(|out| Version::parse_loose(&out))
     });

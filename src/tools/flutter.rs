@@ -127,7 +127,10 @@ pub fn update_flutter(ctx: &Ctx) -> Result<()> {
         let tmp = download_to_temp(ctx, &download_url)?;
         let got = sha256_file(tmp.path())?;
         if !got.eq_ignore_ascii_case(&release.hash) {
-            bail!("Flutter sha256 mismatch: expected {}, got {got}", release.hash);
+            bail!(
+                "Flutter sha256 mismatch: expected {}, got {got}",
+                release.hash
+            );
         }
 
         let tool_root = ctx.home.join("flutter");

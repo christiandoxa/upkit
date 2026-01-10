@@ -4,8 +4,8 @@ use std::{collections::HashMap, ffi::OsStr, fs, path::PathBuf};
 
 use crate::{
     Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, atomic_symlink, download_to_temp,
-    ensure_clean_dir, http_get_json, http_get_text, info, link_dir_bins,
-    maybe_path_hint_for_dir, run_capture, sha256_file, warn, which_or_none,
+    ensure_clean_dir, http_get_json, http_get_text, info, link_dir_bins, maybe_path_hint_for_dir,
+    run_capture, sha256_file, warn, which_or_none,
 };
 
 #[derive(Debug, Deserialize)]
@@ -38,8 +38,7 @@ pub fn check_node(ctx: &Ctx) -> Result<ToolReport> {
         let args = [OsStr::new("--version")];
         run_capture(bin.as_os_str(), &args).ok()
     } else {
-        which_or_none("node")
-            .and_then(|_| run_capture("node", &["--version"]).ok())
+        which_or_none("node").and_then(|_| run_capture("node", &["--version"]).ok())
     }
     .and_then(|out| Version::parse_loose(&out));
 
@@ -201,8 +200,8 @@ fn ensure_npm_prefix(active: &std::path::Path) -> Result<()> {
         ];
         run_capture(npm_path.as_os_str(), &args)
     }
-        .ok()
-        .map(|value| value.trim().to_string());
+    .ok()
+    .map(|value| value.trim().to_string());
     if current_prefix.as_deref() == Some(desired_prefix.as_str()) {
         return Ok(());
     }

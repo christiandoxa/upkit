@@ -28,7 +28,8 @@ fn make_flutter_tar_xz() -> Vec<u8> {
             let mut header = tar::Header::new_gnu();
             header.set_size(0);
             header.set_cksum();
-            tar.append_data(&mut header, path, std::io::empty()).unwrap();
+            tar.append_data(&mut header, path, std::io::empty())
+                .unwrap();
         }
         tar.finish().unwrap();
     }
@@ -196,10 +197,7 @@ fn update_flutter_paths() {
             Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
         ],
     );
-    set_http_plan(
-        download_url,
-        vec![Ok(MockResponse::new(archive, None))],
-    );
+    set_http_plan(download_url, vec![Ok(MockResponse::new(archive, None))]);
     update_flutter(&ctx).unwrap();
     assert!(ctx.bindir.join("flutter").exists());
     std::fs::remove_file(ctx.bindir.join("flutter")).unwrap();
