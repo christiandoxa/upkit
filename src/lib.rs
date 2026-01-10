@@ -585,9 +585,9 @@ pub fn run(cli: &Cli, ctx: &mut Ctx) -> Result<()> {
                 if let Err(err) = result {
                     finish_spinner(pb, &format!("Failed to update {}", t.as_str()));
                     if !cli.json {
-                        error(format!("Failed to update {}: {err}", t.as_str()));
+                        error(format!("Failed to update {}: {err:#}", t.as_str()));
                     }
-                    failures.push(format!("- {}: {err}", t.as_str()));
+                    failures.push(format!("- {}: {err:#}", t.as_str()));
                     results.push(serde_json::json!({
                         "tool": t.as_str(),
                         "ok": false,
@@ -1528,12 +1528,13 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+
 pub fn download_to_temp(ctx: &Ctx, url: &str) -> Result<NamedTempFile> {
     let show_progress = progress_allowed(ctx);
     let mut resp = http_get_no_timeout(ctx, url)?;
     let mut tmp = NamedTempFile::new()?;
     let total = resp.content_length();
-    if show_progress && progress_overwrite_allowed(ctx) {
+    let downloaded_total = if show_progress && progress_overwrite_allowed(ctx) {
         if let Some(total) = total {
             let pb =
                 ProgressBar::with_draw_target(Some(total), ProgressDrawTarget::stderr_with_hz(10));
@@ -1556,6 +1557,7 @@ pub fn download_to_temp(ctx: &Ctx, url: &str) -> Result<NamedTempFile> {
                 pb.set_position(downloaded);
             }
             pb.finish_with_message("Downloaded");
+            Some(downloaded)
         } else {
             let pb = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr_with_hz(10));
             pb.set_style(
@@ -1564,8 +1566,9 @@ pub fn download_to_temp(ctx: &Ctx, url: &str) -> Result<NamedTempFile> {
             );
             pb.set_message(format!("Downloading {url}"));
             pb.enable_steady_tick(Duration::from_millis(80));
-            io::copy(&mut resp, &mut tmp)?;
+            let downloaded = io::copy(&mut resp, &mut tmp)?;
             pb.finish_with_message("Downloaded");
+            Some(downloaded)
         }
     } else if show_progress {
         if let Some(total) = total {
@@ -1586,12 +1589,21 @@ pub fn download_to_temp(ctx: &Ctx, url: &str) -> Result<NamedTempFile> {
                 let pct = (downloaded.saturating_mul(100) / total).min(100);
                 info(ctx, format!("Downloading {url} [{pct}%]"));
             }
+            Some(downloaded)
         } else {
             info(ctx, format!("Downloading {url}"));
-            io::copy(&mut resp, &mut tmp)?;
+            Some(io::copy(&mut resp, &mut tmp)?)
         }
     } else {
-        io::copy(&mut resp, &mut tmp)?;
+        Some(io::copy(&mut resp, &mut tmp)?)
+    };
+
+    if let (Some(total), Some(downloaded)) = (total, downloaded_total) {
+        if downloaded < total {
+            bail!(
+                "download incomplete for {url}: expected {total} bytes, got {downloaded}"
+            );
+        }
     }
     Ok(tmp)
 }
