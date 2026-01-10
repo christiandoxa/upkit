@@ -813,6 +813,13 @@ fn run_update_flow_variants() {
     ctx.stdin_is_tty = false;
     assert!(run(&cli, &mut ctx).is_err());
 
+    let cli = Cli::parse_from(["upkit", "install", "go"]);
+    if let Some(Commands::Update { tools, .. }) = cli.cmd {
+        assert_eq!(tools, vec![ToolKind::Go]);
+    } else {
+        panic!("install should map to update");
+    }
+
     let cli = Cli::parse_from(["upkit", "--json", "update"]);
     let mut ctx = ctx_from_cli(&cli, home.clone(), bindir.clone(), prompt.clone());
     assert!(run(&cli, &mut ctx).is_err());

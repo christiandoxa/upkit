@@ -5,7 +5,7 @@ use std::{collections::HashMap, ffi::OsStr, fs, path::PathBuf};
 use crate::{
     Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, atomic_symlink, download_to_temp,
     ensure_clean_dir, http_get_json, http_get_text, info, link_dir_bins, maybe_path_hint_for_dir,
-    run_capture, sha256_file, warn, which_or_none,
+    prune_tool_versions, run_capture, sha256_file, warn, which_or_none,
 };
 
 #[derive(Debug, Deserialize)]
@@ -181,6 +181,10 @@ pub fn update_node(ctx: &Ctx) -> Result<()> {
         warn(ctx, format!("Failed to set npm prefix: {err}"));
     }
     maybe_path_hint_for_dir(ctx, &bin_dir, "npm global bin");
+
+    if let Err(err) = prune_tool_versions(&tool_root, &ver_dir, &["active"]) {
+        warn(ctx, format!("Failed to remove old node versions: {err}"));
+    }
 
     info(ctx, format!("node updated to {}", latest.to_string()));
     Ok(())

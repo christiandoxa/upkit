@@ -6,7 +6,7 @@ use std::{env, ffi::OsStr, fs, path::PathBuf};
 use crate::{
     Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, atomic_symlink, download_to_temp,
     ensure_clean_dir, home_dir, http_get_json, info, link_dir_bins, maybe_path_hint_for_dir,
-    run_capture, which_or_none,
+    prune_tool_versions, run_capture, warn, which_or_none,
 };
 
 #[derive(Debug, Deserialize)]
@@ -211,6 +211,10 @@ pub fn update_python(ctx: &Ctx) -> Result<()> {
     };
     link_dir_bins(&bin, &ctx.bindir, &["python", "python3", "pip", "pip3"])?;
     maybe_hint_python_bins(ctx, &active);
+
+    if let Err(err) = prune_tool_versions(&tool_root, &ver_dir, &["active"]) {
+        warn(ctx, format!("Failed to remove old python versions: {err}"));
+    }
 
     info(ctx, format!("python updated to {}", latest.to_string()));
     Ok(())

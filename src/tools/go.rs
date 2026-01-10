@@ -7,7 +7,7 @@ use std::{env, ffi::OsStr, fs};
 use crate::{
     Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, atomic_symlink, download_to_temp,
     ensure_clean_dir, get_env_var, home_dir, http_get_json, info, link_dir_bins,
-    maybe_path_hint_for_dir, run_capture, sha256_file, which_or_none,
+    maybe_path_hint_for_dir, prune_tool_versions, run_capture, sha256_file, warn, which_or_none,
 };
 
 #[derive(Debug, Deserialize)]
@@ -169,6 +169,10 @@ pub fn update_go(ctx: &Ctx) -> Result<()> {
     atomic_symlink(&extracted_go_dir, &active)?;
 
     ensure_go_wrappers(ctx, &tool_root, &active)?;
+
+    if let Err(err) = prune_tool_versions(&tool_root, &ver_dir, &["active", "wrappers"]) {
+        warn(ctx, format!("Failed to remove old go versions: {err}"));
+    }
 
     info(ctx, format!("go updated to {}", latest.to_string()));
     Ok(())
