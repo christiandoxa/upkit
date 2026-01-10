@@ -1979,13 +1979,16 @@ pub fn check_tools_parallel(ctx: &Ctx, tools: &[ToolKind]) -> Vec<ToolReport> {
 }
 
 pub fn check_tools_with_spinner(ctx: &Ctx, tools: &[ToolKind]) -> Vec<ToolReport> {
+    let pb = start_spinner(ctx, "Checking toolchains...");
     let mut out = Vec::new();
     for tool in tools {
-        let pb = start_spinner(ctx, &format!("Checking {}", tool.as_str()));
+        if let Some(ProgressHandle::Spinner(inner)) = pb.as_ref() {
+            inner.set_message(format!("Checking {}", tool.as_str()));
+        }
         let report = check_tool_safe(ctx, *tool);
-        finish_spinner(pb, &format!("Checked {}", tool.as_str()));
         out.push(report);
     }
+    finish_spinner(pb, "Checked toolchains");
     out
 }
 

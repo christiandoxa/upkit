@@ -86,16 +86,16 @@ fn flutter_installed_and_check() {
     let (ctx, _dir) = ctx_with_dirs();
     set_which("flutter", Some(PathBuf::from("/bin/flutter")));
     set_run_output(
-        "flutter",
+        "/bin/flutter",
         &["--version", "--machine"],
         output_with_status(0, br#"{"frameworkVersion":"3.1.0"}"#, b""),
     );
     set_run_output(
-        "flutter",
+        "/bin/flutter",
         &["--version", "--machine"],
         output_with_status(0, br#"{"frameworkVersion":"3.1.0"}"#, b""),
     );
-    let v = flutter_installed_version(None).unwrap();
+    let v = flutter_installed_version(std::path::Path::new("/bin/flutter")).unwrap();
     assert_eq!(v.to_string(), "3.1.0");
 
     let url = "https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json";
@@ -119,7 +119,7 @@ fn flutter_installed_and_check() {
         ))],
     );
     set_run_output(
-        "flutter",
+        "/bin/flutter",
         &["--version", "--machine"],
         output_with_status(0, br#"{"frameworkVersion":"3.1.0"}"#, b""),
     );
@@ -207,7 +207,7 @@ fn update_flutter_paths() {
         vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
     );
     set_run_output(
-        "flutter",
+        "/bin/flutter",
         &["--version", "--machine"],
         output_with_status(0, br#"{"frameworkVersion":"3.0.0"}"#, b""),
     );
@@ -220,7 +220,7 @@ fn update_flutter_paths() {
         vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
     );
     set_run_output(
-        "flutter",
+        "/bin/flutter",
         &["--version", "--machine"],
         output_with_status(0, br#"{"frameworkVersion":"3.0.0"}"#, b""),
     );
@@ -232,7 +232,7 @@ fn update_flutter_paths() {
         vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
     );
     set_run_output(
-        "flutter",
+        "/bin/flutter",
         &["--version", "--machine"],
         output_with_status(0, br#"{"frameworkVersion":"3.0.0"}"#, b""),
     );
@@ -245,7 +245,7 @@ fn update_flutter_paths() {
         vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
     );
     set_run_output(
-        "flutter",
+        "/bin/flutter",
         &["--version", "--machine"],
         output_with_status(0, br#"{"frameworkVersion":"3.1.0"}"#, b""),
     );
