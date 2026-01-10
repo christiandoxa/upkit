@@ -38,55 +38,55 @@ pub mod tools;
 #[command(about = "Check and update Go/Rust/Node/Python/Flutter", long_about = None)]
 pub struct Cli {
     /// Print JSON instead of pretty text
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub json: bool,
 
     /// Assume "yes" for prompts (non-interactive)
-    #[arg(short = 'y', long)]
+    #[arg(short = 'y', long, global = true)]
     pub yes: bool,
 
     /// Increase verbosity (-v, -vv)
-    #[arg(short = 'v', long, action = clap::ArgAction::Count)]
+    #[arg(short = 'v', long, action = clap::ArgAction::Count, global = true)]
     pub verbose: u8,
 
     /// Suppress non-error output
-    #[arg(short = 'q', long)]
+    #[arg(short = 'q', long, global = true)]
     pub quiet: bool,
 
     /// Disable ANSI colors
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub no_color: bool,
 
     /// Don't perform actions; only show what would happen
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub dry_run: bool,
 
     /// Disable progress indicators
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub no_progress: bool,
 
     /// Disable network access (skip latest checks and downloads)
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub offline: bool,
 
     /// Network timeout in seconds
-    #[arg(long, default_value_t = 60)]
+    #[arg(long, default_value_t = 60, global = true)]
     pub timeout: u64,
 
     /// Retry failed network requests this many times
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, default_value_t = 2, global = true)]
     pub retries: u8,
 
     /// Limit which tools to operate on
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, global = true)]
     pub only: Option<ToolKind>,
 
     /// Where upkit stores tool installs (default: ~/.local/share/upkit)
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub home: Option<PathBuf>,
 
     /// Where upkit places symlinks (default: ~/.local/bin)
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub bindir: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -113,6 +113,14 @@ pub enum Commands {
         /// Tools to clean (skips interactive selection)
         tools: Vec<ToolKind>,
         /// Clean all tools (skip interactive selection)
+        #[arg(long)]
+        all: bool,
+    },
+    /// Uninstall managed tool installs and symlinks
+    Uninstall {
+        /// Tools to uninstall (skips interactive selection)
+        tools: Vec<ToolKind>,
+        /// Uninstall all tools (skip interactive selection)
         #[arg(long)]
         all: bool,
     },
@@ -181,6 +189,7 @@ pub struct Ctx {
     pub no_progress: bool,
     pub offline: bool,
     pub retries: u8,
+    pub timeout: u64,
     pub force: bool,
     pub json: bool,
     pub use_color: bool,
@@ -576,9 +585,9 @@ pub fn run(cli: &Cli, ctx: &mut Ctx) -> Result<()> {
                 if let Err(err) = result {
                     finish_spinner(pb, &format!("Failed to update {}", t.as_str()));
                     if !cli.json {
-                        error(format!("Failed to update {}: {err}", t.as_str()));
+                        error(format!("Failed to update {}: {err:#}", t.as_str()));
                     }
-                    failures.push(format!("- {}: {err}", t.as_str()));
+                    failures.push(format!("- {}: {err:#}", t.as_str()));
                     results.push(serde_json::json!({
                         "tool": t.as_str(),
                         "ok": false,
@@ -614,100 +623,10 @@ pub fn run(cli: &Cli, ctx: &mut Ctx) -> Result<()> {
             maybe_path_hint(ctx);
         }
         Commands::Clean { tools, all } => {
-            ensure_dirs(ctx)?;
-            let mut overall_pb = start_spinner(ctx, "Preparing clean plan...");
-            let targets = if !tools.is_empty() {
-                tools
-            } else if all {
-                select_kinds(cli.only)
-            } else {
-                if !ctx.stdin_is_tty && !ctx.yes {
-                    return Err(anyhow!(
-                        "non-interactive mode: pass tool names, or use --all/--yes to accept defaults"
-                    ));
-                }
-                if cli.json && !ctx.yes {
-                    return Err(anyhow!(
-                        "JSON mode requires --yes or explicit tool selection"
-                    ));
-                }
-                let tools = select_kinds(cli.only);
-                let labels = tools
-                    .iter()
-                    .map(|t| t.as_str().to_string())
-                    .collect::<Vec<_>>();
-                let chosen_idx = if ctx.yes {
-                    (0..tools.len()).collect::<Vec<_>>()
-                } else {
-                    finish_spinner(overall_pb.take(), "Clean plan ready");
-                    ctx.prompt
-                        .multi_select("Remove which tool installs?", &labels)?
-                };
-                chosen_idx.into_iter().map(|i| tools[i]).collect()
-            };
-            finish_spinner(overall_pb, "Clean plan ready");
-
-            if targets.is_empty() {
-                info(ctx, "Nothing selected.");
-                return Ok(());
-            }
-
-            if !ctx.yes {
-                let mut summary = String::new();
-                for t in &targets {
-                    summary.push_str(&format!("- {}\n", t.as_str()));
-                }
-                info(ctx, format!("Clean plan:\n{summary}"));
-                let ok = ctx.prompt.confirm("Proceed?", false)?;
-                if !ok {
-                    info(ctx, "Canceled.");
-                    return Ok(());
-                }
-            }
-
-            let mut failures = Vec::new();
-            let mut results = Vec::new();
-            for t in targets {
-                let pb = start_spinner(ctx, &format!("Cleaning {}", t.as_str()));
-                let result = clean_tool(ctx, t);
-                if let Err(err) = result {
-                    finish_spinner(pb, &format!("Failed to clean {}", t.as_str()));
-                    if !cli.json {
-                        error(format!("Failed to clean {}: {err}", t.as_str()));
-                    }
-                    failures.push(format!("- {}: {err}", t.as_str()));
-                    results.push(serde_json::json!({
-                        "tool": t.as_str(),
-                        "ok": false,
-                        "error": err.to_string(),
-                    }));
-                } else {
-                    finish_spinner(pb, &format!("Cleaned {}", t.as_str()));
-                    results.push(serde_json::json!({
-                        "tool": t.as_str(),
-                        "ok": true,
-                    }));
-                }
-            }
-            if !failures.is_empty() {
-                if cli.json {
-                    let payload = serde_json::json!({
-                        "command": "clean",
-                        "ok": false,
-                        "results": results,
-                    });
-                    emit_json(ctx, payload)?;
-                }
-                return Err(anyhow!("some clean steps failed:\n{}", failures.join("\n")));
-            }
-            if cli.json {
-                let payload = serde_json::json!({
-                    "command": "clean",
-                    "ok": true,
-                    "results": results,
-                });
-                emit_json(ctx, payload)?;
-            }
+            run_clean_command(ctx, cli, tools, all, CleanAction::Clean)?;
+        }
+        Commands::Uninstall { tools, all } => {
+            run_clean_command(ctx, cli, tools, all, CleanAction::Uninstall)?;
         }
         Commands::Doctor => {
             ensure_dirs(ctx)?;
@@ -737,6 +656,142 @@ pub fn run(cli: &Cli, ctx: &mut Ctx) -> Result<()> {
     Ok(())
 }
 
+#[derive(Copy, Clone, Debug)]
+enum CleanAction {
+    Clean,
+    Uninstall,
+}
+
+impl CleanAction {
+    fn verb(self) -> &'static str {
+        match self {
+            CleanAction::Clean => "clean",
+            CleanAction::Uninstall => "uninstall",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            CleanAction::Clean => "Clean",
+            CleanAction::Uninstall => "Uninstall",
+        }
+    }
+
+    fn prompt(self) -> &'static str {
+        match self {
+            CleanAction::Clean => "Remove which tool installs?",
+            CleanAction::Uninstall => "Uninstall which tool installs?",
+        }
+    }
+}
+
+fn run_clean_command(
+    ctx: &Ctx,
+    cli: &Cli,
+    tools: Vec<ToolKind>,
+    all: bool,
+    action: CleanAction,
+) -> Result<()> {
+    ensure_dirs(ctx)?;
+    let mut overall_pb = start_spinner(ctx, &format!("Preparing {} plan...", action.verb()));
+    let targets = if !tools.is_empty() {
+        tools
+    } else if all {
+        select_kinds(cli.only)
+    } else {
+        if !ctx.stdin_is_tty && !ctx.yes {
+            return Err(anyhow!(
+                "non-interactive mode: pass tool names, or use --all/--yes to accept defaults"
+            ));
+        }
+        if cli.json && !ctx.yes {
+            return Err(anyhow!(
+                "JSON mode requires --yes or explicit tool selection"
+            ));
+        }
+        let tools = select_kinds(cli.only);
+        let labels = tools
+            .iter()
+            .map(|t| t.as_str().to_string())
+            .collect::<Vec<_>>();
+        let chosen_idx = if ctx.yes {
+            (0..tools.len()).collect::<Vec<_>>()
+        } else {
+            finish_spinner(overall_pb.take(), &format!("{} plan ready", action.title()));
+            ctx.prompt.multi_select(action.prompt(), &labels)?
+        };
+        chosen_idx.into_iter().map(|i| tools[i]).collect()
+    };
+    finish_spinner(overall_pb, &format!("{} plan ready", action.title()));
+
+    if targets.is_empty() {
+        info(ctx, "Nothing selected.");
+        return Ok(());
+    }
+
+    if !ctx.yes {
+        let mut summary = String::new();
+        for t in &targets {
+            summary.push_str(&format!("- {}\n", t.as_str()));
+        }
+        info(ctx, format!("{} plan:\n{summary}", action.title()));
+        let ok = ctx.prompt.confirm("Proceed?", false)?;
+        if !ok {
+            info(ctx, "Canceled.");
+            return Ok(());
+        }
+    }
+
+    let mut failures = Vec::new();
+    let mut results = Vec::new();
+    for t in targets {
+        let pb = start_spinner(ctx, &format!("{} {}", action.title(), t.as_str()));
+        let result = clean_tool(ctx, t);
+        if let Err(err) = result {
+            finish_spinner(pb, &format!("Failed to {} {}", action.verb(), t.as_str()));
+            if !cli.json {
+                error(format!("Failed to {} {}: {err}", action.verb(), t.as_str()));
+            }
+            failures.push(format!("- {}: {err}", t.as_str()));
+            results.push(serde_json::json!({
+                "tool": t.as_str(),
+                "ok": false,
+                "error": err.to_string(),
+            }));
+        } else {
+            finish_spinner(pb, &format!("{}ed {}", action.title(), t.as_str()));
+            results.push(serde_json::json!({
+                "tool": t.as_str(),
+                "ok": true,
+            }));
+        }
+    }
+    if !failures.is_empty() {
+        if cli.json {
+            let payload = serde_json::json!({
+                "command": action.verb(),
+                "ok": false,
+                "results": results,
+            });
+            emit_json(ctx, payload)?;
+        }
+        return Err(anyhow!(
+            "some {} steps failed:\n{}",
+            action.verb(),
+            failures.join("\n")
+        ));
+    }
+    if cli.json {
+        let payload = serde_json::json!({
+            "command": action.verb(),
+            "ok": true,
+            "results": results,
+        });
+        emit_json(ctx, payload)?;
+    }
+    Ok(())
+}
+
 pub fn make_ctx(cli: &Cli) -> Result<Ctx> {
     if let Some(err) = test_support::make_ctx_error() {
         bail!(err);
@@ -745,8 +800,8 @@ pub fn make_ctx(cli: &Cli) -> Result<Ctx> {
         .user_agent("upkit/0.1 (github.com/christiandoxa/upkit)")
         .timeout(Duration::from_secs(cli.timeout));
     if let Some(cert_path) = get_env_var("SSL_CERT_FILE") {
-        let pem = fs::read(&cert_path)
-            .with_context(|| format!("read SSL_CERT_FILE {}", cert_path))?;
+        let pem =
+            fs::read(&cert_path).with_context(|| format!("read SSL_CERT_FILE {}", cert_path))?;
         let cert = Certificate::from_pem(&pem)
             .with_context(|| format!("parse SSL_CERT_FILE {}", cert_path))?;
         http_builder = http_builder.add_root_certificate(cert);
@@ -789,6 +844,7 @@ pub fn make_ctx(cli: &Cli) -> Result<Ctx> {
         no_progress: cli.no_progress,
         offline: cli.offline,
         retries: cli.retries,
+        timeout: cli.timeout,
         force: false,
         json: cli.json,
         use_color,
@@ -870,11 +926,6 @@ pub fn maybe_path_hint_for_dir(ctx: &Ctx, dir: &Path, label: &str) {
     if ctx.quiet {
         return;
     }
-    let dir_str = dir.to_string_lossy();
-    let path = get_env_var("PATH").unwrap_or_default();
-    if env::split_paths(&path).any(|p| p == dir) {
-        return;
-    }
     let shell = get_env_var("SHELL").unwrap_or_default();
     let rc = if shell.ends_with("zsh") {
         "~/.zshrc"
@@ -885,41 +936,77 @@ pub fn maybe_path_hint_for_dir(ctx: &Ctx, dir: &Path, label: &str) {
     } else {
         "~/.profile"
     };
-    let rc_path = expand_tilde(rc);
-    let dir_string = dir_str.to_string();
-    let already_configured = rc_path
-        .as_ref()
-        .and_then(|p| fs::read_to_string(p).ok())
-        .map(|content| content.contains(&dir_string))
-        .unwrap_or(false);
-    if already_configured {
-        return;
-    }
-    let rc_path = match rc_path {
+    let rc_path = match expand_tilde(rc) {
         Some(p) => p,
         None => {
             warn(ctx, "Could not resolve shell rc file to update PATH.");
             return;
         }
     };
-    let line = if shell.ends_with("fish") {
-        format!(
-            "\n# upkit ({label})\nset -gx PATH {} $PATH\n",
-            dir.display()
-        )
-    } else {
-        format!(
-            "\n# upkit ({label})\nexport PATH=\"{}:$PATH\"\n",
-            dir.display()
-        )
-    };
+
+    let label_line = format!("# upkit ({label})");
+    let path_line = path_hint_line(&shell, dir);
+    let dir_string = dir.to_string_lossy().to_string();
+    let existing = fs::read_to_string(&rc_path).ok();
+    let mut found_label = false;
+    let mut updated = false;
+    let mut lines = Vec::new();
+
+    if let Some(content) = &existing {
+        let mut iter = content.lines().peekable();
+        while let Some(line) = iter.next() {
+            if line.trim_end() == label_line {
+                found_label = true;
+                lines.push(label_line.clone());
+                if let Some(next_line) = iter.peek().map(|next| next.trim_end()) {
+                    if next_line != path_line {
+                        updated = true;
+                    }
+                    iter.next();
+                } else {
+                    updated = true;
+                }
+                lines.push(path_line.clone());
+                continue;
+            }
+            lines.push(line.to_string());
+        }
+    }
+
+    if !found_label {
+        let path = get_env_var("PATH").unwrap_or_default();
+        if env::split_paths(&path).any(|p| p == dir) {
+            return;
+        }
+        let already_configured = existing
+            .as_ref()
+            .map(|content| content.contains(&dir_string))
+            .unwrap_or(false);
+        if already_configured {
+            return;
+        }
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push(label_line);
+        lines.push(path_line);
+        updated = true;
+    }
+
+    if !updated {
+        return;
+    }
+
+    let mut output = lines.join("\n");
+    output.push('\n');
     match fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .truncate(true)
         .open(&rc_path)
     {
         Ok(mut f) => {
-            if let Err(err) = write_all_checked(&mut f, line.as_bytes()) {
+            if let Err(err) = write_all_checked(&mut f, output.as_bytes()) {
                 warn(
                     ctx,
                     format!("Failed to update PATH in {}: {err}", rc_path.display()),
@@ -940,6 +1027,94 @@ pub fn maybe_path_hint_for_dir(ctx: &Ctx, dir: &Path, label: &str) {
                 format!("Failed to open {} to update PATH: {err}", rc_path.display()),
             );
         }
+    }
+}
+
+pub fn remove_path_hint_for_label(ctx: &Ctx, label: &str) {
+    if ctx.quiet {
+        return;
+    }
+    let shell = get_env_var("SHELL").unwrap_or_default();
+    let rc = if shell.ends_with("zsh") {
+        "~/.zshrc"
+    } else if shell.ends_with("fish") {
+        "~/.config/fish/config.fish"
+    } else if shell.ends_with("bash") {
+        "~/.bashrc"
+    } else {
+        "~/.profile"
+    };
+    let rc_path = match expand_tilde(rc) {
+        Some(p) => p,
+        None => {
+            warn(ctx, "Could not resolve shell rc file to update PATH.");
+            return;
+        }
+    };
+    let content = match fs::read_to_string(&rc_path) {
+        Ok(content) => content,
+        Err(_) => return,
+    };
+
+    let label_line = format!("# upkit ({label})");
+    let mut changed = false;
+    let mut lines = Vec::new();
+    let mut iter = content.lines().peekable();
+    while let Some(line) = iter.next() {
+        if line.trim_end() == label_line {
+            changed = true;
+            if let Some(next_line) = iter.peek() {
+                let trimmed = next_line.trim_start();
+                if trimmed.starts_with("export PATH=") || trimmed.starts_with("set -gx PATH") {
+                    iter.next();
+                }
+            }
+            continue;
+        }
+        lines.push(line.to_string());
+    }
+
+    if !changed {
+        return;
+    }
+    let mut output = lines.join("\n");
+    output.push('\n');
+    match fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&rc_path)
+    {
+        Ok(mut f) => {
+            if let Err(err) = write_all_checked(&mut f, output.as_bytes()) {
+                warn(
+                    ctx,
+                    format!("Failed to update PATH in {}: {err}", rc_path.display()),
+                );
+            } else {
+                info(
+                    ctx,
+                    format!(
+                        "PATH updated in {} (restart shell to apply).",
+                        rc_path.display()
+                    ),
+                );
+            }
+        }
+        Err(err) => {
+            warn(
+                ctx,
+                format!("Failed to open {} to update PATH: {err}", rc_path.display()),
+            );
+        }
+    }
+}
+
+fn path_hint_line(shell: &str, dir: &Path) -> String {
+    if shell.ends_with("fish") {
+        format!("set -gx PATH {} $PATH", dir.display())
+    } else {
+        format!("export PATH=\"{}:$PATH\"", dir.display())
     }
 }
 
@@ -1277,6 +1452,54 @@ pub fn http_get(ctx: &Ctx, url: &str) -> Result<Box<dyn HttpResponse>> {
     ))
 }
 
+#[cfg(coverage)]
+pub fn http_get_no_timeout(ctx: &Ctx, url: &str) -> Result<Box<dyn HttpResponse>> {
+    http_get(ctx, url)
+}
+
+#[cfg(not(coverage))]
+pub fn http_get_no_timeout(ctx: &Ctx, url: &str) -> Result<Box<dyn HttpResponse>> {
+    if ctx.offline {
+        bail!("offline mode enabled");
+    }
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..=ctx.retries {
+        if test_support::http_mocking_enabled() || test_support::http_allow_unknown_error() {
+            if let Some(resp) = test_support::next_http_response(url) {
+                match resp {
+                    Ok(r) => return Ok(r),
+                    Err(err) => last_err = Some(err),
+                }
+            } else if !test_support::http_allow_unknown_error() {
+                last_err = Some(anyhow!("no test response left"));
+            }
+        } else {
+            let long_timeout = ctx.timeout.saturating_mul(10).max(600);
+            let resp = ctx
+                .http
+                .get(url)
+                .timeout(Duration::from_secs(long_timeout))
+                .send();
+            match resp {
+                Ok(r) => match r.error_for_status() {
+                    Ok(r) => return Ok(Box::new(ReqwestResponse { inner: r })),
+                    Err(err) => last_err = Some(err.into()),
+                },
+                Err(err) => last_err = Some(err.into()),
+            }
+        }
+        if attempt < ctx.retries {
+            let backoff = 250u64.saturating_mul(2u64.pow(attempt as u32));
+            sleep_for(Duration::from_millis(backoff));
+        }
+    }
+    Err(anyhow!(
+        "request failed after {} attempt(s): {}",
+        ctx.retries + 1,
+        last_err.unwrap_or_else(|| anyhow!("unknown error"))
+    ))
+}
+
 pub fn http_get_json<T: DeserializeOwned>(ctx: &Ctx, url: &str) -> Result<T> {
     let mut resp = http_get(ctx, url)?;
     let mut buf = Vec::new();
@@ -1305,12 +1528,13 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+
 pub fn download_to_temp(ctx: &Ctx, url: &str) -> Result<NamedTempFile> {
     let show_progress = progress_allowed(ctx);
-    let mut resp = http_get(ctx, url)?;
+    let mut resp = http_get_no_timeout(ctx, url)?;
     let mut tmp = NamedTempFile::new()?;
     let total = resp.content_length();
-    if show_progress && progress_overwrite_allowed(ctx) {
+    let downloaded_total = if show_progress && progress_overwrite_allowed(ctx) {
         if let Some(total) = total {
             let pb =
                 ProgressBar::with_draw_target(Some(total), ProgressDrawTarget::stderr_with_hz(10));
@@ -1333,6 +1557,7 @@ pub fn download_to_temp(ctx: &Ctx, url: &str) -> Result<NamedTempFile> {
                 pb.set_position(downloaded);
             }
             pb.finish_with_message("Downloaded");
+            Some(downloaded)
         } else {
             let pb = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr_with_hz(10));
             pb.set_style(
@@ -1341,8 +1566,9 @@ pub fn download_to_temp(ctx: &Ctx, url: &str) -> Result<NamedTempFile> {
             );
             pb.set_message(format!("Downloading {url}"));
             pb.enable_steady_tick(Duration::from_millis(80));
-            io::copy(&mut resp, &mut tmp)?;
+            let downloaded = io::copy(&mut resp, &mut tmp)?;
             pb.finish_with_message("Downloaded");
+            Some(downloaded)
         }
     } else if show_progress {
         if let Some(total) = total {
@@ -1363,12 +1589,21 @@ pub fn download_to_temp(ctx: &Ctx, url: &str) -> Result<NamedTempFile> {
                 let pct = (downloaded.saturating_mul(100) / total).min(100);
                 info(ctx, format!("Downloading {url} [{pct}%]"));
             }
+            Some(downloaded)
         } else {
             info(ctx, format!("Downloading {url}"));
-            io::copy(&mut resp, &mut tmp)?;
+            Some(io::copy(&mut resp, &mut tmp)?)
         }
     } else {
-        io::copy(&mut resp, &mut tmp)?;
+        Some(io::copy(&mut resp, &mut tmp)?)
+    };
+
+    if let (Some(total), Some(downloaded)) = (total, downloaded_total) {
+        if downloaded < total {
+            bail!(
+                "download incomplete for {url}: expected {total} bytes, got {downloaded}"
+            );
+        }
     }
     Ok(tmp)
 }
@@ -1425,7 +1660,18 @@ pub fn tool_bin_names(tool: ToolKind) -> &'static [&'static str] {
         ToolKind::Go => &["go", "gofmt"],
         ToolKind::Node => &["node", "npm", "npx", "corepack"],
         ToolKind::Python => &["python", "python3", "pip", "pip3"],
-        ToolKind::Rust | ToolKind::Flutter => &[],
+        ToolKind::Flutter => &["flutter", "dart", "pub"],
+        ToolKind::Rust => &[],
+    }
+}
+
+pub fn tool_path_hint_labels(tool: ToolKind) -> &'static [&'static str] {
+    match tool {
+        ToolKind::Go => &["go GOBIN", "go GOPATH/bin"],
+        ToolKind::Node => &["npm global bin"],
+        ToolKind::Python => &["python user base bin"],
+        ToolKind::Flutter => &["flutter bin", "pub cache bin"],
+        ToolKind::Rust => &["cargo bin"],
     }
 }
 
@@ -1462,6 +1708,10 @@ pub fn clean_tool(ctx: &Ctx, tool: ToolKind) -> Result<()> {
             }
             fs::remove_file(&dst).with_context(|| format!("remove {}", dst.display()))?;
         }
+    }
+
+    for &label in tool_path_hint_labels(tool) {
+        remove_path_hint_for_label(ctx, label);
     }
 
     info(ctx, format!("cleaned {}", tool.as_str()));
@@ -1725,6 +1975,7 @@ pub fn map_error_to_exit_code(err: &anyhow::Error) -> u8 {
     let msg = err.to_string();
     if msg.starts_with("some updates failed")
         || msg.starts_with("some clean steps failed")
+        || msg.starts_with("some uninstall steps failed")
         || msg.starts_with("doctor found")
     {
         2
@@ -2117,6 +2368,7 @@ pub mod test_support {
             no_progress: false,
             offline: false,
             retries: 0,
+            timeout: 1,
             force: false,
             json: false,
             use_color: false,

@@ -1,5 +1,7 @@
 use anyhow::{Result, anyhow, bail};
 use serde::Deserialize;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{env, ffi::OsStr, fs};
 
 use crate::{
@@ -48,8 +50,7 @@ pub fn check_go(ctx: &Ctx) -> Result<ToolReport> {
         let args = [OsStr::new("version")];
         run_capture(bin.as_os_str(), &args).ok()
     } else {
-        which_or_none("go")
-            .and_then(|_| run_capture("go", &["version"]).ok())
+        which_or_none("go").and_then(|_| run_capture("go", &["version"]).ok())
     }
     .and_then(|out| Version::parse_loose(&out));
 
@@ -127,6 +128,11 @@ pub fn update_go(ctx: &Ctx) -> Result<()> {
         .latest
         .clone()
         .ok_or_else(|| anyhow!("latest unknown"))?;
+    let tool_root = ctx.home.join("go");
+    let active = tool_root.join("active");
+    if tool_root.exists() && active.exists() {
+        ensure_go_wrappers(ctx, &tool_root, &active)?;
+    }
 
     if matches!(report.status, Status::UpToDate) && !ctx.force {
         info(ctx, format!("go is up-to-date ({})", latest.to_string()));
@@ -146,7 +152,6 @@ pub fn update_go(ctx: &Ctx) -> Result<()> {
         bail!("Go sha256 mismatch: expected {expected_sha}, got {got}");
     }
 
-    let tool_root = ctx.home.join("go");
     fs::create_dir_all(&tool_root)?;
     let ver_dir = tool_root.join(latest.to_string());
     ensure_clean_dir(&ver_dir)?;
@@ -160,17 +165,47 @@ pub fn update_go(ctx: &Ctx) -> Result<()> {
     }
 
     // Active directory points to ver_dir/go
-    let active = tool_root.join("active");
     let extracted_go_dir = ver_dir.join("go");
     atomic_symlink(&extracted_go_dir, &active)?;
 
-    // link binaries
-    let active_bin = active.join("bin");
-    let go_bin = active_bin.join("go");
-    link_dir_bins(&active_bin, &ctx.bindir, &["go", "gofmt"])?;
-    maybe_hint_go_bins(ctx, Some(&go_bin));
+    ensure_go_wrappers(ctx, &tool_root, &active)?;
 
     info(ctx, format!("go updated to {}", latest.to_string()));
+    Ok(())
+}
+
+fn ensure_go_wrappers(
+    ctx: &Ctx,
+    tool_root: &std::path::Path,
+    active: &std::path::Path,
+) -> Result<()> {
+    let wrapper_dir = tool_root.join("wrappers");
+    fs::create_dir_all(&wrapper_dir)?;
+    write_go_wrapper(&wrapper_dir.join("go"), active)?;
+    write_go_wrapper(&wrapper_dir.join("gofmt"), active)?;
+    link_dir_bins(&wrapper_dir, &ctx.bindir, &["go", "gofmt"])?;
+    maybe_hint_go_bins(ctx, Some(&wrapper_dir.join("go")));
+    Ok(())
+}
+
+fn write_go_wrapper(wrapper_path: &std::path::Path, active: &std::path::Path) -> Result<()> {
+    let target = active.join("bin").join(
+        wrapper_path
+            .file_name()
+            .ok_or_else(|| anyhow!("invalid wrapper path"))?,
+    );
+    let script = format!(
+        "#!/usr/bin/env sh\nexport GOROOT=\"{}\"\nexec \"{}\" \"$@\"\n",
+        active.display(),
+        target.display()
+    );
+    fs::write(wrapper_path, script)?;
+    #[cfg(unix)]
+    {
+        let mut perms = fs::metadata(wrapper_path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(wrapper_path, perms)?;
+    }
     Ok(())
 }
 
