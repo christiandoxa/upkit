@@ -98,6 +98,7 @@ pub enum Commands {
     /// Show installed version + latest version + status
     Check,
     /// Update tools (interactive by default)
+    #[command(visible_alias = "install")]
     Update {
         /// Tools to update (skips interactive selection)
         tools: Vec<ToolKind>,
@@ -1616,6 +1617,30 @@ pub fn ensure_clean_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn prune_tool_versions(tool_root: &Path, keep_dir: &Path, keep_names: &[&str]) -> Result<()> {
+    if !tool_root.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(tool_root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path == keep_dir {
+            continue;
+        }
+        if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+            if keep_names.iter().any(|keep| keep == &name) {
+                continue;
+            }
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        fs::remove_dir_all(&path).with_context(|| format!("remove {}", path.display()))?;
+    }
+    Ok(())
+}
+
 pub fn atomic_symlink(target: &Path, link: &Path) -> Result<()> {
     // Create tmp symlink then rename (best-effort, cross-platform-ish).
     // On Windows this will likely require privileges; we keep Linux/macOS as primary.
@@ -2381,6 +2406,7 @@ pub mod test_support {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn index_code_roundtrip() {
@@ -2503,5 +2529,34 @@ mod unit_tests {
         let items = vec!["one".to_string(), "two".to_string()];
         let err = prompt.multi_select("Pick items", &items).unwrap_err();
         assert!(err.to_string().contains("selection out of range"));
+    }
+
+    #[test]
+    fn prune_tool_versions_removes_old_dirs() {
+        let dir = tempdir().unwrap();
+        let tool_root = dir.path().join("tool");
+        let keep_dir = tool_root.join("1.2.3");
+        let old_dir = tool_root.join("0.9.0");
+        let wrappers = tool_root.join("wrappers");
+        let cache_file = tool_root.join("cache.txt");
+
+        fs::create_dir_all(&keep_dir).unwrap();
+        fs::create_dir_all(&old_dir).unwrap();
+        fs::create_dir_all(&wrappers).unwrap();
+        fs::write(&cache_file, b"cache").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let active = tool_root.join("active");
+            symlink(&keep_dir, &active).unwrap();
+        }
+
+        prune_tool_versions(&tool_root, &keep_dir, &["active", "wrappers"]).unwrap();
+
+        assert!(keep_dir.exists());
+        assert!(!old_dir.exists());
+        assert!(wrappers.exists());
+        assert!(cache_file.exists());
     }
 }

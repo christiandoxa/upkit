@@ -41,6 +41,12 @@ Update tools interactively:
 upkit update
 ```
 
+The `install` alias runs the same command:
+
+```bash
+upkit install
+```
+
 Interactive selection uses letter codes (comma-separated), for example:
 
 ```bash

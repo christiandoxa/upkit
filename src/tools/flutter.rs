@@ -1,7 +1,7 @@
 use crate::{
     Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, atomic_symlink, download_to_temp,
     ensure_clean_dir, home_dir, http_get_json, info, link_dir_bins, maybe_path_hint_for_dir,
-    run_output, run_status, which_or_none,
+    prune_tool_versions, run_output, run_status, warn, which_or_none,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
@@ -172,6 +172,10 @@ pub fn update_flutter(ctx: &Ctx) -> Result<()> {
             .context("link flutter binaries")?;
         maybe_path_hint_for_dir(ctx, &bin_dir, "flutter bin");
         maybe_hint_flutter_bins(ctx);
+
+        if let Err(err) = prune_tool_versions(&tool_root, &ver_dir, &["active"]) {
+            warn(ctx, format!("Failed to remove old flutter versions: {err}"));
+        }
 
         info(ctx, "flutter installed");
         return Ok(());
