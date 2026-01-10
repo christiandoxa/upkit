@@ -62,26 +62,35 @@ pub fn flutter_latest_stable(ctx: &Ctx) -> Result<Version> {
         .ok_or_else(|| anyhow!("could not parse flutter version {}", release.version))
 }
 
-pub fn flutter_installed_version(bin: Option<&Path>) -> Option<Version> {
+pub fn flutter_installed_version(bin: &Path) -> Option<Version> {
     // flutter --version --machine outputs JSON
     let args = [OsStr::new("--version"), OsStr::new("--machine")];
-    let out = match bin {
-        Some(bin) => run_output(bin.as_os_str(), &args).ok()?,
-        None => run_output("flutter", &["--version", "--machine"]).ok()?,
-    };
-    if !out.status.success() {
-        return None;
+    if let Ok(out) = run_output(bin.as_os_str(), &args) {
+        if out.status.success() {
+            let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+            let s = v.get("frameworkVersion")?.as_str()?;
+            if let Some(parsed) = Version::parse_loose(s) {
+                return Some(parsed);
+            }
+        }
     }
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    let s = v.get("frameworkVersion")?.as_str()?;
-    Version::parse_loose(s)
+    flutter_version_from_root(bin)
+}
+
+fn flutter_version_from_root(bin: &Path) -> Option<Version> {
+    let canonical = fs::canonicalize(bin).ok()?;
+    let bin_dir = canonical.parent()?;
+    let root = bin_dir.parent()?;
+    let version_path = root.join("version");
+    let contents = fs::read_to_string(version_path).ok()?;
+    Version::parse_loose(contents.trim())
 }
 
 pub fn check_flutter(ctx: &Ctx) -> Result<ToolReport> {
     let installed = if let Some(bin) = flutter_bin_in_bindir(ctx) {
-        flutter_installed_version(Some(&bin))
-    } else if which_or_none("flutter").is_some() {
-        flutter_installed_version(None)
+        flutter_installed_version(&bin)
+    } else if let Some(bin) = which_or_none("flutter") {
+        flutter_installed_version(&bin)
     } else {
         None
     };
