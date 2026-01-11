@@ -57,6 +57,37 @@ pub enum Status {
     Unknown,
 }
 
+impl Status {
+    pub fn from_versions(installed: Option<&Version>, latest: Option<&Version>) -> Self {
+        match (installed, latest) {
+            (None, Some(_)) => Status::NotInstalled,
+            (Some(i), Some(l)) if i >= l => Status::UpToDate,
+            (Some(_), Some(_)) => Status::Outdated,
+            _ => Status::Unknown,
+        }
+    }
+}
+
+pub fn keep_latest_version(best: &mut Option<Version>, candidate: Version) {
+    if best.as_ref().map(|b| &candidate > b).unwrap_or(true) {
+        *best = Some(candidate);
+    }
+}
+
+pub fn keep_latest_with_version<T>(
+    best: &mut Option<(Version, T)>,
+    candidate_version: Version,
+    candidate: T,
+) {
+    if best
+        .as_ref()
+        .map(|(b, _)| &candidate_version > b)
+        .unwrap_or(true)
+    {
+        *best = Some((candidate_version, candidate));
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Version {
     pub major: u64,

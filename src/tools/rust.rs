@@ -12,12 +12,7 @@ pub fn check_rust(ctx: &Ctx) -> Result<ToolReport> {
         .and_then(|out| Version::parse_loose(&out));
 
     let latest = rust_latest_stable(ctx).ok();
-    let status = match (&installed, &latest) {
-        (None, Some(_)) => Status::NotInstalled,
-        (Some(i), Some(l)) if i >= l => Status::UpToDate,
-        (Some(_), Some(_)) => Status::Outdated,
-        _ => Status::Unknown,
-    };
+    let status = Status::from_versions(installed.as_ref(), latest.as_ref());
 
     Ok(ToolReport {
         tool: ToolKind::Rust,

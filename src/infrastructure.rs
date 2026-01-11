@@ -226,15 +226,7 @@ pub fn maybe_path_hint_for_dir(ctx: &Ctx, dir: &Path, label: &str) {
         return;
     }
     let shell = get_env_var("SHELL").unwrap_or_default();
-    let rc = if shell.ends_with("zsh") {
-        "~/.zshrc"
-    } else if shell.ends_with("fish") {
-        "~/.config/fish/config.fish"
-    } else if shell.ends_with("bash") {
-        "~/.bashrc"
-    } else {
-        "~/.profile"
-    };
+    let rc = shell_rc_path(&shell);
     let rc_path = match expand_tilde(rc) {
         Some(p) => p,
         None => {
@@ -298,35 +290,7 @@ pub fn maybe_path_hint_for_dir(ctx: &Ctx, dir: &Path, label: &str) {
 
     let mut output = lines.join("\n");
     output.push('\n');
-    match fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&rc_path)
-    {
-        Ok(mut f) => {
-            if let Err(err) = write_all_checked(&mut f, output.as_bytes()) {
-                warn(
-                    ctx,
-                    format!("Failed to update PATH in {}: {err}", rc_path.display()),
-                );
-            } else {
-                info(
-                    ctx,
-                    format!(
-                        "PATH updated in {} (restart shell to apply).",
-                        rc_path.display()
-                    ),
-                );
-            }
-        }
-        Err(err) => {
-            warn(
-                ctx,
-                format!("Failed to open {} to update PATH: {err}", rc_path.display()),
-            );
-        }
-    }
+    write_path_hint(ctx, &rc_path, output);
 }
 
 pub fn remove_path_hint_for_label(ctx: &Ctx, label: &str) {
@@ -334,15 +298,7 @@ pub fn remove_path_hint_for_label(ctx: &Ctx, label: &str) {
         return;
     }
     let shell = get_env_var("SHELL").unwrap_or_default();
-    let rc = if shell.ends_with("zsh") {
-        "~/.zshrc"
-    } else if shell.ends_with("fish") {
-        "~/.config/fish/config.fish"
-    } else if shell.ends_with("bash") {
-        "~/.bashrc"
-    } else {
-        "~/.profile"
-    };
+    let rc = shell_rc_path(&shell);
     let rc_path = match expand_tilde(rc) {
         Some(p) => p,
         None => {
@@ -378,11 +334,35 @@ pub fn remove_path_hint_for_label(ctx: &Ctx, label: &str) {
     }
     let mut output = lines.join("\n");
     output.push('\n');
+    write_path_hint(ctx, &rc_path, output);
+}
+
+fn path_hint_line(shell: &str, dir: &Path) -> String {
+    if shell.ends_with("fish") {
+        format!("set -gx PATH {} $PATH", dir.display())
+    } else {
+        format!("export PATH=\"{}:$PATH\"", dir.display())
+    }
+}
+
+fn shell_rc_path(shell: &str) -> &'static str {
+    if shell.ends_with("zsh") {
+        "~/.zshrc"
+    } else if shell.ends_with("fish") {
+        "~/.config/fish/config.fish"
+    } else if shell.ends_with("bash") {
+        "~/.bashrc"
+    } else {
+        "~/.profile"
+    }
+}
+
+fn write_path_hint(ctx: &Ctx, rc_path: &Path, output: String) {
     match fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
-        .open(&rc_path)
+        .open(rc_path)
     {
         Ok(mut f) => {
             if let Err(err) = write_all_checked(&mut f, output.as_bytes()) {
@@ -406,14 +386,6 @@ pub fn remove_path_hint_for_label(ctx: &Ctx, label: &str) {
                 format!("Failed to open {} to update PATH: {err}", rc_path.display()),
             );
         }
-    }
-}
-
-fn path_hint_line(shell: &str, dir: &Path) -> String {
-    if shell.ends_with("fish") {
-        format!("set -gx PATH {} $PATH", dir.display())
-    } else {
-        format!("export PATH=\"{}:$PATH\"", dir.display())
     }
 }
 
@@ -614,6 +586,36 @@ pub trait HttpResponse: Read {
     fn content_length(&self) -> Option<u64>;
 }
 
+enum MockAttempt {
+    Handled(Option<Box<dyn HttpResponse>>),
+    Skipped,
+}
+
+fn mock_http_attempt(
+    url: &str,
+    last_err: &mut Option<anyhow::Error>,
+    require_mocking: bool,
+) -> MockAttempt {
+    if test_support::http_mocking_enabled() || test_support::http_allow_unknown_error() {
+        if let Some(resp) = test_support::next_http_response(url) {
+            match resp {
+                Ok(r) => return MockAttempt::Handled(Some(r)),
+                Err(err) => *last_err = Some(err),
+            }
+        } else if !test_support::http_allow_unknown_error() {
+            *last_err = Some(anyhow!("no test response left"));
+        }
+        return MockAttempt::Handled(None);
+    }
+    if require_mocking {
+        *last_err = Some(anyhow!(
+            "http mocking disabled under coverage; set test responses"
+        ));
+        return MockAttempt::Handled(None);
+    }
+    MockAttempt::Skipped
+}
+
 #[cfg(not(coverage))]
 struct ReqwestResponse {
     inner: reqwest::blocking::Response,
@@ -633,6 +635,26 @@ impl HttpResponse for ReqwestResponse {
     }
 }
 
+#[cfg(not(coverage))]
+fn handle_reqwest_response(
+    resp: Result<reqwest::blocking::Response, reqwest::Error>,
+    last_err: &mut Option<anyhow::Error>,
+) -> Option<Box<dyn HttpResponse>> {
+    match resp {
+        Ok(r) => match r.error_for_status() {
+            Ok(r) => Some(Box::new(ReqwestResponse { inner: r })),
+            Err(err) => {
+                *last_err = Some(err.into());
+                None
+            }
+        },
+        Err(err) => {
+            *last_err = Some(err.into());
+            None
+        }
+    }
+}
+
 #[cfg(coverage)]
 pub fn http_get(ctx: &Ctx, url: &str) -> Result<Box<dyn HttpResponse>> {
     if ctx.offline {
@@ -640,19 +662,10 @@ pub fn http_get(ctx: &Ctx, url: &str) -> Result<Box<dyn HttpResponse>> {
     }
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..=ctx.retries {
-        if test_support::http_mocking_enabled() || test_support::http_allow_unknown_error() {
-            if let Some(resp) = test_support::next_http_response(url) {
-                match resp {
-                    Ok(r) => return Ok(r),
-                    Err(err) => last_err = Some(err),
-                }
-            } else if !test_support::http_allow_unknown_error() {
-                last_err = Some(anyhow!("no test response left"));
-            }
-        } else {
-            last_err = Some(anyhow!(
-                "http mocking disabled under coverage; set test responses"
-            ));
+        match mock_http_attempt(url, &mut last_err, true) {
+            MockAttempt::Handled(Some(resp)) => return Ok(resp),
+            MockAttempt::Handled(None) => {}
+            MockAttempt::Skipped => {}
         }
         if attempt < ctx.retries {
             let backoff = 250u64.saturating_mul(2u64.pow(attempt as u32));
@@ -675,23 +688,14 @@ pub fn http_get(ctx: &Ctx, url: &str) -> Result<Box<dyn HttpResponse>> {
     }
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..=ctx.retries {
-        if test_support::http_mocking_enabled() || test_support::http_allow_unknown_error() {
-            if let Some(resp) = test_support::next_http_response(url) {
-                match resp {
-                    Ok(r) => return Ok(r),
-                    Err(err) => last_err = Some(err),
+        match mock_http_attempt(url, &mut last_err, false) {
+            MockAttempt::Handled(Some(resp)) => return Ok(resp),
+            MockAttempt::Handled(None) => {}
+            MockAttempt::Skipped => {
+                let resp = ctx.http.get(url).send();
+                if let Some(resp) = handle_reqwest_response(resp, &mut last_err) {
+                    return Ok(resp);
                 }
-            } else if !test_support::http_allow_unknown_error() {
-                last_err = Some(anyhow!("no test response left"));
-            }
-        } else {
-            let resp = ctx.http.get(url).send();
-            match resp {
-                Ok(r) => match r.error_for_status() {
-                    Ok(r) => return Ok(Box::new(ReqwestResponse { inner: r })),
-                    Err(err) => last_err = Some(err.into()),
-                },
-                Err(err) => last_err = Some(err.into()),
             }
         }
         if attempt < ctx.retries {
@@ -718,28 +722,19 @@ pub fn http_get_no_timeout(ctx: &Ctx, url: &str) -> Result<Box<dyn HttpResponse>
     }
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..=ctx.retries {
-        if test_support::http_mocking_enabled() || test_support::http_allow_unknown_error() {
-            if let Some(resp) = test_support::next_http_response(url) {
-                match resp {
-                    Ok(r) => return Ok(r),
-                    Err(err) => last_err = Some(err),
+        match mock_http_attempt(url, &mut last_err, false) {
+            MockAttempt::Handled(Some(resp)) => return Ok(resp),
+            MockAttempt::Handled(None) => {}
+            MockAttempt::Skipped => {
+                let long_timeout = ctx.timeout.saturating_mul(10).max(600);
+                let resp = ctx
+                    .http
+                    .get(url)
+                    .timeout(Duration::from_secs(long_timeout))
+                    .send();
+                if let Some(resp) = handle_reqwest_response(resp, &mut last_err) {
+                    return Ok(resp);
                 }
-            } else if !test_support::http_allow_unknown_error() {
-                last_err = Some(anyhow!("no test response left"));
-            }
-        } else {
-            let long_timeout = ctx.timeout.saturating_mul(10).max(600);
-            let resp = ctx
-                .http
-                .get(url)
-                .timeout(Duration::from_secs(long_timeout))
-                .send();
-            match resp {
-                Ok(r) => match r.error_for_status() {
-                    Ok(r) => return Ok(Box::new(ReqwestResponse { inner: r })),
-                    Err(err) => last_err = Some(err.into()),
-                },
-                Err(err) => last_err = Some(err.into()),
             }
         }
         if attempt < ctx.retries {

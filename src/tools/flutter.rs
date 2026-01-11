@@ -1,7 +1,7 @@
 use crate::{
     Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, atomic_symlink, download_to_temp,
-    ensure_clean_dir, home_dir, http_get_json, info, link_dir_bins, maybe_path_hint_for_dir,
-    prune_tool_versions, run_output, run_status, warn, which_or_none,
+    ensure_clean_dir, home_dir, http_get_json, info, keep_latest_with_version, link_dir_bins,
+    maybe_path_hint_for_dir, prune_tool_versions, run_output, run_status, warn, which_or_none,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
@@ -47,9 +47,7 @@ fn flutter_latest_stable_release(ctx: &Ctx) -> Result<FlutterReleaseEntry> {
     let mut best: Option<(Version, FlutterReleaseEntry)> = None;
     for r in data.releases.into_iter().filter(|r| r.channel == "stable") {
         if let Some(v) = Version::parse_loose(&r.version) {
-            if best.as_ref().map(|(b, _)| &v > b).unwrap_or(true) {
-                best = Some((v, r));
-            }
+            keep_latest_with_version(&mut best, v, r);
         }
     }
     best.map(|(_, r)| r)
@@ -96,12 +94,7 @@ pub fn check_flutter(ctx: &Ctx) -> Result<ToolReport> {
     };
 
     let latest = flutter_latest_stable(ctx).ok();
-    let status = match (&installed, &latest) {
-        (None, Some(_)) => Status::NotInstalled,
-        (Some(i), Some(l)) if i >= l => Status::UpToDate,
-        (Some(_), Some(_)) => Status::Outdated,
-        _ => Status::Unknown,
-    };
+    let status = Status::from_versions(installed.as_ref(), latest.as_ref());
 
     Ok(ToolReport {
         tool: ToolKind::Flutter,

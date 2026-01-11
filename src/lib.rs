@@ -12,7 +12,10 @@ pub use application::{
     report_has_error, run, run_doctor, run_self_update, run_version, select_kinds, tool_method,
     update_tool,
 };
-pub use domain::{Status, ToolKind, ToolReport, UpdateMethod, Version};
+pub use domain::{
+    Status, ToolKind, ToolReport, UpdateMethod, Version, keep_latest_version,
+    keep_latest_with_version,
+};
 pub use infrastructure::{
     Ctx, DialoguerPrompt, HttpResponse, ProgressHandle, Prompt, atomic_symlink, colorize_status,
     data_local_dir, debug, download_to_temp, emit_json, ensure_clean_dir, error, expand_tilde,
