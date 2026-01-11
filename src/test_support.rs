@@ -37,6 +37,7 @@ pub struct Hooks {
     prompt_defaults: bool,
     prompt_inputs: VecDeque<String>,
     prompt_confirms: VecDeque<bool>,
+    prune_tool_versions_error: Option<String>,
 }
 
 static HOOKS: OnceLock<Mutex<Hooks>> = OnceLock::new();
@@ -278,6 +279,14 @@ pub fn make_ctx_error() -> Option<String> {
 
 pub fn set_sleep_passthrough(enabled: bool) {
     hooks().lock().unwrap().sleep_passthrough = enabled;
+}
+
+pub fn set_prune_tool_versions_error(err: Option<String>) {
+    hooks().lock().unwrap().prune_tool_versions_error = err;
+}
+
+pub fn prune_tool_versions_error() -> Option<String> {
+    hooks().lock().unwrap().prune_tool_versions_error.clone()
 }
 
 pub struct MockResponse {

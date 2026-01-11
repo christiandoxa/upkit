@@ -99,6 +99,41 @@ fn make_ctx_fallback_dirs() {
 }
 
 #[test]
+fn make_ctx_uses_ssl_cert_file() {
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let cert_path = dir.path().join("cert.pem");
+    let pem = "\
+-----BEGIN CERTIFICATE-----\n\
+MIIDCzCCAfOgAwIBAgIUdiczmAOCkgQuwApNRbw/U7NxyhwwDQYJKoZIhvcNAQEL\n\
+BQAwFTETMBEGA1UEAwwKdXBraXQtdGVzdDAeFw0yNjAxMTExNDU2NTVaFw0yNjAx\n\
+MTIxNDU2NTVaMBUxEzARBgNVBAMMCnVwa2l0LXRlc3QwggEiMA0GCSqGSIb3DQEB\n\
+AQUAA4IBDwAwggEKAoIBAQDKiVi1tZPdLAb88tmNAZ2LHldAYMg/YhQ5S0zJxXzW\n\
+Y1vy2j2RGVV0E5rM5AlJ+HjjxqvG/4eyS+mcBnTE7lSH9PkMs8e+aqVxqbOGBOrP\n\
+hl+9HmbI5jZ+pJP1XuYsyzC8K8t7xj3AzYqBwq8n0z8AmEHoB4YrKA9yi+mHSFwH\n\
+6TQAXHdR0xe+SFj0l52sNozI13ei39STDv5UAix3UdFflmniITcTcAaVPa/akfOK\n\
+nOO8HuzeTNXbIhSmYsKqLwpj1V2SjSI36tcH9AL6KMGofgP8Z/QW5myFk7i4XyrN\n\
+VjiOtB4orcKdKosa/OqiEuPM+Judow7n+h6mCV8HKzvHAgMBAAGjUzBRMB0GA1Ud\n\
+DgQWBBT6ZS2JEyXhvF2gdyLllJWProe9ujAfBgNVHSMEGDAWgBT6ZS2JEyXhvF2g\n\
+dyLllJWProe9ujAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQC2\n\
+CmlDJVgB3JAHd+Fv+EHsijfWBjqlEiVxoS7ZENflFVTK50LoR3Qc+LETn03I7pcl\n\
+r1VGPNxQYsa3zkwUtC7/5hi+pAgnNhBW1CLX90aABV6J3N0AGYOJpKBf53O67rcw\n\
+FsJgQ0IjZ1JZpDT7ToaQcvjjIevO1fYdPmHrqVAoUm9At65Xt7ypmxqfcTn1RqcN\n\
+ABj36fHCz/LEV5gQp1D6hwly00+ntiUSDT9PjFwRnYq+P46ez1onmTQg1ftCJgEh\n\
+8vEoW6qhlTKMrFpjenKeYB9lpazBUzqqHf2aEji5FExK9BjmL2C52ePa05Ghy9Ug\n\
+6NMx6i4RoEntFk8vyNUd\n\
+-----END CERTIFICATE-----\n";
+    fs::write(&cert_path, pem).unwrap();
+    set_env_var(
+        "SSL_CERT_FILE",
+        Some(cert_path.to_string_lossy().to_string()),
+    );
+    let cli = Cli::parse_from(["upkit", "--offline"]);
+    let ctx = make_ctx(&cli).unwrap();
+    assert!(ctx.timeout > 0);
+}
+
+#[test]
 fn main_smoke() {
     let _guard = reset_guard();
     let dir = tempdir().unwrap();
@@ -621,6 +656,30 @@ fn run_doctor_variants() {
     run_doctor(&ctx, true).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn run_doctor_unwritable_dirs() {
+    let _env_guard = ENV_LOCK.lock().unwrap();
+    let _hook_guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("home");
+    let bindir = dir.path().join("bin");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&bindir).unwrap();
+    let mut perms = fs::metadata(&home).unwrap().permissions();
+    perms.set_mode(0o500);
+    fs::set_permissions(&home, perms).unwrap();
+    let mut perms = fs::metadata(&bindir).unwrap().permissions();
+    perms.set_mode(0o500);
+    fs::set_permissions(&bindir, perms).unwrap();
+    set_env_var("PATH", Some(bindir.display().to_string()));
+    let prompt = Arc::new(TestPrompt::default());
+    let mut ctx = base_ctx(home.clone(), bindir.clone(), prompt);
+    ctx.offline = true;
+    let err = run_doctor(&ctx, false).unwrap_err();
+    assert!(err.to_string().contains("doctor found"));
+}
+
 #[test]
 fn run_self_update_paths() {
     let _guard = reset_guard();
@@ -770,6 +829,21 @@ fn run_command_paths_check_update_clean() {
 
     let cli = Cli::parse_from(["upkit", "-y", "--dry-run", "uninstall", "go"]);
     let mut ctx = ctx_from_cli(&cli, home.clone(), bindir.clone(), prompt.clone());
+    run(&cli, &mut ctx).unwrap();
+}
+
+#[test]
+fn run_uninstall_prompts_for_selection() {
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("home");
+    let bindir = dir.path().join("bin");
+    let prompt = Arc::new(TestPrompt::default());
+    prompt.push_selection(vec![0]);
+    prompt.push_confirm(true);
+    let cli = Cli::parse_from(["upkit", "uninstall"]);
+    let mut ctx = ctx_from_cli(&cli, home, bindir, prompt);
+    ctx.dry_run = true;
     run(&cli, &mut ctx).unwrap();
 }
 

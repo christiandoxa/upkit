@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tempfile::tempdir;
 use upkit::test_support::{
     MockResponse, TestPrompt, base_ctx, output_with_status, reset_guard, set_http_plan,
-    set_run_output, set_which,
+    set_prune_tool_versions_error, set_run_output, set_which,
 };
 use upkit::tools::python::{
     check_python, python_latest, python_pick_asset, python_target, update_python,
@@ -28,6 +28,22 @@ fn python_target_and_latest() {
 
     let url = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest";
     let json = r#"{"tag_name":"v3.11.9","assets":[{"name":"cpython-3.11.9+20240224-x86_64-unknown-linux-gnu.tar.zst","browser_download_url":"https://example.com/python.tar.zst"}]}"#;
+    set_http_plan(
+        url,
+        vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
+    );
+    let v = python_latest(&ctx).unwrap();
+    assert_eq!(v.to_string(), "3.11.9");
+}
+
+#[test]
+fn python_latest_picks_highest_matching_asset() {
+    let _guard = reset_guard();
+    let (mut ctx, _dir) = ctx_with_dirs();
+    ctx.os = "linux".into();
+    ctx.arch = "x86_64".into();
+    let url = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest";
+    let json = r#"{"tag_name":"v3.11.9","assets":[{"name":"cpython-3.11.8-x86_64-unknown-linux-gnu.tar.zst","browser_download_url":"https://example.com/python-3.11.8.tar.zst"},{"name":"cpython-3.11.9-x86_64-unknown-linux-gnu.tar.zst","browser_download_url":"https://example.com/python-3.11.9.tar.zst"}]}"#;
     set_http_plan(
         url,
         vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
@@ -176,6 +192,30 @@ fn python_check_uses_bindir() {
 }
 
 #[test]
+fn python_check_uses_python_bindir() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = ctx_with_dirs();
+    fs::create_dir_all(&ctx.bindir).unwrap();
+    let bindir_python = ctx.bindir.join("python");
+    fs::write(&bindir_python, b"").unwrap();
+    set_which("python3", None);
+    set_which("python", None);
+    set_run_output(
+        bindir_python.to_string_lossy().as_ref(),
+        &["--version"],
+        output_with_status(0, b"Python 3.11.9", b""),
+    );
+    let url = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest";
+    let json = r#"{"tag_name":"v3.11.9","assets":[{"name":"cpython-3.11.9+20240224-x86_64-unknown-linux-gnu.tar.zst","browser_download_url":"https://example.com/python.tar.zst"}]}"#;
+    set_http_plan(
+        url,
+        vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
+    );
+    let report = check_python(&ctx).unwrap();
+    assert!(matches!(report.status, Status::UpToDate));
+}
+
+#[test]
 fn python_pick_asset_missing() {
     let _guard = reset_guard();
     let (mut ctx, _dir) = ctx_with_dirs();
@@ -195,6 +235,49 @@ fn python_pick_asset_missing() {
         pre: None,
     };
     assert!(python_pick_asset(&ctx, &v).is_err());
+}
+
+#[test]
+fn update_python_prune_warn() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = ctx_with_dirs();
+    fs::create_dir_all(&ctx.bindir).unwrap();
+    set_which("python3", None);
+    set_which("python", None);
+    let url = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest";
+    let json = r#"{"tag_name":"v3.11.9","assets":[{"name":"cpython-3.11.9+20240224-x86_64-unknown-linux-gnu.tar.zst","browser_download_url":"https://example.com/python.tgz"}]}"#;
+    set_http_plan(
+        url,
+        vec![
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+        ],
+    );
+    let tar = {
+        let mut bytes = Vec::new();
+        {
+            let mut tar = tar::Builder::new(&mut bytes);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_cksum();
+            tar.append_data(&mut header, "python/install/bin/python", std::io::empty())
+                .unwrap();
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_cksum();
+            tar.append_data(&mut header, "python/install/bin/python3", std::io::empty())
+                .unwrap();
+            tar.finish().unwrap();
+        }
+        zstd::stream::encode_all(&bytes[..], 0).unwrap()
+    };
+    set_http_plan(
+        "https://example.com/python.tgz",
+        vec![Ok(MockResponse::new(tar.clone(), Some(tar.len() as u64)))],
+    );
+    set_prune_tool_versions_error(Some("prune".to_string()));
+    update_python(&ctx).unwrap();
+    set_prune_tool_versions_error(None);
 }
 
 #[test]

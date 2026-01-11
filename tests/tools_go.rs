@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tempfile::tempdir;
 use upkit::test_support::{
     MockResponse, TestPrompt, base_ctx, output_with_status, reset_guard, set_http_plan,
-    set_run_output, set_which,
+    set_prune_tool_versions_error, set_run_output, set_which,
 };
 use upkit::tools::go::{check_go, go_latest, go_os_arch, go_pick_file, update_go};
 use upkit::{Ctx, Status, Version};
@@ -137,6 +137,47 @@ fn update_go_latest_unknown() {
     set_which("go", None);
     let err = update_go(&ctx).unwrap_err();
     assert!(err.to_string().contains("latest unknown"));
+}
+
+#[test]
+fn update_go_existing_wrappers_and_prune_warn() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = ctx_with_dirs();
+    fs::create_dir_all(&ctx.bindir).unwrap();
+    let tool_root = ctx.home.join("go");
+    let active = tool_root.join("active");
+    fs::create_dir_all(&tool_root).unwrap();
+    let old_active = tool_root.join("old");
+    fs::create_dir_all(&old_active).unwrap();
+    upkit::atomic_symlink(&old_active, &active).unwrap();
+    set_which("go", None);
+    let url = "https://go.dev/dl/?mode=json";
+
+    let tar_bytes = make_go_tar_gz();
+    let mut hasher = Sha256::new();
+    hasher.update(&tar_bytes);
+    let good_sha = hex::encode(hasher.finalize());
+    let json = go_json("go1.2.3", &good_sha);
+    set_http_plan(
+        url,
+        vec![
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+        ],
+    );
+
+    let dl = "https://go.dev/dl/go1.2.3.linux-amd64.tar.gz";
+    set_http_plan(
+        dl,
+        vec![Ok(MockResponse::new(
+            tar_bytes.clone(),
+            Some(tar_bytes.len() as u64),
+        ))],
+    );
+
+    set_prune_tool_versions_error(Some("prune".to_string()));
+    update_go(&ctx).unwrap();
+    set_prune_tool_versions_error(None);
 }
 
 #[test]

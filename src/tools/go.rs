@@ -272,3 +272,84 @@ fn go_releases(ctx: &Ctx) -> Result<Vec<GoRelease>> {
     }
     Err(last_err.unwrap_or_else(|| anyhow!("could not fetch Go releases")))
 }
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::test_support::{
+        TestPrompt, base_ctx, output_with_status, reset_guard, set_env_var, set_home_dir,
+        set_run_output,
+    };
+    use std::fs;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    #[test]
+    fn go_env_value_uses_env() {
+        let _guard = reset_guard();
+        set_env_var("GOBIN", Some(" /tmp/gobin ".to_string()));
+        let value = go_env_value(None, "GOBIN");
+        assert_eq!(value.as_deref(), Some("/tmp/gobin"));
+    }
+
+    #[test]
+    fn go_env_value_runs_go_env() {
+        let _guard = reset_guard();
+        set_env_var("GOPATH", None);
+        set_run_output(
+            "go",
+            &["env", "GOPATH"],
+            output_with_status(0, b"/opt/go\n", b""),
+        );
+        let value = go_env_value(None, "GOPATH");
+        assert_eq!(value.as_deref(), Some("/opt/go"));
+    }
+
+    #[test]
+    fn go_env_value_uses_env_for_gopath() {
+        let _guard = reset_guard();
+        set_env_var("GOPATH", Some(" /tmp/gopath ".to_string()));
+        let value = go_env_value(None, "GOPATH");
+        assert_eq!(value.as_deref(), Some("/tmp/gopath"));
+    }
+
+    #[test]
+    fn go_env_paths_from_env_and_default() {
+        let _guard = reset_guard();
+        set_env_var("GOPATH", Some("/a:/b".to_string()));
+        let paths = go_env_paths(None, "GOPATH");
+        assert_eq!(paths.len(), 2);
+
+        set_env_var("GOPATH", None);
+        set_run_output("go", &["env", "GOPATH"], output_with_status(0, b"\n", b""));
+        set_home_dir(Some(std::path::PathBuf::from("/tmp")));
+        let paths = go_env_paths(None, "GOPATH");
+        assert_eq!(paths, vec![std::path::PathBuf::from("/tmp/go")]);
+    }
+
+    #[test]
+    fn go_env_paths_empty_for_unknown_key() {
+        let _guard = reset_guard();
+        set_env_var("GOROOT", None);
+        set_run_output("go", &["env", "GOROOT"], output_with_status(0, b"\n", b""));
+        let paths = go_env_paths(None, "GOROOT");
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn ensure_go_wrappers_hints_from_gobin() {
+        let _guard = reset_guard();
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        let bindir = dir.path().join("bin");
+        let prompt = Arc::new(TestPrompt::default());
+        let mut ctx = base_ctx(home.clone(), bindir.clone(), prompt);
+        ctx.quiet = true;
+        fs::create_dir_all(&bindir).unwrap();
+        let tool_root = home.join("go");
+        let active = tool_root.join("active");
+        fs::create_dir_all(&active).unwrap();
+        set_env_var("GOBIN", Some("/tmp/gobin".to_string()));
+        ensure_go_wrappers(&ctx, &tool_root, &active).unwrap();
+    }
+}
