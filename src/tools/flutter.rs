@@ -143,8 +143,7 @@ pub fn update_flutter(ctx: &Ctx) -> Result<()> {
         fs::create_dir_all(&tool_root)
             .with_context(|| format!("create {}", tool_root.display()))?;
         let ver_dir = tool_root.join(&release.version);
-        ensure_clean_dir(&ver_dir)
-            .with_context(|| format!("prepare {}", ver_dir.display()))?;
+        ensure_clean_dir(&ver_dir).with_context(|| format!("prepare {}", ver_dir.display()))?;
 
         let archive = release.archive.as_str();
         if archive.ends_with(".tar.xz") {
