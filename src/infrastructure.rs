@@ -17,6 +17,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
+        Mutex, OnceLock,
     },
     time::Duration,
 };
@@ -444,6 +445,33 @@ pub enum ProgressHandle {
     Static,
 }
 
+static ACTIVE_SPINNER: OnceLock<Mutex<Option<ProgressBar>>> = OnceLock::new();
+
+fn active_spinner() -> &'static Mutex<Option<ProgressBar>> {
+    ACTIVE_SPINNER.get_or_init(|| Mutex::new(None))
+}
+
+fn register_active_spinner(pb: &ProgressBar) {
+    *active_spinner().lock().unwrap() = Some(pb.clone());
+}
+
+fn clear_active_spinner() {
+    if let Ok(mut guard) = active_spinner().lock() {
+        *guard = None;
+    }
+}
+
+fn with_spinner_suspended<F, T>(action: F) -> T
+where
+    F: FnOnce() -> T,
+{
+    let spinner = active_spinner().lock().unwrap().clone();
+    match spinner {
+        Some(pb) => pb.suspend(action),
+        None => action(),
+    }
+}
+
 fn spinner_template() -> String {
     if let Some(template) = test_support::spinner_template_override() {
         return template;
@@ -478,6 +506,7 @@ pub fn start_spinner(ctx: &Ctx, msg: &str) -> Option<ProgressHandle> {
     pb.set_style(style.tick_strings(&["-", "\\", "|", "/"]));
     pb.set_message(msg.to_string());
     pb.enable_steady_tick(Duration::from_millis(80));
+    register_active_spinner(&pb);
     Some(ProgressHandle::Spinner(pb))
 }
 
@@ -496,6 +525,7 @@ pub fn finish_spinner(pb: Option<ProgressHandle>, msg: &str) {
                     .unwrap_or_else(|_| ProgressStyle::default_spinner());
                 pb.set_style(style);
                 pb.finish_with_message(msg);
+                clear_active_spinner();
             }
             ProgressHandle::Static => {}
         }
@@ -778,80 +808,84 @@ pub(crate) fn sha256_file(path: &Path) -> Result<String> {
 }
 
 pub fn download_to_temp(ctx: &Ctx, url: &str) -> Result<NamedTempFile> {
-    let show_progress = progress_allowed(ctx);
-    let mut resp = http_get_no_timeout(ctx, url)?;
-    let mut tmp = NamedTempFile::new()?;
-    let total = resp.content_length();
-    let downloaded_total = if show_progress && progress_overwrite_allowed(ctx) {
-        if let Some(total) = total {
-            let pb =
-                ProgressBar::with_draw_target(Some(total), ProgressDrawTarget::stderr_with_hz(10));
-            pb.set_length(total);
-            let style = ProgressStyle::with_template(
-                "[{bar:40.cyan/blue}] {percent:>3}% {bytes}/{total_bytes} {msg}",
-            )?
-            .progress_chars("=>-");
-            pb.set_style(style);
-            pb.set_message(format!("Downloading {url}"));
-            let mut buf = [0u8; 1024 * 64];
-            let mut downloaded = 0u64;
-            loop {
-                let n = resp.read(&mut buf)?;
-                if n == 0 {
-                    break;
+    with_spinner_suspended(|| {
+        let show_progress = progress_allowed(ctx);
+        let mut resp = http_get_no_timeout(ctx, url)?;
+        let mut tmp = NamedTempFile::new()?;
+        let total = resp.content_length();
+        let downloaded_total = if show_progress && progress_overwrite_allowed(ctx) {
+            if let Some(total) = total {
+                let pb = ProgressBar::with_draw_target(
+                    Some(total),
+                    ProgressDrawTarget::stderr_with_hz(10),
+                );
+                pb.set_length(total);
+                let style = ProgressStyle::with_template(
+                    "[{bar:40.cyan/blue}] {percent:>3}% {bytes}/{total_bytes} {msg}",
+                )?
+                .progress_chars("=>-");
+                pb.set_style(style);
+                pb.set_message(format!("Downloading {url}"));
+                let mut buf = [0u8; 1024 * 64];
+                let mut downloaded = 0u64;
+                loop {
+                    let n = resp.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    tmp.write_all(&buf[..n])?;
+                    downloaded += n as u64;
+                    pb.set_position(downloaded);
                 }
-                tmp.write_all(&buf[..n])?;
-                downloaded += n as u64;
-                pb.set_position(downloaded);
-            }
-            pb.finish_with_message("Downloaded");
-            Some(downloaded)
-        } else {
-            let pb = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr_with_hz(10));
-            pb.set_style(
-                ProgressStyle::with_template("{spinner} {msg}")?
-                    .tick_strings(&["-", "\\", "|", "/"]),
-            );
-            pb.set_message(format!("Downloading {url}"));
-            pb.enable_steady_tick(Duration::from_millis(80));
-            let downloaded = io::copy(&mut resp, &mut tmp)?;
-            pb.finish_with_message("Downloaded");
-            Some(downloaded)
-        }
-    } else if show_progress {
-        if let Some(total) = total {
-            info(ctx, format!("Downloading {url} [0%]"));
-            let mut buf = [0u8; 1024 * 64];
-            let mut downloaded = 0u64;
-            loop {
-                let n = resp.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                tmp.write_all(&buf[..n])?;
-                downloaded += n as u64;
-            }
-            if downloaded >= total {
-                info(ctx, format!("Downloading {url} [100%]"));
+                pb.finish_with_message("Downloaded");
+                Some(downloaded)
             } else {
-                let pct = (downloaded.saturating_mul(100) / total).min(100);
-                info(ctx, format!("Downloading {url} [{pct}%]"));
+                let pb = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr_with_hz(10));
+                pb.set_style(
+                    ProgressStyle::with_template("{spinner} {msg}")?
+                        .tick_strings(&["-", "\\", "|", "/"]),
+                );
+                pb.set_message(format!("Downloading {url}"));
+                pb.enable_steady_tick(Duration::from_millis(80));
+                let downloaded = io::copy(&mut resp, &mut tmp)?;
+                pb.finish_with_message("Downloaded");
+                Some(downloaded)
             }
-            Some(downloaded)
+        } else if show_progress {
+            if let Some(total) = total {
+                info(ctx, format!("Downloading {url} [0%]"));
+                let mut buf = [0u8; 1024 * 64];
+                let mut downloaded = 0u64;
+                loop {
+                    let n = resp.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    tmp.write_all(&buf[..n])?;
+                    downloaded += n as u64;
+                }
+                if downloaded >= total {
+                    info(ctx, format!("Downloading {url} [100%]"));
+                } else {
+                    let pct = (downloaded.saturating_mul(100) / total).min(100);
+                    info(ctx, format!("Downloading {url} [{pct}%]"));
+                }
+                Some(downloaded)
+            } else {
+                info(ctx, format!("Downloading {url}"));
+                Some(io::copy(&mut resp, &mut tmp)?)
+            }
         } else {
-            info(ctx, format!("Downloading {url}"));
             Some(io::copy(&mut resp, &mut tmp)?)
-        }
-    } else {
-        Some(io::copy(&mut resp, &mut tmp)?)
-    };
+        };
 
-    if let (Some(total), Some(downloaded)) = (total, downloaded_total) {
-        if downloaded < total {
-            bail!("download incomplete for {url}: expected {total} bytes, got {downloaded}");
+        if let (Some(total), Some(downloaded)) = (total, downloaded_total) {
+            if downloaded < total {
+                bail!("download incomplete for {url}: expected {total} bytes, got {downloaded}");
+            }
         }
-    }
-    Ok(tmp)
+        Ok(tmp)
+    })
 }
 
 pub fn ensure_clean_dir(dir: &Path) -> Result<()> {
