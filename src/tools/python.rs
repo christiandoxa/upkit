@@ -5,8 +5,8 @@ use std::{env, ffi::OsStr, fs, path::PathBuf};
 
 use crate::{
     Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, atomic_symlink, download_to_temp,
-    ensure_clean_dir, home_dir, http_get_json, info, link_dir_bins, maybe_path_hint_for_dir,
-    prune_tool_versions, run_capture, warn, which_or_none,
+    ensure_clean_dir, home_dir, http_get_json, info, keep_latest_version, link_dir_bins,
+    maybe_path_hint_for_dir, prune_tool_versions, run_capture, warn, which_or_none,
 };
 
 #[derive(Debug, Deserialize)]
@@ -40,12 +40,7 @@ pub fn check_python(ctx: &Ctx) -> Result<ToolReport> {
     });
 
     let latest = python_latest(ctx).ok();
-    let status = match (&installed, &latest) {
-        (None, Some(_)) => Status::NotInstalled,
-        (Some(i), Some(l)) if i >= l => Status::UpToDate,
-        (Some(_), Some(_)) => Status::Outdated,
-        _ => Status::Unknown,
-    };
+    let status = Status::from_versions(installed.as_ref(), latest.as_ref());
 
     Ok(ToolReport {
         tool: ToolKind::Python,
@@ -100,9 +95,7 @@ pub fn python_latest(ctx: &Ctx) -> Result<Version> {
                 patch: c[3].parse()?,
                 pre: None,
             };
-            if best.as_ref().map(|b| &v > b).unwrap_or(true) {
-                best = Some(v);
-            }
+            keep_latest_version(&mut best, v);
         }
     }
 
@@ -227,7 +220,7 @@ fn maybe_hint_python_bins(ctx: &Ctx, active: &std::path::Path) {
     }
 }
 
-fn python_user_base(active: &std::path::Path) -> Option<std::path::PathBuf> {
+fn python_user_base(active: &std::path::Path) -> Option<PathBuf> {
     let python = active.join("install").join("bin").join("python3");
     let python = if python.exists() {
         python
@@ -243,14 +236,14 @@ fn python_user_base(active: &std::path::Path) -> Option<std::path::PathBuf> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .map(std::path::PathBuf::from)
+        .map(PathBuf::from)
 }
 
-fn default_python_user_base() -> Option<std::path::PathBuf> {
+fn default_python_user_base() -> Option<PathBuf> {
     env::var("PYTHONUSERBASE")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .map(std::path::PathBuf::from)
+        .map(PathBuf::from)
         .or_else(|| home_dir().map(|home| home.join(".local")))
 }
 

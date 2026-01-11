@@ -6,8 +6,9 @@ use std::{env, ffi::OsStr, fs};
 
 use crate::{
     Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, atomic_symlink, download_to_temp,
-    ensure_clean_dir, get_env_var, home_dir, http_get_json, info, link_dir_bins,
-    maybe_path_hint_for_dir, prune_tool_versions, run_capture, sha256_file, warn, which_or_none,
+    ensure_clean_dir, get_env_var, home_dir, http_get_json, info, keep_latest_version,
+    link_dir_bins, maybe_path_hint_for_dir, prune_tool_versions, run_capture, sha256_file, warn,
+    which_or_none,
 };
 
 #[derive(Debug, Deserialize)]
@@ -55,12 +56,7 @@ pub fn check_go(ctx: &Ctx) -> Result<ToolReport> {
     .and_then(|out| Version::parse_loose(&out));
 
     let latest = go_latest(ctx).ok();
-    let status = match (&installed, &latest) {
-        (None, Some(_)) => Status::NotInstalled,
-        (Some(i), Some(l)) if i >= l => Status::UpToDate,
-        (Some(_), Some(_)) => Status::Outdated,
-        _ => Status::Unknown,
-    };
+    let status = Status::from_versions(installed.as_ref(), latest.as_ref());
 
     let mut notes = vec!["Installs into upkit home and symlinks binaries into bindir.".into()];
     if latest.is_none() {
@@ -86,9 +82,7 @@ pub fn go_latest(ctx: &Ctx) -> Result<Version> {
     let mut best: Option<Version> = None;
     for r in stable {
         if let Some(v) = Version::parse_loose(&r.version) {
-            if best.as_ref().map(|b| &v > b).unwrap_or(true) {
-                best = Some(v);
-            }
+            keep_latest_version(&mut best, v);
         }
     }
     best.ok_or_else(|| anyhow!("could not determine latest Go version"))

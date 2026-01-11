@@ -4,8 +4,8 @@ use std::{collections::HashMap, ffi::OsStr, fs, path::PathBuf};
 
 use crate::{
     Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, atomic_symlink, download_to_temp,
-    ensure_clean_dir, http_get_json, http_get_text, info, link_dir_bins, maybe_path_hint_for_dir,
-    prune_tool_versions, run_capture, sha256_file, warn, which_or_none,
+    ensure_clean_dir, http_get_json, http_get_text, info, keep_latest_version, link_dir_bins,
+    maybe_path_hint_for_dir, prune_tool_versions, run_capture, sha256_file, warn, which_or_none,
 };
 
 #[derive(Debug, Deserialize)]
@@ -43,12 +43,7 @@ pub fn check_node(ctx: &Ctx) -> Result<ToolReport> {
     .and_then(|out| Version::parse_loose(&out));
 
     let latest = node_latest_lts(ctx).ok();
-    let status = match (&installed, &latest) {
-        (None, Some(_)) => Status::NotInstalled,
-        (Some(i), Some(l)) if i >= l => Status::UpToDate,
-        (Some(_), Some(_)) => Status::Outdated,
-        _ => Status::Unknown,
-    };
+    let status = Status::from_versions(installed.as_ref(), latest.as_ref());
 
     Ok(ToolReport {
         tool: ToolKind::Node,
@@ -76,9 +71,7 @@ pub fn node_latest_lts(ctx: &Ctx) -> Result<Version> {
             continue;
         }
         if let Some(v) = Version::parse_loose(&e.version) {
-            if best.as_ref().map(|b| &v > b).unwrap_or(true) {
-                best = Some(v);
-            }
+            keep_latest_version(&mut best, v);
         }
     }
     best.ok_or_else(|| anyhow!("could not determine latest Node LTS"))
