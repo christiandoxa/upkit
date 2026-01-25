@@ -616,13 +616,32 @@ fn cargo_bin_dir() -> Option<PathBuf> {
 fn npm_global_bin_dir(ctx: &Ctx) -> Option<PathBuf> {
     let program = npm_program_for_paths(ctx)?;
     let program = program.to_string_lossy().to_string();
-    let args = vec!["bin".to_string(), "-g".to_string()];
-    let output = run_capture(program, &args).ok()?;
-    let trimmed = output.trim();
-    if trimmed.is_empty() {
+    let bin_output = run_capture(program.clone(), &["bin".to_string(), "-g".to_string()]).ok();
+    if let Some(path) = normalize_path_output(bin_output) {
+        return Some(PathBuf::from(path));
+    }
+    let prefix_output = run_capture(
+        program.clone(),
+        &[
+            "config".to_string(),
+            "get".to_string(),
+            "prefix".to_string(),
+        ],
+    )
+    .ok();
+    if let Some(prefix) = normalize_path_output(prefix_output) {
+        return Some(PathBuf::from(prefix).join("bin"));
+    }
+    let prefix_output = run_capture(program, &["prefix".to_string(), "-g".to_string()]).ok();
+    normalize_path_output(prefix_output).map(|prefix| PathBuf::from(prefix).join("bin"))
+}
+
+fn normalize_path_output(output: Option<String>) -> Option<String> {
+    let trimmed = output?.trim().to_string();
+    if trimmed.is_empty() || trimmed == "undefined" || trimmed == "null" {
         return None;
     }
-    Some(PathBuf::from(trimmed))
+    Some(trimmed)
 }
 
 fn npm_program_for_paths(ctx: &Ctx) -> Option<PathBuf> {
