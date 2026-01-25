@@ -404,7 +404,7 @@ fn required_path_targets(ctx: &Ctx) -> Vec<PathTarget> {
             dir,
         });
     }
-    if let Some(dir) = npm_global_bin_dir() {
+    if let Some(dir) = npm_global_bin_dir(ctx) {
         targets.push(PathTarget {
             label: "npm global bin",
             dir,
@@ -416,7 +416,7 @@ fn required_path_targets(ctx: &Ctx) -> Vec<PathTarget> {
             dir: base.join("bin"),
         });
     }
-    if let Some(dir) = flutter_bin_dir() {
+    if let Some(dir) = flutter_bin_dir(ctx) {
         targets.push(PathTarget {
             label: "flutter bin",
             dir,
@@ -613,16 +613,28 @@ fn cargo_bin_dir() -> Option<PathBuf> {
     Some(cargo_home.join("bin"))
 }
 
-fn npm_global_bin_dir() -> Option<PathBuf> {
-    if which_or_none("npm").is_none() {
-        return None;
-    }
-    let output = run_capture("npm", &["bin", "-g"]).ok()?;
+fn npm_global_bin_dir(ctx: &Ctx) -> Option<PathBuf> {
+    let program = npm_program_for_paths(ctx)?;
+    let program = program.to_string_lossy().to_string();
+    let args = vec!["bin".to_string(), "-g".to_string()];
+    let output = run_capture(program, &args).ok()?;
     let trimmed = output.trim();
     if trimmed.is_empty() {
         return None;
     }
     Some(PathBuf::from(trimmed))
+}
+
+fn npm_program_for_paths(ctx: &Ctx) -> Option<PathBuf> {
+    let bindir_npm = ctx.bindir.join("npm");
+    if bindir_npm.exists() {
+        return Some(bindir_npm);
+    }
+    let active_npm = ctx.home.join("node").join("active").join("bin").join("npm");
+    if active_npm.exists() {
+        return Some(active_npm);
+    }
+    which_or_none("npm")
 }
 
 fn python_user_base_dir() -> Option<PathBuf> {
@@ -681,7 +693,15 @@ fn default_gopath() -> Option<PathBuf> {
     home_dir().map(|home| home.join("go"))
 }
 
-fn flutter_bin_dir() -> Option<PathBuf> {
+fn flutter_bin_dir(ctx: &Ctx) -> Option<PathBuf> {
+    let active_bin = ctx.home.join("flutter").join("active").join("bin");
+    if active_bin.exists() {
+        return Some(active_bin);
+    }
+    let bindir_flutter = ctx.bindir.join("flutter");
+    if bindir_flutter.exists() {
+        return Some(ctx.bindir.clone());
+    }
     let flutter = which_or_none("flutter")?;
     flutter.parent().map(|parent| parent.to_path_buf())
 }

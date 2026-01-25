@@ -169,13 +169,11 @@ pub fn main_with(cli: Cli) -> ExitCode {
     }
 
     let result = run(&cli, &mut ctx);
-    if !matches!(command, Commands::Paths) {
-        let mut path_ctx = ctx.clone();
-        if matches!(command, Commands::Completions { .. }) {
-            path_ctx.quiet = true;
-        }
-        let _ = ensure_required_paths(&path_ctx);
+    let mut path_ctx = ctx.clone();
+    if matches!(command, Commands::Completions { .. }) {
+        path_ctx.quiet = true;
     }
+    let _ = ensure_required_paths(&path_ctx);
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
