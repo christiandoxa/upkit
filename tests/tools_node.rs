@@ -12,6 +12,12 @@ use upkit::tools::node::{
 };
 use upkit::{Ctx, Status, Version};
 
+#[cfg(unix)]
+use upkit::test_support::take_run_output;
+
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
+
 fn ctx_with_dirs() -> (Ctx, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let prompt = Arc::new(TestPrompt::default());
@@ -405,6 +411,76 @@ fn update_node_warns_on_prefix_and_prune() {
     set_prune_tool_versions_error(Some("prune".to_string()));
     update_node(&ctx).unwrap();
     set_prune_tool_versions_error(None);
+}
+
+#[cfg(unix)]
+#[test]
+fn update_node_restores_npm_globals() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = ctx_with_dirs();
+    fs::create_dir_all(&ctx.bindir).unwrap();
+    let idx_url = "https://nodejs.org/dist/index.json";
+    let json = r#"[{"version":"v1.2.3","lts":true}]"#;
+    set_http_plan(
+        idx_url,
+        vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
+    );
+    set_which("node", None);
+
+    let tar_bytes = make_node_tar_xz_with_npm();
+    let mut hasher = Sha256::new();
+    hasher.update(&tar_bytes);
+    let good_sha = hex::encode(hasher.finalize());
+    let sums = format!("{good_sha}  node-v1.2.3-linux-x64.tar.xz\n");
+    let sums_url = "https://nodejs.org/dist/v1.2.3/SHASUMS256.txt";
+    set_http_plan(
+        sums_url,
+        vec![Ok(MockResponse::new(sums.as_bytes().to_vec(), None))],
+    );
+
+    let dl = "https://nodejs.org/dist/v1.2.3/node-v1.2.3-linux-x64.tar.xz";
+    set_http_plan(
+        dl,
+        vec![Ok(MockResponse::new(
+            tar_bytes.clone(),
+            Some(tar_bytes.len() as u64),
+        ))],
+    );
+
+    let tool_root = ctx.home.join("node");
+    let old_dir = tool_root.join("old");
+    fs::create_dir_all(old_dir.join("bin")).unwrap();
+    fs::write(old_dir.join("bin/npm"), b"").unwrap();
+    symlink(&old_dir, tool_root.join("active")).unwrap();
+
+    let npm = ctx.home.join("node").join("active").join("bin").join("npm");
+    let list_json = r#"{"dependencies":{"npm":{"version":"10.0.0"},"corepack":{"version":"0.0.0"},"eslint":{"version":"9.0.0"},"@scope/pkg":{"version":"1.0.0"}}}"#;
+    set_run_output(
+        npm.to_string_lossy().as_ref(),
+        &["ls", "-g", "--depth=0", "--json"],
+        output_with_status(0, list_json.as_bytes(), b""),
+    );
+    let desired = ctx.home.join("node/active").to_string_lossy().to_string();
+    set_run_output(
+        npm.to_string_lossy().as_ref(),
+        &["config", "get", "prefix"],
+        output_with_status(0, desired.as_bytes(), b""),
+    );
+    set_run_output(
+        npm.to_string_lossy().as_ref(),
+        &["install", "-g", "@scope/pkg", "eslint"],
+        output_with_status(0, b"", b""),
+    );
+
+    update_node(&ctx).unwrap();
+
+    let args = vec![
+        "install".to_string(),
+        "-g".to_string(),
+        "@scope/pkg".to_string(),
+        "eslint".to_string(),
+    ];
+    assert!(take_run_output(npm.to_string_lossy().as_ref(), &args).is_none());
 }
 
 #[test]

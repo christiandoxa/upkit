@@ -13,10 +13,10 @@ use std::{
 
 use crate::domain::{Status, ToolKind, ToolReport, UpdateMethod};
 use crate::infrastructure::{
-    Ctx, DialoguerPrompt, data_local_dir, debug, emit_json, error, finish_spinner, get_env_var,
-    home_dir, http_get_text, info, maybe_path_hint, print_json_error, print_reports,
-    progress_allowed, remove_path_hint_for_label, reports_to_json, run_status, start_spinner,
-    tool_bin_names, tool_path_hint_labels, warn, which_or_none,
+    Ctx, DialoguerPrompt, data_local_dir, debug, emit_json, ensure_required_paths, error,
+    finish_spinner, get_env_var, home_dir, http_get_text, info, maybe_path_hint, print_json_error,
+    print_reports, progress_allowed, remove_path_hint_for_label, reports_to_json, run_status,
+    start_spinner, tool_bin_names, tool_path_hint_labels, warn, which_or_none,
 };
 use crate::{test_support, tools};
 
@@ -146,6 +146,7 @@ pub fn main_with(cli: Cli) -> ExitCode {
             return ExitCode::from(map_error_to_exit_code(&err));
         }
     };
+    let command = cli.cmd.clone().unwrap_or(Commands::Check);
     debug(
         &ctx,
         format!(
@@ -168,6 +169,13 @@ pub fn main_with(cli: Cli) -> ExitCode {
     }
 
     let result = run(&cli, &mut ctx);
+    if !matches!(command, Commands::Paths) {
+        let mut path_ctx = ctx.clone();
+        if matches!(command, Commands::Completions { .. }) {
+            path_ctx.quiet = true;
+        }
+        let _ = ensure_required_paths(&path_ctx);
+    }
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -186,16 +194,49 @@ pub fn run(cli: &Cli, ctx: &mut Ctx) -> Result<()> {
     match cli.cmd.clone().unwrap_or(Commands::Check) {
         Commands::Paths => {
             ensure_dirs(ctx)?;
+            let report = ensure_required_paths(ctx);
             if cli.json {
+                let paths = report
+                    .iter()
+                    .map(|entry| {
+                        serde_json::json!({
+                            "label": entry.label,
+                            "dir": entry.dir.display().to_string(),
+                            "configured": entry.configured,
+                            "updated": entry.updated,
+                        })
+                    })
+                    .collect::<Vec<_>>();
                 let payload = serde_json::json!({
                     "home": ctx.home.display().to_string(),
                     "bindir": ctx.bindir.display().to_string(),
+                    "paths": paths,
                 });
                 emit_json(ctx, payload)?;
             } else {
                 info(ctx, format!("upkit home : {}", ctx.home.display()));
                 info(ctx, format!("upkit bindir: {}", ctx.bindir.display()));
                 info(ctx, "(created directories if missing)");
+                if report.is_empty() {
+                    info(ctx, "No path targets detected.");
+                } else {
+                    info(ctx, "Path checks:");
+                    for entry in &report {
+                        let status = if entry.updated {
+                            "added"
+                        } else if entry.configured {
+                            "ok"
+                        } else {
+                            "missing"
+                        };
+                        let line = format!("- {status}: {} ({})", entry.label, entry.dir.display());
+                        if entry.updated || entry.configured {
+                            info(ctx, line);
+                        } else {
+                            warn(ctx, line);
+                        }
+                    }
+                }
             }
         }
         Commands::Check => {

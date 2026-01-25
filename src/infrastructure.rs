@@ -293,6 +293,49 @@ pub fn maybe_path_hint_for_dir(ctx: &Ctx, dir: &Path, label: &str) {
     write_path_hint(ctx, &rc_path, output);
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct PathCheckEntry {
+    pub(crate) label: String,
+    pub(crate) dir: PathBuf,
+    pub(crate) configured: bool,
+    pub(crate) updated: bool,
+}
+
+struct PathTarget {
+    label: &'static str,
+    dir: PathBuf,
+}
+
+pub(crate) fn ensure_required_paths(ctx: &Ctx) -> Vec<PathCheckEntry> {
+    let shell = get_env_var("SHELL").unwrap_or_default();
+    let rc_paths = resolve_shell_rc_paths(&shell);
+    let primary_rc = primary_shell_rc_path(&rc_paths);
+    let home = home_dir();
+    let mut warned_missing_rc = false;
+    let mut report = Vec::new();
+
+    for target in required_path_targets(ctx) {
+        let configured = dir_configured_in_rc(&target.dir, &rc_paths, home.as_deref());
+        let mut updated = false;
+        if !configured && !ctx.dry_run {
+            if let Some(rc_path) = primary_rc.as_ref() {
+                updated = update_path_hint_in_rc(ctx, rc_path, &shell, &target.dir, target.label);
+            } else if !warned_missing_rc {
+                warn(ctx, "Could not resolve shell rc file to update PATH.");
+                warned_missing_rc = true;
+            }
+        }
+        report.push(PathCheckEntry {
+            label: target.label.to_string(),
+            dir: target.dir,
+            configured,
+            updated,
+        });
+    }
+
+    report
+}
+
 pub fn remove_path_hint_for_label(ctx: &Ctx, label: &str) {
     if ctx.quiet {
         return;
@@ -349,6 +392,58 @@ fn path_hint_line(shell: &str, dir: &Path) -> String {
     }
 }
 
+fn required_path_targets(ctx: &Ctx) -> Vec<PathTarget> {
+    let mut targets = Vec::new();
+    targets.push(PathTarget {
+        label: "upkit",
+        dir: ctx.bindir.clone(),
+    });
+    if let Some(dir) = cargo_bin_dir() {
+        targets.push(PathTarget {
+            label: "cargo bin",
+            dir,
+        });
+    }
+    if let Some(dir) = npm_global_bin_dir() {
+        targets.push(PathTarget {
+            label: "npm global bin",
+            dir,
+        });
+    }
+    if let Some(base) = python_user_base_dir() {
+        targets.push(PathTarget {
+            label: "python user base bin",
+            dir: base.join("bin"),
+        });
+    }
+    if let Some(dir) = flutter_bin_dir() {
+        targets.push(PathTarget {
+            label: "flutter bin",
+            dir,
+        });
+    }
+    if let Some(pub_cache) = pub_cache_dir() {
+        targets.push(PathTarget {
+            label: "pub cache bin",
+            dir: pub_cache.join("bin"),
+        });
+    }
+    if let Some(gobin) = go_env_value("GOBIN") {
+        targets.push(PathTarget {
+            label: "go GOBIN",
+            dir: PathBuf::from(gobin),
+        });
+    } else {
+        for gopath in go_env_paths("GOPATH") {
+            targets.push(PathTarget {
+                label: "go GOPATH/bin",
+                dir: gopath.join("bin"),
+            });
+        }
+    }
+    targets
+}
+
 fn shell_rc_path(shell: &str) -> &'static str {
     if shell.ends_with("zsh") {
         "~/.zshrc"
@@ -359,6 +454,123 @@ fn shell_rc_path(shell: &str) -> &'static str {
     } else {
         "~/.profile"
     }
+}
+
+fn shell_rc_candidates(shell: &str) -> Vec<&'static str> {
+    if shell.ends_with("zsh") {
+        vec!["~/.zshrc", "~/.zprofile"]
+    } else if shell.ends_with("fish") {
+        vec!["~/.config/fish/config.fish"]
+    } else if shell.ends_with("bash") {
+        vec!["~/.bashrc", "~/.bash_profile", "~/.profile"]
+    } else {
+        vec!["~/.profile"]
+    }
+}
+
+fn resolve_shell_rc_paths(shell: &str) -> Vec<PathBuf> {
+    shell_rc_candidates(shell)
+        .into_iter()
+        .filter_map(expand_tilde)
+        .collect()
+}
+
+fn primary_shell_rc_path(rc_paths: &[PathBuf]) -> Option<PathBuf> {
+    for path in rc_paths {
+        if path.exists() {
+            return Some(path.clone());
+        }
+    }
+    rc_paths.first().cloned()
+}
+
+fn dir_configured_in_rc(dir: &Path, rc_paths: &[PathBuf], home: Option<&Path>) -> bool {
+    for rc_path in rc_paths {
+        let Ok(content) = fs::read_to_string(rc_path) else {
+            continue;
+        };
+        if rc_contains_dir(&content, dir, home) {
+            return true;
+        }
+    }
+    false
+}
+
+fn rc_contains_dir(content: &str, dir: &Path, home: Option<&Path>) -> bool {
+    let dir_str = dir.to_string_lossy();
+    if content.contains(dir_str.as_ref()) {
+        return true;
+    }
+    let Some(home) = home else {
+        return false;
+    };
+    let Some((tilde, home_env, home_env_braced)) = home_relative_patterns(home, dir) else {
+        return false;
+    };
+    content.contains(&tilde) || content.contains(&home_env) || content.contains(&home_env_braced)
+}
+
+fn home_relative_patterns(home: &Path, dir: &Path) -> Option<(String, String, String)> {
+    let rel = dir.strip_prefix(home).ok()?;
+    let rel_str = rel.to_string_lossy();
+    let suffix = if rel_str.is_empty() {
+        "".to_string()
+    } else {
+        format!("/{}", rel_str)
+    };
+    Some((
+        format!("~{suffix}"),
+        format!("$HOME{suffix}"),
+        format!("${{HOME}}{suffix}"),
+    ))
+}
+
+fn update_path_hint_in_rc(ctx: &Ctx, rc_path: &Path, shell: &str, dir: &Path, label: &str) -> bool {
+    let label_line = format!("# upkit ({label})");
+    let path_line = path_hint_line(shell, dir);
+    let existing = fs::read_to_string(rc_path).ok();
+    let mut found_label = false;
+    let mut updated = false;
+    let mut lines = Vec::new();
+
+    if let Some(content) = &existing {
+        let mut iter = content.lines().peekable();
+        while let Some(line) = iter.next() {
+            if line.trim_end() == label_line {
+                found_label = true;
+                lines.push(label_line.clone());
+                if let Some(next_line) = iter.peek().map(|next| next.trim_end()) {
+                    if next_line != path_line {
+                        updated = true;
+                    }
+                    iter.next();
+                } else {
+                    updated = true;
+                }
+                lines.push(path_line.clone());
+                continue;
+            }
+            lines.push(line.to_string());
+        }
+    }
+
+    if !found_label {
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push(label_line);
+        lines.push(path_line);
+        updated = true;
+    }
+
+    if !updated {
+        return false;
+    }
+
+    let mut output = lines.join("\n");
+    output.push('\n');
+    write_path_hint(ctx, rc_path, output);
+    true
 }
 
 fn write_path_hint(ctx: &Ctx, rc_path: &Path, output: String) {
@@ -391,6 +603,94 @@ fn write_path_hint(ctx: &Ctx, rc_path: &Path, output: String) {
             );
         }
     }
+}
+
+fn cargo_bin_dir() -> Option<PathBuf> {
+    let cargo_home = get_env_var("CARGO_HOME")
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(".cargo")))?;
+    Some(cargo_home.join("bin"))
+}
+
+fn npm_global_bin_dir() -> Option<PathBuf> {
+    if which_or_none("npm").is_none() {
+        return None;
+    }
+    let output = run_capture("npm", &["bin", "-g"]).ok()?;
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(trimmed))
+}
+
+fn python_user_base_dir() -> Option<PathBuf> {
+    if let Some(base) = get_env_var("PYTHONUSERBASE").filter(|value| !value.trim().is_empty()) {
+        return Some(PathBuf::from(base));
+    }
+    if which_or_none("python3").is_some() {
+        if let Some(base) = python_user_base_from("python3") {
+            return Some(base);
+        }
+    }
+    if which_or_none("python").is_some() {
+        if let Some(base) = python_user_base_from("python") {
+            return Some(base);
+        }
+    }
+    home_dir().map(|home| home.join(".local"))
+}
+
+fn python_user_base_from(program: &str) -> Option<PathBuf> {
+    let output = run_capture(program, &["-m", "site", "--user-base"]).ok()?;
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(trimmed))
+}
+
+fn go_env_value(key: &str) -> Option<String> {
+    if let Some(value) = get_env_var(key) {
+        let value = value.trim().to_string();
+        if !value.is_empty() {
+            return Some(value);
+        }
+    }
+    if which_or_none("go").is_none() {
+        return None;
+    }
+    run_capture("go", &["env", key])
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn go_env_paths(key: &str) -> Vec<PathBuf> {
+    if let Some(value) = go_env_value(key) {
+        return env::split_paths(&value).collect();
+    }
+    if key == "GOPATH" {
+        return default_gopath().into_iter().collect();
+    }
+    Vec::new()
+}
+
+fn default_gopath() -> Option<PathBuf> {
+    home_dir().map(|home| home.join("go"))
+}
+
+fn flutter_bin_dir() -> Option<PathBuf> {
+    let flutter = which_or_none("flutter")?;
+    flutter.parent().map(|parent| parent.to_path_buf())
+}
+
+fn pub_cache_dir() -> Option<PathBuf> {
+    get_env_var("PUB_CACHE")
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(".pub-cache")))
 }
 
 pub fn write_all_checked(writer: &mut dyn Write, bytes: &[u8]) -> io::Result<()> {

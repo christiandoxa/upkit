@@ -5,7 +5,8 @@ use std::{collections::HashMap, ffi::OsStr, fs, path::PathBuf};
 use crate::{
     Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, atomic_symlink, download_to_temp,
     ensure_clean_dir, http_get_json, http_get_text, info, keep_latest_version, link_dir_bins,
-    maybe_path_hint_for_dir, prune_tool_versions, run_capture, sha256_file, warn, which_or_none,
+    maybe_path_hint_for_dir, prune_tool_versions, run_capture, run_output, sha256_file, warn,
+    which_or_none,
 };
 
 #[derive(Debug, Deserialize)]
@@ -133,6 +134,15 @@ pub fn update_node(ctx: &Ctx) -> Result<()> {
         return Ok(());
     }
 
+    let tool_root = ctx.home.join("node");
+    let prior_globals = match npm_global_packages(&tool_root.join("active")) {
+        Ok(list) => list,
+        Err(err) => {
+            warn(ctx, format!("Failed to list npm globals: {err}"));
+            Vec::new()
+        }
+    };
+
     // verify sha256 from SHASUMS256.txt
     let sums = node_shasums(ctx, &version_tag)?;
     let expected = sums
@@ -146,7 +156,6 @@ pub fn update_node(ctx: &Ctx) -> Result<()> {
         bail!("Node sha256 mismatch: expected {expected}, got {got}");
     }
 
-    let tool_root = ctx.home.join("node");
     fs::create_dir_all(&tool_root)?;
     let ver_dir = tool_root.join(latest.to_string());
     ensure_clean_dir(&ver_dir)?;
@@ -173,6 +182,9 @@ pub fn update_node(ctx: &Ctx) -> Result<()> {
     if let Err(err) = ensure_npm_prefix(&active) {
         warn(ctx, format!("Failed to set npm prefix: {err}"));
     }
+    if let Err(err) = restore_npm_globals(&active, &prior_globals) {
+        warn(ctx, format!("Failed to restore npm globals: {err}"));
+    }
     maybe_path_hint_for_dir(ctx, &bin_dir, "npm global bin");
 
     if let Err(err) = prune_tool_versions(&tool_root, &ver_dir, &["active"]) {
@@ -180,6 +192,50 @@ pub fn update_node(ctx: &Ctx) -> Result<()> {
     }
 
     info(ctx, format!("node updated to {}", latest.to_string()));
+    Ok(())
+}
+
+fn npm_global_packages(active: &std::path::Path) -> Result<Vec<String>> {
+    let npm_path = active.join("bin").join("npm");
+    if !npm_path.exists() {
+        return Ok(Vec::new());
+    }
+    let program = npm_path.to_string_lossy().to_string();
+    let args = vec![
+        "ls".to_string(),
+        "-g".to_string(),
+        "--depth=0".to_string(),
+        "--json".to_string(),
+    ];
+    let output = run_output(program, &args)?;
+    if output.stdout.is_empty() {
+        return Ok(Vec::new());
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let Some(deps) = value.get("dependencies").and_then(|deps| deps.as_object()) else {
+        return Ok(Vec::new());
+    };
+    let mut names = deps
+        .keys()
+        .filter(|name| *name != "npm" && *name != "corepack")
+        .cloned()
+        .collect::<Vec<_>>();
+    names.sort();
+    Ok(names)
+}
+
+fn restore_npm_globals(active: &std::path::Path, packages: &[String]) -> Result<()> {
+    if packages.is_empty() {
+        return Ok(());
+    }
+    let npm_path = active.join("bin").join("npm");
+    if !npm_path.exists() {
+        return Ok(());
+    }
+    let program = npm_path.to_string_lossy().to_string();
+    let mut args = vec!["install".to_string(), "-g".to_string()];
+    args.extend(packages.iter().cloned());
+    run_capture(program, &args)?;
     Ok(())
 }
 
