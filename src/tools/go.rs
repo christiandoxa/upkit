@@ -190,7 +190,7 @@ pub fn update_go(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-fn ensure_go_wrappers(
+pub fn ensure_go_wrappers(
     ctx: &Ctx,
     tool_root: &std::path::Path,
     active: &std::path::Path,
@@ -236,7 +236,7 @@ fn maybe_hint_go_bins(ctx: &Ctx, go_bin: Option<&std::path::Path>) {
     }
 }
 
-fn go_env_value(go_bin: Option<&std::path::Path>, key: &str) -> Option<String> {
+pub fn go_env_value(go_bin: Option<&std::path::Path>, key: &str) -> Option<String> {
     if let Some(value) = get_env_var(key) {
         let value = value.trim().to_string();
         if !value.is_empty() {
@@ -254,7 +254,7 @@ fn go_env_value(go_bin: Option<&std::path::Path>, key: &str) -> Option<String> {
     .filter(|value| !value.is_empty())
 }
 
-fn go_env_paths(go_bin: Option<&std::path::Path>, key: &str) -> Vec<std::path::PathBuf> {
+pub fn go_env_paths(go_bin: Option<&std::path::Path>, key: &str) -> Vec<std::path::PathBuf> {
     if let Some(value) = go_env_value(go_bin, key) {
         return env::split_paths(&value).collect();
     }
@@ -292,9 +292,9 @@ fn go_releases(ctx: &Ctx) -> Result<Vec<GoRelease>> {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
-struct GoToolSpec {
-    module: String,
-    version: String,
+pub struct GoToolSpec {
+    pub module: String,
+    pub version: String,
 }
 
 fn go_executable(tool_root: &std::path::Path, active: &std::path::Path) -> Option<PathBuf> {
@@ -309,7 +309,7 @@ fn go_executable(tool_root: &std::path::Path, active: &std::path::Path) -> Optio
     None
 }
 
-fn go_global_tools(go_bin: Option<&std::path::Path>) -> Result<Vec<GoToolSpec>> {
+pub fn go_global_tools(go_bin: Option<&std::path::Path>) -> Result<Vec<GoToolSpec>> {
     let bin_dirs = go_global_bin_dirs(go_bin);
     if bin_dirs.is_empty() {
         return Ok(Vec::new());
@@ -339,7 +339,7 @@ fn go_global_tools(go_bin: Option<&std::path::Path>) -> Result<Vec<GoToolSpec>> 
     Ok(specs)
 }
 
-fn go_global_bin_dirs(go_bin: Option<&std::path::Path>) -> Vec<PathBuf> {
+pub fn go_global_bin_dirs(go_bin: Option<&std::path::Path>) -> Vec<PathBuf> {
     if let Some(gobin) = go_env_value(go_bin, "GOBIN") {
         return vec![PathBuf::from(gobin)];
     }
@@ -350,7 +350,7 @@ fn go_global_bin_dirs(go_bin: Option<&std::path::Path>) -> Vec<PathBuf> {
     dirs
 }
 
-fn go_tool_spec_from_binary(
+pub fn go_tool_spec_from_binary(
     go_bin: Option<&std::path::Path>,
     binary: &std::path::Path,
 ) -> Option<GoToolSpec> {
@@ -370,7 +370,7 @@ fn go_tool_spec_from_binary(
     parse_go_version_metadata(&String::from_utf8_lossy(&output.stdout))
 }
 
-fn parse_go_version_metadata(output: &str) -> Option<GoToolSpec> {
+pub fn parse_go_version_metadata(output: &str) -> Option<GoToolSpec> {
     for line in output.lines() {
         let mut parts = line.split_whitespace();
         let key = parts.next()?;
@@ -386,7 +386,7 @@ fn parse_go_version_metadata(output: &str) -> Option<GoToolSpec> {
     None
 }
 
-fn restore_go_globals(go_bin: Option<&std::path::Path>, tools: &[GoToolSpec]) -> Result<()> {
+pub fn restore_go_globals(go_bin: Option<&std::path::Path>, tools: &[GoToolSpec]) -> Result<()> {
     if tools.is_empty() {
         return Ok(());
     }
@@ -400,158 +400,4 @@ fn restore_go_globals(go_bin: Option<&std::path::Path>, tools: &[GoToolSpec]) ->
         run_capture(program.clone(), &args)?;
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod unit_tests {
-    use super::*;
-    use crate::test_support::{
-        TestPrompt, base_ctx, output_with_status, reset_guard, set_env_var, set_home_dir,
-        set_run_output,
-    };
-    use std::fs;
-    use std::sync::Arc;
-    use tempfile::tempdir;
-
-    #[test]
-    fn go_env_value_uses_env() {
-        let _guard = reset_guard();
-        set_env_var("GOBIN", Some(" /tmp/gobin ".to_string()));
-        let value = go_env_value(None, "GOBIN");
-        assert_eq!(value.as_deref(), Some("/tmp/gobin"));
-    }
-
-    #[test]
-    fn go_env_value_runs_go_env() {
-        let _guard = reset_guard();
-        set_env_var("GOPATH", None);
-        set_run_output(
-            "go",
-            &["env", "GOPATH"],
-            output_with_status(0, b"/opt/go\n", b""),
-        );
-        let value = go_env_value(None, "GOPATH");
-        assert_eq!(value.as_deref(), Some("/opt/go"));
-    }
-
-    #[test]
-    fn go_env_value_uses_env_for_gopath() {
-        let _guard = reset_guard();
-        set_env_var("GOPATH", Some(" /tmp/gopath ".to_string()));
-        let value = go_env_value(None, "GOPATH");
-        assert_eq!(value.as_deref(), Some("/tmp/gopath"));
-    }
-
-    #[test]
-    fn go_env_paths_from_env_and_default() {
-        let _guard = reset_guard();
-        set_env_var("GOPATH", Some("/a:/b".to_string()));
-        let paths = go_env_paths(None, "GOPATH");
-        assert_eq!(paths.len(), 2);
-
-        set_env_var("GOPATH", None);
-        set_run_output("go", &["env", "GOPATH"], output_with_status(0, b"\n", b""));
-        set_home_dir(Some(std::path::PathBuf::from("/tmp")));
-        let paths = go_env_paths(None, "GOPATH");
-        assert_eq!(paths, vec![std::path::PathBuf::from("/tmp/go")]);
-    }
-
-    #[test]
-    fn go_env_paths_empty_for_unknown_key() {
-        let _guard = reset_guard();
-        set_env_var("GOROOT", None);
-        set_run_output("go", &["env", "GOROOT"], output_with_status(0, b"\n", b""));
-        let paths = go_env_paths(None, "GOROOT");
-        assert!(paths.is_empty());
-    }
-
-    #[test]
-    fn ensure_go_wrappers_hints_from_gobin() {
-        let _guard = reset_guard();
-        let dir = tempdir().unwrap();
-        let home = dir.path().join("home");
-        let bindir = dir.path().join("bin");
-        let prompt = Arc::new(TestPrompt::default());
-        let mut ctx = base_ctx(home.clone(), bindir.clone(), prompt);
-        ctx.quiet = true;
-        fs::create_dir_all(&bindir).unwrap();
-        let tool_root = home.join("go");
-        let active = tool_root.join("active");
-        fs::create_dir_all(&active).unwrap();
-        set_env_var("GOBIN", Some("/tmp/gobin".to_string()));
-        ensure_go_wrappers(&ctx, &tool_root, &active).unwrap();
-    }
-
-    #[test]
-    fn parse_go_version_metadata_skips_devel() {
-        let output = "example\nmod example.com/tool (devel)\n";
-        assert!(parse_go_version_metadata(output).is_none());
-    }
-
-    #[test]
-    fn parse_go_version_metadata_extracts_mod() {
-        let output = "example\nmod example.com/tool v1.2.3\n";
-        let spec = parse_go_version_metadata(output).unwrap();
-        assert_eq!(spec.module, "example.com/tool");
-        assert_eq!(spec.version, "v1.2.3");
-    }
-
-    #[test]
-    fn go_global_bin_dirs_prefers_gobin() {
-        let _guard = reset_guard();
-        set_env_var("GOBIN", Some("/tmp/gobin".to_string()));
-        set_env_var("GOPATH", Some("/tmp/gopath".to_string()));
-        let dirs = go_global_bin_dirs(None);
-        assert_eq!(dirs, vec![std::path::PathBuf::from("/tmp/gobin")]);
-    }
-
-    #[test]
-    fn go_tool_spec_from_binary_uses_version_output() {
-        let _guard = reset_guard();
-        let dir = tempdir().unwrap();
-        let binary = dir.path().join("tool");
-        fs::write(&binary, b"").unwrap();
-        set_run_output(
-            "go",
-            &["version", "-m", binary.to_string_lossy().as_ref()],
-            output_with_status(0, b"example\nmod example.com/tool v1.2.3\n", b""),
-        );
-        let spec = go_tool_spec_from_binary(None, &binary).unwrap();
-        assert_eq!(spec.module, "example.com/tool");
-        assert_eq!(spec.version, "v1.2.3");
-    }
-
-    #[test]
-    fn restore_go_globals_runs_install() {
-        let _guard = reset_guard();
-        set_run_output(
-            "go",
-            &["install", "example.com/tool@v1.2.3"],
-            output_with_status(0, b"", b""),
-        );
-        let tools = vec![GoToolSpec {
-            module: "example.com/tool".to_string(),
-            version: "v1.2.3".to_string(),
-        }];
-        restore_go_globals(None, &tools).unwrap();
-    }
-
-    #[test]
-    fn go_global_tools_reads_gobin_dir() {
-        let _guard = reset_guard();
-        let dir = tempdir().unwrap();
-        let gobin = dir.path().join("bin");
-        fs::create_dir_all(&gobin).unwrap();
-        let binary = gobin.join("tool");
-        fs::write(&binary, b"").unwrap();
-        set_env_var("GOBIN", Some(gobin.to_string_lossy().to_string()));
-        set_run_output(
-            "go",
-            &["version", "-m", binary.to_string_lossy().as_ref()],
-            output_with_status(0, b"example\nmod example.com/tool v1.2.3\n", b""),
-        );
-        let tools = go_global_tools(None).unwrap();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].module, "example.com/tool");
-    }
 }

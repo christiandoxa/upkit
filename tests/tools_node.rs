@@ -8,7 +8,8 @@ use upkit::test_support::{
     set_prune_tool_versions_error, set_run_output, set_which,
 };
 use upkit::tools::node::{
-    check_node, node_artifact_name, node_latest_lts, node_os_arch, node_shasums, update_node,
+    check_node, ensure_npm_prefix, node_artifact_name, node_latest_lts, node_os_arch, node_shasums,
+    update_node,
 };
 use upkit::{Ctx, Status, Version};
 
@@ -550,4 +551,51 @@ fn update_node_up_to_date() {
         output_with_status(0, b"v1.2.3", b""),
     );
     update_node(&ctx).unwrap();
+}
+
+#[test]
+fn ensure_npm_prefix_no_npm() {
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let active = dir.path().join("active");
+    fs::create_dir_all(&active).unwrap();
+    ensure_npm_prefix(&active).unwrap();
+}
+
+#[test]
+fn ensure_npm_prefix_no_change() {
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let active = dir.path().join("active");
+    let npm = active.join("bin").join("npm");
+    fs::create_dir_all(npm.parent().unwrap()).unwrap();
+    fs::write(&npm, b"").unwrap();
+    let desired = active.to_string_lossy().to_string();
+    set_run_output(
+        npm.to_string_lossy().as_ref(),
+        &["config", "get", "prefix"],
+        output_with_status(0, desired.as_bytes(), b""),
+    );
+    ensure_npm_prefix(&active).unwrap();
+}
+
+#[test]
+fn ensure_npm_prefix_set() {
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let active = dir.path().join("active");
+    let npm = active.join("bin").join("npm");
+    fs::create_dir_all(npm.parent().unwrap()).unwrap();
+    fs::write(&npm, b"").unwrap();
+    set_run_output(
+        npm.to_string_lossy().as_ref(),
+        &["config", "get", "prefix"],
+        output_with_status(0, b"/tmp/old", b""),
+    );
+    set_run_output(
+        npm.to_string_lossy().as_ref(),
+        &["config", "set", "prefix", active.to_string_lossy().as_ref()],
+        output_with_status(0, b"", b""),
+    );
+    ensure_npm_prefix(&active).unwrap();
 }

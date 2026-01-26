@@ -239,7 +239,7 @@ fn restore_npm_globals(active: &std::path::Path, packages: &[String]) -> Result<
     Ok(())
 }
 
-fn ensure_npm_prefix(active: &std::path::Path) -> Result<()> {
+pub fn ensure_npm_prefix(active: &std::path::Path) -> Result<()> {
     let desired_prefix = active.to_string_lossy().to_string();
     let npm_path = active.join("bin").join("npm");
     if !npm_path.exists() {
@@ -274,59 +274,4 @@ fn node_bin_in_bindir(ctx: &Ctx) -> Option<PathBuf> {
         return Some(candidate);
     }
     None
-}
-
-#[cfg(test)]
-mod unit_tests {
-    use super::*;
-    use crate::test_support::{output_with_status, reset_guard, set_run_output};
-    use std::fs;
-    use tempfile::tempdir;
-
-    #[test]
-    fn ensure_npm_prefix_no_npm() {
-        let _guard = reset_guard();
-        let dir = tempdir().unwrap();
-        let active = dir.path().join("active");
-        fs::create_dir_all(&active).unwrap();
-        ensure_npm_prefix(&active).unwrap();
-    }
-
-    #[test]
-    fn ensure_npm_prefix_no_change() {
-        let _guard = reset_guard();
-        let dir = tempdir().unwrap();
-        let active = dir.path().join("active");
-        let npm = active.join("bin").join("npm");
-        fs::create_dir_all(npm.parent().unwrap()).unwrap();
-        fs::write(&npm, b"").unwrap();
-        let desired = active.to_string_lossy().to_string();
-        set_run_output(
-            npm.to_string_lossy().as_ref(),
-            &["config", "get", "prefix"],
-            output_with_status(0, desired.as_bytes(), b""),
-        );
-        ensure_npm_prefix(&active).unwrap();
-    }
-
-    #[test]
-    fn ensure_npm_prefix_set() {
-        let _guard = reset_guard();
-        let dir = tempdir().unwrap();
-        let active = dir.path().join("active");
-        let npm = active.join("bin").join("npm");
-        fs::create_dir_all(npm.parent().unwrap()).unwrap();
-        fs::write(&npm, b"").unwrap();
-        set_run_output(
-            npm.to_string_lossy().as_ref(),
-            &["config", "get", "prefix"],
-            output_with_status(0, b"/tmp/old", b""),
-        );
-        set_run_output(
-            npm.to_string_lossy().as_ref(),
-            &["config", "set", "prefix", active.to_string_lossy().as_ref()],
-            output_with_status(0, b"", b""),
-        );
-        ensure_npm_prefix(&active).unwrap();
-    }
 }

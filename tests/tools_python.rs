@@ -7,7 +7,8 @@ use upkit::test_support::{
     set_prune_tool_versions_error, set_run_output, set_which,
 };
 use upkit::tools::python::{
-    check_python, python_latest, python_pick_asset, python_target, update_python,
+    check_python, pip_global_packages, python_latest, python_pick_asset, python_target,
+    restore_pip_globals, update_python,
 };
 use upkit::{Ctx, Status, Version};
 
@@ -507,4 +508,62 @@ fn update_python_latest_unknown() {
     set_http_plan(url, vec![Err("no".to_string())]);
     let err = update_python(&ctx).unwrap_err();
     assert!(err.to_string().contains("latest unknown"));
+}
+
+#[test]
+fn pip_globals_filters_and_versions() {
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let active = dir.path().join("active");
+    let python = active.join("install").join("bin").join("python3");
+    fs::create_dir_all(python.parent().unwrap()).unwrap();
+    fs::write(&python, b"").unwrap();
+
+    let json = r#"[{"name":"pip","version":"23.2"},{"name":"setuptools","version":"65.5"},{"name":"wheel","version":"0.41"},{"name":"requests","version":"2.31.0"},{"name":"black","version":"23.7"}]"#;
+    set_run_output(
+        python.to_string_lossy().as_ref(),
+        &["-m", "pip", "list", "--format=json"],
+        output_with_status(0, json.as_bytes(), b""),
+    );
+    let packages = pip_global_packages(&active).unwrap();
+    assert_eq!(
+        packages,
+        vec!["black==23.7".to_string(), "requests==2.31.0".to_string()]
+    );
+}
+
+#[test]
+fn pip_globals_errors_on_failed_list() {
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let active = dir.path().join("active");
+    let python = active.join("bin").join("python3");
+    fs::create_dir_all(python.parent().unwrap()).unwrap();
+    fs::write(&python, b"").unwrap();
+
+    set_run_output(
+        python.to_string_lossy().as_ref(),
+        &["-m", "pip", "list", "--format=json"],
+        output_with_status(1, b"", b"boom"),
+    );
+    let err = pip_global_packages(&active).unwrap_err();
+    assert!(err.to_string().contains("pip list failed"));
+}
+
+#[test]
+fn restore_pip_globals_runs_install() {
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let active = dir.path().join("active");
+    let python = active.join("bin").join("python3");
+    fs::create_dir_all(python.parent().unwrap()).unwrap();
+    fs::write(&python, b"").unwrap();
+
+    set_run_output(
+        python.to_string_lossy().as_ref(),
+        &["-m", "pip", "install", "requests==2.31.0", "black==23.7"],
+        output_with_status(0, b"", b""),
+    );
+    let packages = vec!["requests==2.31.0".to_string(), "black==23.7".to_string()];
+    restore_pip_globals(&active, &packages).unwrap();
 }
