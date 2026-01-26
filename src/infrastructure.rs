@@ -219,6 +219,11 @@ pub fn print_reports(ctx: &Ctx, reports: &[ToolReport]) {
 
 pub fn maybe_path_hint(ctx: &Ctx) {
     maybe_path_hint_for_dir(ctx, &ctx.bindir, "upkit");
+    if let Some(dir) = upkit_exe_dir() {
+        if dir != ctx.bindir {
+            maybe_path_hint_for_dir(ctx, &dir, "upkit bin");
+        }
+    }
 }
 
 pub fn maybe_path_hint_for_dir(ctx: &Ctx, dir: &Path, label: &str) {
@@ -394,11 +399,24 @@ fn path_hint_line(shell: &str, dir: &Path) -> String {
 
 fn required_path_targets(ctx: &Ctx) -> Vec<PathTarget> {
     let mut targets = Vec::new();
+    let cargo_dir = cargo_bin_dir();
     targets.push(PathTarget {
         label: "upkit",
         dir: ctx.bindir.clone(),
     });
-    if let Some(dir) = cargo_bin_dir() {
+    if let Some(dir) = upkit_exe_dir() {
+        let matches_cargo = cargo_dir.as_ref().map_or(false, |cargo| cargo == &dir);
+        if !matches_cargo
+            && !path_contains_dir(&dir)
+            && !targets.iter().any(|target| target.dir == dir)
+        {
+            targets.push(PathTarget {
+                label: "upkit bin",
+                dir,
+            });
+        }
+    }
+    if let Some(dir) = cargo_dir {
         targets.push(PathTarget {
             label: "cargo bin",
             dir,
@@ -454,6 +472,16 @@ fn shell_rc_path(shell: &str) -> &'static str {
     } else {
         "~/.profile"
     }
+}
+
+fn upkit_exe_dir() -> Option<PathBuf> {
+    let exe = env::current_exe().ok()?;
+    exe.parent().map(|parent| parent.to_path_buf())
+}
+
+fn path_contains_dir(dir: &Path) -> bool {
+    let path = get_env_var("PATH").unwrap_or_default();
+    env::split_paths(&path).any(|p| p == dir)
 }
 
 fn shell_rc_candidates(shell: &str) -> Vec<&'static str> {
