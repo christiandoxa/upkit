@@ -6,7 +6,7 @@ use std::{env, ffi::OsStr, fs, path::PathBuf};
 use crate::{
     Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, atomic_symlink, download_to_temp,
     ensure_clean_dir, home_dir, http_get_json, info, keep_latest_version, link_dir_bins,
-    maybe_path_hint_for_dir, prune_tool_versions, run_capture, warn, which_or_none,
+    maybe_path_hint_for_dir, prune_tool_versions, run_capture, run_output, warn, which_or_none,
 };
 
 #[derive(Debug, Deserialize)]
@@ -158,6 +158,15 @@ pub fn update_python(ctx: &Ctx) -> Result<()> {
     }
 
     info(ctx, format!("Updating python -> {}", latest.to_string()));
+
+    let tool_root = ctx.home.join("python");
+    let prior_globals = match pip_global_packages(&tool_root.join("active")) {
+        Ok(list) => list,
+        Err(err) => {
+            warn(ctx, format!("Failed to list pip globals: {err}"));
+            Vec::new()
+        }
+    };
     let asset = python_pick_asset(ctx, &latest)?;
     let dl = asset.browser_download_url;
 
@@ -171,7 +180,6 @@ pub fn update_python(ctx: &Ctx) -> Result<()> {
 
     let tmp = download_to_temp(ctx, &dl)?;
 
-    let tool_root = ctx.home.join("python");
     fs::create_dir_all(&tool_root)?;
     let ver_dir = tool_root.join(latest.to_string());
     ensure_clean_dir(&ver_dir)?;
@@ -204,6 +212,9 @@ pub fn update_python(ctx: &Ctx) -> Result<()> {
     };
     link_dir_bins(&bin, &ctx.bindir, &["python", "python3", "pip", "pip3"])?;
     maybe_hint_python_bins(ctx, &active);
+    if let Err(err) = restore_pip_globals(&active, &prior_globals) {
+        warn(ctx, format!("Failed to restore pip globals: {err}"));
+    }
 
     if let Err(err) = prune_tool_versions(&tool_root, &ver_dir, &["active"]) {
         warn(ctx, format!("Failed to remove old python versions: {err}"));
@@ -253,4 +264,143 @@ fn python_bin_in_bindir(ctx: &Ctx, name: &str) -> Option<PathBuf> {
         return Some(candidate);
     }
     None
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::test_support::{output_with_status, reset_guard, set_run_output};
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn pip_globals_filters_and_versions() {
+        let _guard = reset_guard();
+        let dir = tempdir().unwrap();
+        let active = dir.path().join("active");
+        let python = active.join("install").join("bin").join("python3");
+        fs::create_dir_all(python.parent().unwrap()).unwrap();
+        fs::write(&python, b"").unwrap();
+
+        let json = r#"[{"name":"pip","version":"23.2"},{"name":"setuptools","version":"65.5"},{"name":"wheel","version":"0.41"},{"name":"requests","version":"2.31.0"},{"name":"black","version":"23.7"}]"#;
+        set_run_output(
+            python.to_string_lossy().as_ref(),
+            &["-m", "pip", "list", "--format=json"],
+            output_with_status(0, json.as_bytes(), b""),
+        );
+        let packages = pip_global_packages(&active).unwrap();
+        assert_eq!(
+            packages,
+            vec!["black==23.7".to_string(), "requests==2.31.0".to_string()]
+        );
+    }
+
+    #[test]
+    fn pip_globals_errors_on_failed_list() {
+        let _guard = reset_guard();
+        let dir = tempdir().unwrap();
+        let active = dir.path().join("active");
+        let python = active.join("bin").join("python3");
+        fs::create_dir_all(python.parent().unwrap()).unwrap();
+        fs::write(&python, b"").unwrap();
+
+        set_run_output(
+            python.to_string_lossy().as_ref(),
+            &["-m", "pip", "list", "--format=json"],
+            output_with_status(1, b"", b"boom"),
+        );
+        let err = pip_global_packages(&active).unwrap_err();
+        assert!(err.to_string().contains("pip list failed"));
+    }
+
+    #[test]
+    fn restore_pip_globals_runs_install() {
+        let _guard = reset_guard();
+        let dir = tempdir().unwrap();
+        let active = dir.path().join("active");
+        let python = active.join("bin").join("python3");
+        fs::create_dir_all(python.parent().unwrap()).unwrap();
+        fs::write(&python, b"").unwrap();
+
+        set_run_output(
+            python.to_string_lossy().as_ref(),
+            &["-m", "pip", "install", "requests==2.31.0", "black==23.7"],
+            output_with_status(0, b"", b""),
+        );
+        let packages = vec!["requests==2.31.0".to_string(), "black==23.7".to_string()];
+        restore_pip_globals(&active, &packages).unwrap();
+    }
+}
+
+fn python_executable(active: &std::path::Path) -> Option<PathBuf> {
+    let install_bin = active.join("install").join("bin").join("python3");
+    if install_bin.exists() {
+        return Some(install_bin);
+    }
+    let bin = active.join("bin").join("python3");
+    if bin.exists() {
+        return Some(bin);
+    }
+    None
+}
+
+fn pip_global_packages(active: &std::path::Path) -> Result<Vec<String>> {
+    let python = match python_executable(active) {
+        Some(path) => path,
+        None => return Ok(Vec::new()),
+    };
+    let args = [
+        OsStr::new("-m"),
+        OsStr::new("pip"),
+        OsStr::new("list"),
+        OsStr::new("--format=json"),
+    ];
+    let output = run_output(python.as_os_str(), &args)?;
+    if !output.status.success() {
+        bail!(
+            "pip list failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    if output.stdout.is_empty() {
+        return Ok(Vec::new());
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let Some(list) = value.as_array() else {
+        return Ok(Vec::new());
+    };
+    let mut packages = Vec::new();
+    for entry in list {
+        let Some(name) = entry.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let lower = name.to_ascii_lowercase();
+        if lower == "pip" || lower == "setuptools" || lower == "wheel" {
+            continue;
+        }
+        let version = entry.get("version").and_then(|v| v.as_str()).unwrap_or("");
+        if version.is_empty() {
+            packages.push(name.to_string());
+        } else {
+            packages.push(format!("{name}=={version}"));
+        }
+    }
+    packages.sort();
+    packages.dedup();
+    Ok(packages)
+}
+
+fn restore_pip_globals(active: &std::path::Path, packages: &[String]) -> Result<()> {
+    if packages.is_empty() {
+        return Ok(());
+    }
+    let python = match python_executable(active) {
+        Some(path) => path,
+        None => return Ok(()),
+    };
+    let program = python.to_string_lossy().to_string();
+    let mut args = vec!["-m".to_string(), "pip".to_string(), "install".to_string()];
+    args.extend(packages.iter().cloned());
+    run_capture(program, &args)?;
+    Ok(())
 }

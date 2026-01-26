@@ -2,13 +2,13 @@ use anyhow::{Result, anyhow, bail};
 use serde::Deserialize;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::{env, ffi::OsStr, fs};
+use std::{env, ffi::OsStr, fs, path::PathBuf};
 
 use crate::{
     Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, atomic_symlink, download_to_temp,
     ensure_clean_dir, get_env_var, home_dir, http_get_json, info, keep_latest_version,
-    link_dir_bins, maybe_path_hint_for_dir, prune_tool_versions, run_capture, sha256_file, warn,
-    which_or_none,
+    link_dir_bins, maybe_path_hint_for_dir, prune_tool_versions, run_capture, run_output,
+    sha256_file, warn, which_or_none,
 };
 
 #[derive(Debug, Deserialize)]
@@ -133,6 +133,18 @@ pub fn update_go(ctx: &Ctx) -> Result<()> {
         return Ok(());
     }
 
+    let prior_globals = if active.exists() {
+        match go_global_tools(go_executable(&tool_root, &active).as_deref()) {
+            Ok(list) => list,
+            Err(err) => {
+                warn(ctx, format!("Failed to list go global tools: {err}"));
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     info(ctx, format!("Updating go -> {}", latest.to_string()));
     let (dl, expected_sha) = go_pick_file(ctx, &latest)?;
     if ctx.dry_run {
@@ -163,6 +175,12 @@ pub fn update_go(ctx: &Ctx) -> Result<()> {
     atomic_symlink(&extracted_go_dir, &active)?;
 
     ensure_go_wrappers(ctx, &tool_root, &active)?;
+    if let Err(err) = restore_go_globals(
+        go_executable(&tool_root, &active).as_deref(),
+        &prior_globals,
+    ) {
+        warn(ctx, format!("Failed to restore go global tools: {err}"));
+    }
 
     if let Err(err) = prune_tool_versions(&tool_root, &ver_dir, &["active", "wrappers"]) {
         warn(ctx, format!("Failed to remove old go versions: {err}"));
@@ -273,6 +291,117 @@ fn go_releases(ctx: &Ctx) -> Result<Vec<GoRelease>> {
     Err(last_err.unwrap_or_else(|| anyhow!("could not fetch Go releases")))
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+struct GoToolSpec {
+    module: String,
+    version: String,
+}
+
+fn go_executable(tool_root: &std::path::Path, active: &std::path::Path) -> Option<PathBuf> {
+    let wrapper = tool_root.join("wrappers").join("go");
+    if wrapper.exists() {
+        return Some(wrapper);
+    }
+    let bin = active.join("bin").join("go");
+    if bin.exists() {
+        return Some(bin);
+    }
+    None
+}
+
+fn go_global_tools(go_bin: Option<&std::path::Path>) -> Result<Vec<GoToolSpec>> {
+    let bin_dirs = go_global_bin_dirs(go_bin);
+    if bin_dirs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut specs = Vec::new();
+    for dir in bin_dirs {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let meta = match entry.metadata() {
+                Ok(meta) => meta,
+                Err(_) => continue,
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            if let Some(spec) = go_tool_spec_from_binary(go_bin, &path) {
+                specs.push(spec);
+            }
+        }
+    }
+    specs.sort();
+    specs.dedup();
+    Ok(specs)
+}
+
+fn go_global_bin_dirs(go_bin: Option<&std::path::Path>) -> Vec<PathBuf> {
+    if let Some(gobin) = go_env_value(go_bin, "GOBIN") {
+        return vec![PathBuf::from(gobin)];
+    }
+    let mut dirs = Vec::new();
+    for gopath in go_env_paths(go_bin, "GOPATH") {
+        dirs.push(gopath.join("bin"));
+    }
+    dirs
+}
+
+fn go_tool_spec_from_binary(
+    go_bin: Option<&std::path::Path>,
+    binary: &std::path::Path,
+) -> Option<GoToolSpec> {
+    let program = match go_bin {
+        Some(path) => path.to_string_lossy().to_string(),
+        None => "go".to_string(),
+    };
+    let args = [
+        "version".to_string(),
+        "-m".to_string(),
+        binary.to_string_lossy().to_string(),
+    ];
+    let output = run_output(program, &args).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_go_version_metadata(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_go_version_metadata(output: &str) -> Option<GoToolSpec> {
+    for line in output.lines() {
+        let mut parts = line.split_whitespace();
+        let key = parts.next()?;
+        if key == "mod" {
+            let module = parts.next()?.to_string();
+            let version = parts.next()?.to_string();
+            if version == "(devel)" {
+                return None;
+            }
+            return Some(GoToolSpec { module, version });
+        }
+    }
+    None
+}
+
+fn restore_go_globals(go_bin: Option<&std::path::Path>, tools: &[GoToolSpec]) -> Result<()> {
+    if tools.is_empty() {
+        return Ok(());
+    }
+    let program = match go_bin {
+        Some(path) => path.to_string_lossy().to_string(),
+        None => "go".to_string(),
+    };
+    for tool in tools {
+        let target = format!("{}@{}", tool.module, tool.version);
+        let args = vec!["install".to_string(), target];
+        run_capture(program.clone(), &args)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
@@ -351,5 +480,78 @@ mod unit_tests {
         fs::create_dir_all(&active).unwrap();
         set_env_var("GOBIN", Some("/tmp/gobin".to_string()));
         ensure_go_wrappers(&ctx, &tool_root, &active).unwrap();
+    }
+
+    #[test]
+    fn parse_go_version_metadata_skips_devel() {
+        let output = "example\nmod example.com/tool (devel)\n";
+        assert!(parse_go_version_metadata(output).is_none());
+    }
+
+    #[test]
+    fn parse_go_version_metadata_extracts_mod() {
+        let output = "example\nmod example.com/tool v1.2.3\n";
+        let spec = parse_go_version_metadata(output).unwrap();
+        assert_eq!(spec.module, "example.com/tool");
+        assert_eq!(spec.version, "v1.2.3");
+    }
+
+    #[test]
+    fn go_global_bin_dirs_prefers_gobin() {
+        let _guard = reset_guard();
+        set_env_var("GOBIN", Some("/tmp/gobin".to_string()));
+        set_env_var("GOPATH", Some("/tmp/gopath".to_string()));
+        let dirs = go_global_bin_dirs(None);
+        assert_eq!(dirs, vec![std::path::PathBuf::from("/tmp/gobin")]);
+    }
+
+    #[test]
+    fn go_tool_spec_from_binary_uses_version_output() {
+        let _guard = reset_guard();
+        let dir = tempdir().unwrap();
+        let binary = dir.path().join("tool");
+        fs::write(&binary, b"").unwrap();
+        set_run_output(
+            "go",
+            &["version", "-m", binary.to_string_lossy().as_ref()],
+            output_with_status(0, b"example\nmod example.com/tool v1.2.3\n", b""),
+        );
+        let spec = go_tool_spec_from_binary(None, &binary).unwrap();
+        assert_eq!(spec.module, "example.com/tool");
+        assert_eq!(spec.version, "v1.2.3");
+    }
+
+    #[test]
+    fn restore_go_globals_runs_install() {
+        let _guard = reset_guard();
+        set_run_output(
+            "go",
+            &["install", "example.com/tool@v1.2.3"],
+            output_with_status(0, b"", b""),
+        );
+        let tools = vec![GoToolSpec {
+            module: "example.com/tool".to_string(),
+            version: "v1.2.3".to_string(),
+        }];
+        restore_go_globals(None, &tools).unwrap();
+    }
+
+    #[test]
+    fn go_global_tools_reads_gobin_dir() {
+        let _guard = reset_guard();
+        let dir = tempdir().unwrap();
+        let gobin = dir.path().join("bin");
+        fs::create_dir_all(&gobin).unwrap();
+        let binary = gobin.join("tool");
+        fs::write(&binary, b"").unwrap();
+        set_env_var("GOBIN", Some(gobin.to_string_lossy().to_string()));
+        set_run_output(
+            "go",
+            &["version", "-m", binary.to_string_lossy().as_ref()],
+            output_with_status(0, b"example\nmod example.com/tool v1.2.3\n", b""),
+        );
+        let tools = go_global_tools(None).unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].module, "example.com/tool");
     }
 }
