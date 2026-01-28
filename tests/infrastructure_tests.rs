@@ -179,8 +179,8 @@ fn maybe_path_hint_updates_missing_path_line() {
     let prompt = Arc::new(TestPrompt::default());
     let ctx = base_ctx(home.clone(), bindir.clone(), prompt);
     let rc = home.join(".bashrc");
-    fs::write(&rc, "# upkit (upkit)\n").unwrap();
-    maybe_path_hint_for_dir(&ctx, &bindir, "upkit");
+    fs::write(&rc, "# upkit (upkit bin)\n").unwrap();
+    maybe_path_hint_for_dir(&ctx, &bindir, "upkit bin");
     let updated = fs::read_to_string(&rc).unwrap();
     assert!(updated.contains("export PATH="));
 }
@@ -198,9 +198,9 @@ fn remove_path_hint_quiet_and_missing_rc() {
     let prompt = Arc::new(TestPrompt::default());
     let mut ctx = base_ctx(home.clone(), bindir, prompt);
     ctx.quiet = true;
-    remove_path_hint_for_label(&ctx, "upkit");
+    remove_path_hint_for_label(&ctx, "upkit bin");
     ctx.quiet = false;
-    remove_path_hint_for_label(&ctx, "upkit");
+    remove_path_hint_for_label(&ctx, "upkit bin");
 }
 
 #[test]
@@ -215,12 +215,16 @@ fn remove_path_hint_handles_unresolvable_and_removes_path_line() {
     set_home_dir(None);
     let prompt = Arc::new(TestPrompt::default());
     let ctx = base_ctx(home.clone(), bindir.clone(), prompt);
-    remove_path_hint_for_label(&ctx, "upkit");
+    remove_path_hint_for_label(&ctx, "upkit bin");
 
     set_home_dir(Some(home.clone()));
     let rc = home.join(".bashrc");
-    fs::write(&rc, "# upkit (upkit)\nexport PATH=\"/tmp:$PATH\"\nother\n").unwrap();
-    remove_path_hint_for_label(&ctx, "upkit");
+    fs::write(
+        &rc,
+        "# upkit (upkit bin)\nexport PATH=\"/tmp:$PATH\"\nother\n",
+    )
+    .unwrap();
+    remove_path_hint_for_label(&ctx, "upkit bin");
     let updated = fs::read_to_string(&rc).unwrap();
     assert!(!updated.contains("upkit"));
 }
@@ -238,8 +242,8 @@ fn remove_path_hint_skips_non_path_line() {
     let prompt = Arc::new(TestPrompt::default());
     let ctx = base_ctx(home.clone(), bindir, prompt);
     let rc = home.join(".bashrc");
-    fs::write(&rc, "# upkit (upkit)\nnot a path\n").unwrap();
-    remove_path_hint_for_label(&ctx, "upkit");
+    fs::write(&rc, "# upkit (upkit bin)\nnot a path\n").unwrap();
+    remove_path_hint_for_label(&ctx, "upkit bin");
     let updated = fs::read_to_string(&rc).unwrap();
     assert!(!updated.contains("upkit"));
 }

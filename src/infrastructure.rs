@@ -218,7 +218,7 @@ pub fn print_reports(ctx: &Ctx, reports: &[ToolReport]) {
 }
 
 pub fn maybe_path_hint(ctx: &Ctx) {
-    maybe_path_hint_for_dir(ctx, &ctx.bindir, "upkit");
+    maybe_path_hint_for_dir(ctx, &ctx.bindir, "upkit bin");
     if let Some(dir) = upkit_exe_dir() {
         let upkit_dir = if is_dev_exe_dir(&dir) {
             ctx.bindir.clone()
@@ -226,7 +226,7 @@ pub fn maybe_path_hint(ctx: &Ctx) {
             dir
         };
         if upkit_dir != ctx.bindir {
-            maybe_path_hint_for_dir(ctx, &upkit_dir, "upkit bin");
+            maybe_path_hint_for_dir(ctx, &upkit_dir, "upkit exe");
         }
     }
 }
@@ -335,8 +335,9 @@ pub(crate) fn ensure_required_paths(ctx: &Ctx) -> Vec<PathCheckEntry> {
 
     for target in required_path_targets(ctx) {
         let configured = dir_configured_in_rc(&target.dir, &rc_paths, home.as_deref());
+        let labeled = label_configured_in_rc(target.label, &rc_paths);
         let mut updated = false;
-        if !configured && !ctx.dry_run {
+        if (!configured || !labeled) && !ctx.dry_run {
             if let Some(rc_path) = primary_rc.as_ref() {
                 updated = update_path_hint_in_rc(ctx, rc_path, &shell, &target.dir, target.label);
             } else if !warned_missing_rc {
@@ -420,7 +421,7 @@ fn required_path_targets(ctx: &Ctx) -> Vec<PathTarget> {
         }
     }
     targets.push(PathTarget {
-        label: "upkit",
+        label: "upkit bin",
         dir: ctx.bindir.clone(),
     });
     if let Some(dir) = upkit_exe_dir() {
@@ -434,7 +435,7 @@ fn required_path_targets(ctx: &Ctx) -> Vec<PathTarget> {
             && !path_contains_dir(&upkit_dir)
             && !targets.iter().any(|target| target.dir == upkit_dir)
         {
-            push_target(&mut targets, "upkit bin", upkit_dir);
+            push_target(&mut targets, "upkit exe", upkit_dir);
         }
     }
     if let Some(dir) = cargo_dir {
@@ -532,6 +533,19 @@ fn dir_configured_in_rc(dir: &Path, rc_paths: &[PathBuf], home: Option<&Path>) -
     false
 }
 
+fn label_configured_in_rc(label: &str, rc_paths: &[PathBuf]) -> bool {
+    let label_line = format!("# upkit ({label})");
+    for rc_path in rc_paths {
+        let Ok(content) = fs::read_to_string(rc_path) else {
+            continue;
+        };
+        if content.lines().any(|line| line.trim_end() == label_line) {
+            return true;
+        }
+    }
+    false
+}
+
 fn rc_contains_dir(content: &str, dir: &Path, home: Option<&Path>) -> bool {
     let dir_str = dir.to_string_lossy();
     if content.contains(dir_str.as_ref()) {
@@ -559,6 +573,32 @@ fn home_relative_patterns(home: &Path, dir: &Path) -> Option<(String, String, St
         format!("$HOME{suffix}"),
         format!("${{HOME}}{suffix}"),
     ))
+}
+
+fn line_contains_dir(line: &str, dir: &Path, home: Option<&Path>) -> bool {
+    let dir_str = dir.to_string_lossy();
+    if line.contains(dir_str.as_ref()) {
+        return true;
+    }
+    let Some(home) = home else {
+        return false;
+    };
+    let Some((tilde, home_env, home_env_braced)) = home_relative_patterns(home, dir) else {
+        return false;
+    };
+    line.contains(&tilde) || line.contains(&home_env) || line.contains(&home_env_braced)
+}
+
+fn find_existing_path_line(lines: &[String], dir: &Path, home: Option<&Path>) -> Option<usize> {
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("export PATH=") || trimmed.starts_with("set -gx PATH") {
+            if line_contains_dir(trimmed, dir, home) {
+                return Some(index);
+            }
+        }
+    }
+    None
 }
 
 fn update_path_hint_in_rc(ctx: &Ctx, rc_path: &Path, shell: &str, dir: &Path, label: &str) -> bool {
@@ -591,12 +631,18 @@ fn update_path_hint_in_rc(ctx: &Ctx, rc_path: &Path, shell: &str, dir: &Path, la
     }
 
     if !found_label {
-        if !lines.is_empty() {
-            lines.push(String::new());
+        let home = home_dir();
+        if let Some(index) = find_existing_path_line(&lines, dir, home.as_deref()) {
+            lines.insert(index, label_line);
+            updated = true;
+        } else {
+            if !lines.is_empty() {
+                lines.push(String::new());
+            }
+            lines.push(label_line);
+            lines.push(path_line);
+            updated = true;
         }
-        lines.push(label_line);
-        lines.push(path_line);
-        updated = true;
     }
 
     if !updated {
