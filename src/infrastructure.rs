@@ -220,8 +220,13 @@ pub fn print_reports(ctx: &Ctx, reports: &[ToolReport]) {
 pub fn maybe_path_hint(ctx: &Ctx) {
     maybe_path_hint_for_dir(ctx, &ctx.bindir, "upkit");
     if let Some(dir) = upkit_exe_dir() {
-        if dir != ctx.bindir {
-            maybe_path_hint_for_dir(ctx, &dir, "upkit bin");
+        let upkit_dir = if is_dev_exe_dir(&dir) {
+            ctx.bindir.clone()
+        } else {
+            dir
+        };
+        if upkit_dir != ctx.bindir {
+            maybe_path_hint_for_dir(ctx, &upkit_dir, "upkit bin");
         }
     }
 }
@@ -316,6 +321,15 @@ pub(crate) fn ensure_required_paths(ctx: &Ctx) -> Vec<PathCheckEntry> {
     let rc_paths = resolve_shell_rc_paths(&shell);
     let primary_rc = primary_shell_rc_path(&rc_paths);
     let home = home_dir();
+    if let Some(dir) = upkit_exe_dir() {
+        if is_dev_exe_dir(&dir) && !ctx.dry_run {
+            if let Some(rc_path) = primary_rc.as_ref() {
+                update_path_hint_in_rc(ctx, rc_path, &shell, &ctx.bindir, "upkit bin");
+            } else {
+                warn(ctx, "Could not resolve shell rc file to update PATH.");
+            }
+        }
+    }
     let mut warned_missing_rc = false;
     let mut report = Vec::new();
 
@@ -398,68 +412,62 @@ fn path_hint_line(shell: &str, dir: &Path) -> String {
 }
 
 fn required_path_targets(ctx: &Ctx) -> Vec<PathTarget> {
-    let mut targets = Vec::new();
+    let mut targets: Vec<PathTarget> = Vec::new();
     let cargo_dir = cargo_bin_dir();
+    fn push_target(targets: &mut Vec<PathTarget>, label: &'static str, dir: PathBuf) {
+        if !targets.iter().any(|target| target.dir == dir) {
+            targets.push(PathTarget { label, dir });
+        }
+    }
     targets.push(PathTarget {
         label: "upkit",
         dir: ctx.bindir.clone(),
     });
     if let Some(dir) = upkit_exe_dir() {
         let matches_cargo = cargo_dir.as_ref().map_or(false, |cargo| cargo == &dir);
+        let upkit_dir = if is_dev_exe_dir(&dir) {
+            ctx.bindir.clone()
+        } else {
+            dir
+        };
         if !matches_cargo
-            && !path_contains_dir(&dir)
-            && !targets.iter().any(|target| target.dir == dir)
+            && !path_contains_dir(&upkit_dir)
+            && !targets.iter().any(|target| target.dir == upkit_dir)
         {
-            targets.push(PathTarget {
-                label: "upkit bin",
-                dir,
-            });
+            push_target(&mut targets, "upkit bin", upkit_dir);
         }
     }
     if let Some(dir) = cargo_dir {
-        targets.push(PathTarget {
-            label: "cargo bin",
-            dir,
-        });
+        push_target(&mut targets, "cargo bin", dir);
     }
     if let Some(dir) = npm_global_bin_dir(ctx) {
-        targets.push(PathTarget {
-            label: "npm global bin",
-            dir,
-        });
+        push_target(&mut targets, "npm global bin", dir);
+    }
+    if let Some(home) = home_dir() {
+        push_target(&mut targets, "local bin", home.join(".local").join("bin"));
     }
     if let Some(base) = python_user_base_dir() {
-        targets.push(PathTarget {
-            label: "python user base bin",
-            dir: base.join("bin"),
-        });
+        push_target(&mut targets, "python user base bin", base.join("bin"));
     }
     if let Some(dir) = flutter_bin_dir(ctx) {
-        targets.push(PathTarget {
-            label: "flutter bin",
-            dir,
-        });
+        push_target(&mut targets, "flutter bin", dir);
     }
     if let Some(pub_cache) = pub_cache_dir() {
-        targets.push(PathTarget {
-            label: "pub cache bin",
-            dir: pub_cache.join("bin"),
-        });
+        push_target(&mut targets, "pub cache bin", pub_cache.join("bin"));
     }
     if let Some(gobin) = go_env_value("GOBIN") {
-        targets.push(PathTarget {
-            label: "go GOBIN",
-            dir: PathBuf::from(gobin),
-        });
+        push_target(&mut targets, "go GOBIN", PathBuf::from(gobin));
     } else {
         for gopath in go_env_paths("GOPATH") {
-            targets.push(PathTarget {
-                label: "go GOPATH/bin",
-                dir: gopath.join("bin"),
-            });
+            push_target(&mut targets, "go GOPATH/bin", gopath.join("bin"));
         }
     }
     targets
+}
+
+fn is_dev_exe_dir(dir: &Path) -> bool {
+    dir.components()
+        .any(|component| component.as_os_str() == "target")
 }
 
 fn shell_rc_path(shell: &str) -> &'static str {
