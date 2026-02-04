@@ -186,6 +186,26 @@ fn maybe_path_hint_updates_missing_path_line() {
 }
 
 #[test]
+fn maybe_path_hint_adds_blank_line_when_existing_content() {
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("home");
+    let bindir = dir.path().join("bin");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&bindir).unwrap();
+    set_env_var("SHELL", Some("bash".to_string()));
+    set_env_var("PATH", Some("/usr/bin".to_string()));
+    set_home_dir(Some(home.clone()));
+    let prompt = Arc::new(TestPrompt::default());
+    let ctx = base_ctx(home.clone(), bindir.clone(), prompt);
+    let rc = home.join(".bashrc");
+    fs::write(&rc, "export PATH=\"/opt/bin:$PATH\"\n").unwrap();
+    maybe_path_hint_for_dir(&ctx, &bindir, "upkit bin");
+    let updated = fs::read_to_string(&rc).unwrap();
+    assert!(updated.contains("# upkit (upkit bin)"));
+}
+
+#[test]
 fn remove_path_hint_quiet_and_missing_rc() {
     let _guard = reset_guard();
     let dir = tempdir().unwrap();
@@ -283,6 +303,15 @@ fn mock_http_attempt_requires_mocking() {
 }
 
 #[test]
+fn mock_http_attempt_skipped_when_not_required() {
+    let _guard = reset_guard();
+    let mut last_err: Option<anyhow::Error> = None;
+    let attempt = mock_http_attempt("https://example.com", &mut last_err, false);
+    assert!(matches!(attempt, MockAttempt::Skipped));
+    assert!(last_err.is_none());
+}
+
+#[test]
 fn prune_tool_versions_no_root_and_keep_names() {
     let _guard = reset_guard();
     let dir = tempdir().unwrap();
@@ -306,6 +335,19 @@ fn prune_tool_versions_skips_non_dir_entries() {
     fs::write(tool_root.join("note.txt"), b"note").unwrap();
     prune_tool_versions(&tool_root, &keep_dir, &[]).unwrap();
     assert!(tool_root.join("note.txt").exists());
+}
+
+#[test]
+fn prune_tool_versions_coverage_name_branch() {
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let tool_root = dir.path().join("tool");
+    let keep_dir = tool_root.join("1.0.0");
+    let extra_dir = tool_root.join("extra");
+    fs::create_dir_all(&keep_dir).unwrap();
+    fs::create_dir_all(&extra_dir).unwrap();
+    prune_tool_versions(&tool_root, &keep_dir, &[]).unwrap();
+    assert!(!extra_dir.exists());
 }
 
 #[test]

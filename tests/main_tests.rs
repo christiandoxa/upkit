@@ -1532,3 +1532,49 @@ fn download_to_temp_progress_overwrite() {
     let tmp = download_to_temp(&ctx, url).unwrap();
     assert_eq!(fs::read(tmp.path()).unwrap(), vec![1, 2, 3]);
 }
+
+#[test]
+fn main_with_completions_sets_quiet_paths() {
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("home");
+    let bindir = dir.path().join("bin");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&bindir).unwrap();
+    set_env_var("SHELL", Some("bash".to_string()));
+    set_home_dir(Some(home.clone()));
+    set_data_local_dir(Some(home));
+    let code = main_with(Cli::parse_from(["upkit", "completions", "bash"]));
+    assert_eq!(code, std::process::ExitCode::SUCCESS);
+}
+
+#[test]
+fn run_paths_warns_missing_status() {
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("home");
+    let bindir = dir.path().join("bin");
+    let prompt = Arc::new(TestPrompt::default());
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&bindir).unwrap();
+    set_env_var("SHELL", Some("bash".to_string()));
+    set_home_dir(Some(home.clone()));
+    let cli = Cli::parse_from(["upkit", "--dry-run", "paths"]);
+    let mut ctx = ctx_from_cli(&cli, home, bindir, prompt);
+    run(&cli, &mut ctx).unwrap();
+}
+
+#[test]
+fn run_doctor_writable_paths_coverage() {
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("home");
+    let bindir = dir.path().join("bin");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&bindir).unwrap();
+    set_env_var("PATH", Some(bindir.display().to_string()));
+    let prompt = Arc::new(TestPrompt::default());
+    let mut ctx = base_ctx(home, bindir, prompt);
+    ctx.offline = true;
+    run_doctor(&ctx, false).unwrap();
+}

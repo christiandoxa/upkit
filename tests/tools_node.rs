@@ -554,6 +554,277 @@ fn update_node_up_to_date() {
 }
 
 #[test]
+fn update_node_warns_on_globals_error() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = ctx_with_dirs();
+    fs::create_dir_all(&ctx.bindir).unwrap();
+    let old_active = ctx.home.join("node").join("old");
+    let active_bin = old_active.join("bin");
+    fs::create_dir_all(&active_bin).unwrap();
+    fs::write(active_bin.join("npm"), b"").unwrap();
+    #[cfg(unix)]
+    {
+        symlink(&old_active, ctx.home.join("node").join("active")).unwrap();
+    }
+    let idx_url = "https://nodejs.org/dist/index.json";
+    let json = r#"[{"version":"v1.2.3","lts":true}]"#;
+    set_http_plan(
+        idx_url,
+        vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
+    );
+    set_which("node", None);
+
+    let tar_bytes = make_node_tar_xz_with_npm();
+    let mut hasher = Sha256::new();
+    hasher.update(&tar_bytes);
+    let good_sha = hex::encode(hasher.finalize());
+    let sums = format!("{good_sha}  node-v1.2.3-linux-x64.tar.xz\n");
+    let sums_url = "https://nodejs.org/dist/v1.2.3/SHASUMS256.txt";
+    set_http_plan(
+        sums_url,
+        vec![Ok(MockResponse::new(sums.as_bytes().to_vec(), None))],
+    );
+
+    let dl = "https://nodejs.org/dist/v1.2.3/node-v1.2.3-linux-x64.tar.xz";
+    set_http_plan(
+        dl,
+        vec![Ok(MockResponse::new(
+            tar_bytes.clone(),
+            Some(tar_bytes.len() as u64),
+        ))],
+    );
+
+    let npm = active_bin.join("npm");
+    set_run_output(
+        npm.to_string_lossy().as_ref(),
+        &["ls", "-g", "--depth=0", "--json"],
+        output_with_status(0, b"not-json", b""),
+    );
+
+    update_node(&ctx).unwrap();
+}
+
+#[test]
+fn update_node_warns_on_restore_globals() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = ctx_with_dirs();
+    fs::create_dir_all(&ctx.bindir).unwrap();
+    let old_active = ctx.home.join("node").join("old");
+    let active_bin = old_active.join("bin");
+    fs::create_dir_all(&active_bin).unwrap();
+    fs::write(active_bin.join("npm"), b"").unwrap();
+    #[cfg(unix)]
+    {
+        symlink(&old_active, ctx.home.join("node").join("active")).unwrap();
+    }
+    let idx_url = "https://nodejs.org/dist/index.json";
+    let json = r#"[{"version":"v1.2.3","lts":true}]"#;
+    set_http_plan(
+        idx_url,
+        vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
+    );
+    set_which("node", None);
+
+    let tar_bytes = make_node_tar_xz_with_npm();
+    let mut hasher = Sha256::new();
+    hasher.update(&tar_bytes);
+    let good_sha = hex::encode(hasher.finalize());
+    let sums = format!("{good_sha}  node-v1.2.3-linux-x64.tar.xz\n");
+    let sums_url = "https://nodejs.org/dist/v1.2.3/SHASUMS256.txt";
+    set_http_plan(
+        sums_url,
+        vec![Ok(MockResponse::new(sums.as_bytes().to_vec(), None))],
+    );
+
+    let dl = "https://nodejs.org/dist/v1.2.3/node-v1.2.3-linux-x64.tar.xz";
+    set_http_plan(
+        dl,
+        vec![Ok(MockResponse::new(
+            tar_bytes.clone(),
+            Some(tar_bytes.len() as u64),
+        ))],
+    );
+
+    let npm = active_bin.join("npm");
+    set_run_output(
+        npm.to_string_lossy().as_ref(),
+        &["ls", "-g", "--depth=0", "--json"],
+        output_with_status(
+            0,
+            br#"{"dependencies":{"eslint":{"version":"9.0.0"}}}"#,
+            b"",
+        ),
+    );
+    set_run_output(
+        npm.to_string_lossy().as_ref(),
+        &["install", "-g", "eslint@9.0.0"],
+        output_with_status(1, b"", b""),
+    );
+
+    update_node(&ctx).unwrap();
+}
+
+#[test]
+fn update_node_globals_empty_output() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = ctx_with_dirs();
+    fs::create_dir_all(&ctx.bindir).unwrap();
+    let old_active = ctx.home.join("node").join("old");
+    let active_bin = old_active.join("bin");
+    fs::create_dir_all(&active_bin).unwrap();
+    fs::write(active_bin.join("npm"), b"").unwrap();
+    #[cfg(unix)]
+    {
+        symlink(&old_active, ctx.home.join("node").join("active")).unwrap();
+    }
+
+    let idx_url = "https://nodejs.org/dist/index.json";
+    let json = r#"[{"version":"v1.2.3","lts":true}]"#;
+    set_http_plan(
+        idx_url,
+        vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
+    );
+    set_which("node", None);
+
+    let tar_bytes = make_node_tar_xz_with_npm();
+    let mut hasher = Sha256::new();
+    hasher.update(&tar_bytes);
+    let good_sha = hex::encode(hasher.finalize());
+    let sums = format!("{good_sha}  node-v1.2.3-linux-x64.tar.xz\n");
+    let sums_url = "https://nodejs.org/dist/v1.2.3/SHASUMS256.txt";
+    set_http_plan(
+        sums_url,
+        vec![Ok(MockResponse::new(sums.as_bytes().to_vec(), None))],
+    );
+
+    let dl = "https://nodejs.org/dist/v1.2.3/node-v1.2.3-linux-x64.tar.xz";
+    set_http_plan(
+        dl,
+        vec![Ok(MockResponse::new(
+            tar_bytes.clone(),
+            Some(tar_bytes.len() as u64),
+        ))],
+    );
+
+    let npm = active_bin.join("npm");
+    set_run_output(
+        npm.to_string_lossy().as_ref(),
+        &["ls", "-g", "--depth=0", "--json"],
+        output_with_status(0, b"", b""),
+    );
+
+    update_node(&ctx).unwrap();
+}
+
+#[test]
+fn update_node_globals_missing_deps() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = ctx_with_dirs();
+    fs::create_dir_all(&ctx.bindir).unwrap();
+    let old_active = ctx.home.join("node").join("old");
+    let active_bin = old_active.join("bin");
+    fs::create_dir_all(&active_bin).unwrap();
+    fs::write(active_bin.join("npm"), b"").unwrap();
+    #[cfg(unix)]
+    {
+        symlink(&old_active, ctx.home.join("node").join("active")).unwrap();
+    }
+
+    let idx_url = "https://nodejs.org/dist/index.json";
+    let json = r#"[{"version":"v1.2.3","lts":true}]"#;
+    set_http_plan(
+        idx_url,
+        vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
+    );
+    set_which("node", None);
+
+    let tar_bytes = make_node_tar_xz_with_npm();
+    let mut hasher = Sha256::new();
+    hasher.update(&tar_bytes);
+    let good_sha = hex::encode(hasher.finalize());
+    let sums = format!("{good_sha}  node-v1.2.3-linux-x64.tar.xz\n");
+    let sums_url = "https://nodejs.org/dist/v1.2.3/SHASUMS256.txt";
+    set_http_plan(
+        sums_url,
+        vec![Ok(MockResponse::new(sums.as_bytes().to_vec(), None))],
+    );
+
+    let dl = "https://nodejs.org/dist/v1.2.3/node-v1.2.3-linux-x64.tar.xz";
+    set_http_plan(
+        dl,
+        vec![Ok(MockResponse::new(
+            tar_bytes.clone(),
+            Some(tar_bytes.len() as u64),
+        ))],
+    );
+
+    let npm = active_bin.join("npm");
+    set_run_output(
+        npm.to_string_lossy().as_ref(),
+        &["ls", "-g", "--depth=0", "--json"],
+        output_with_status(0, br#"{}"#, b""),
+    );
+
+    update_node(&ctx).unwrap();
+}
+
+#[test]
+fn update_node_restore_globals_npm_missing() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = ctx_with_dirs();
+    fs::create_dir_all(&ctx.bindir).unwrap();
+    let old_active = ctx.home.join("node").join("old");
+    let active_bin = old_active.join("bin");
+    fs::create_dir_all(&active_bin).unwrap();
+    fs::write(active_bin.join("npm"), b"").unwrap();
+    #[cfg(unix)]
+    {
+        symlink(&old_active, ctx.home.join("node").join("active")).unwrap();
+    }
+
+    let idx_url = "https://nodejs.org/dist/index.json";
+    let json = r#"[{"version":"v1.2.3","lts":true}]"#;
+    set_http_plan(
+        idx_url,
+        vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
+    );
+    set_which("node", None);
+
+    let tar_bytes = make_node_tar_xz();
+    let mut hasher = Sha256::new();
+    hasher.update(&tar_bytes);
+    let good_sha = hex::encode(hasher.finalize());
+    let sums = format!("{good_sha}  node-v1.2.3-linux-x64.tar.xz\n");
+    let sums_url = "https://nodejs.org/dist/v1.2.3/SHASUMS256.txt";
+    set_http_plan(
+        sums_url,
+        vec![Ok(MockResponse::new(sums.as_bytes().to_vec(), None))],
+    );
+
+    let dl = "https://nodejs.org/dist/v1.2.3/node-v1.2.3-linux-x64.tar.xz";
+    set_http_plan(
+        dl,
+        vec![Ok(MockResponse::new(
+            tar_bytes.clone(),
+            Some(tar_bytes.len() as u64),
+        ))],
+    );
+
+    let npm = active_bin.join("npm");
+    set_run_output(
+        npm.to_string_lossy().as_ref(),
+        &["ls", "-g", "--depth=0", "--json"],
+        output_with_status(
+            0,
+            br#"{"dependencies":{"eslint":{"version":"9.0.0"}}}"#,
+            b"",
+        ),
+    );
+
+    update_node(&ctx).unwrap();
+}
+
+#[test]
 fn ensure_npm_prefix_no_npm() {
     let _guard = reset_guard();
     let dir = tempdir().unwrap();

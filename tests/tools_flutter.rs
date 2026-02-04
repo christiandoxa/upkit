@@ -404,6 +404,40 @@ fn update_flutter_upgrade_uses_bindir() {
 }
 
 #[test]
+fn flutter_installed_version_from_machine_output() {
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let bin = dir.path().join("flutter");
+    let json = r#"{"frameworkVersion":"3.2.1"}"#;
+    set_run_output(
+        bin.to_string_lossy().as_ref(),
+        &["--version", "--machine"],
+        output_with_status(0, json.as_bytes(), b""),
+    );
+    let v = flutter_installed_version(&bin).unwrap();
+    assert_eq!(v.to_string(), "3.2.1");
+}
+
+#[test]
+fn flutter_installed_version_machine_output_invalid_version() {
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("flutter");
+    let bin_dir = root.join("bin");
+    let bin = bin_dir.join("flutter");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::write(&bin, b"").unwrap();
+    std::fs::write(root.join("version"), b"3.2.1").unwrap();
+    set_run_output(
+        bin.to_string_lossy().as_ref(),
+        &["--version", "--machine"],
+        output_with_status(0, br#"{"frameworkVersion":"invalid"}"#, b""),
+    );
+    let v = flutter_installed_version(&bin).unwrap();
+    assert_eq!(v.to_string(), "3.2.1");
+}
+
+#[test]
 fn update_flutter_paths() {
     let _guard = reset_guard();
     let (mut ctx, _dir) = ctx_with_dirs();

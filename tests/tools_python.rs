@@ -1,4 +1,8 @@
+use anyhow::anyhow;
+use jmpln::patch;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -51,6 +55,22 @@ fn python_latest_picks_highest_matching_asset() {
     );
     let v = python_latest(&ctx).unwrap();
     assert_eq!(v.to_string(), "3.11.9");
+}
+
+#[test]
+fn python_latest_matches_simple_asset() {
+    let _guard = reset_guard();
+    let (mut ctx, _dir) = ctx_with_dirs();
+    ctx.os = "linux".into();
+    ctx.arch = "x86_64".into();
+    let url = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest";
+    let json = r#"{"tag_name":"v3.12.1","assets":[{"name":"cpython-3.12.1-x86_64-unknown-linux-gnu.tar.zst","browser_download_url":"https://example.com/python-3.12.1.tar.zst"}]}"#;
+    set_http_plan(
+        url,
+        vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
+    );
+    let v = python_latest(&ctx).unwrap();
+    assert_eq!(v.to_string(), "3.12.1");
 }
 
 #[test]
@@ -508,6 +528,223 @@ fn update_python_latest_unknown() {
     set_http_plan(url, vec![Err("no".to_string())]);
     let err = update_python(&ctx).unwrap_err();
     assert!(err.to_string().contains("latest unknown"));
+}
+
+#[test]
+fn python_latest_updates_best_in_loop() {
+    let _guard = reset_guard();
+    let (mut ctx, _dir) = ctx_with_dirs();
+    ctx.os = "linux".into();
+    ctx.arch = "x86_64".into();
+    let url = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest";
+    let json = r#"{"tag_name":"v3.11.9","assets":[{"name":"cpython-3.11.8-x86_64-unknown-linux-gnu.tar.zst","browser_download_url":"https://example.com/python-3.11.8.tar.zst"},{"name":"cpython-3.11.9-x86_64-unknown-linux-gnu.tar.zst","browser_download_url":"https://example.com/python-3.11.9.tar.zst"}]}"#;
+    set_http_plan(
+        url,
+        vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
+    );
+    let v = python_latest(&ctx).unwrap();
+    assert_eq!(v.to_string(), "3.11.9");
+}
+
+#[test]
+fn pip_global_packages_empty_stdout() {
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let active = dir.path().join("active");
+    let python = active.join("install").join("bin").join("python3");
+    fs::create_dir_all(python.parent().unwrap()).unwrap();
+    fs::write(&python, b"").unwrap();
+    set_run_output(
+        python.to_string_lossy().as_ref(),
+        &["-m", "pip", "list", "--format=json"],
+        output_with_status(0, b"", b""),
+    );
+    assert!(pip_global_packages(&active).unwrap().is_empty());
+}
+
+#[test]
+fn pip_global_packages_non_array_and_missing_name() {
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let active = dir.path().join("active");
+    let python = active.join("install").join("bin").join("python3");
+    fs::create_dir_all(python.parent().unwrap()).unwrap();
+    fs::write(&python, b"").unwrap();
+    set_run_output(
+        python.to_string_lossy().as_ref(),
+        &["-m", "pip", "list", "--format=json"],
+        output_with_status(0, br#"{"nope":true}"#, b""),
+    );
+    assert!(pip_global_packages(&active).unwrap().is_empty());
+
+    let list_json = br#"[{"version":"1.0.0"},{"name":"foo","version":""}]"#;
+    set_run_output(
+        python.to_string_lossy().as_ref(),
+        &["-m", "pip", "list", "--format=json"],
+        output_with_status(0, list_json, b""),
+    );
+    let packages = pip_global_packages(&active).unwrap();
+    assert!(packages.contains(&"foo".to_string()));
+}
+
+#[test]
+fn restore_pip_globals_missing_python() {
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let active = dir.path().join("active");
+    restore_pip_globals(&active, &["foo==1.0.0".to_string()]).unwrap();
+}
+
+#[test]
+fn update_python_warns_on_pip_globals_error() {
+    let _guard = reset_guard();
+    let (mut ctx, _dir) = ctx_with_dirs();
+    ctx.dry_run = true;
+    fs::create_dir_all(&ctx.bindir).unwrap();
+    set_which("python3", None);
+    set_which("python", None);
+
+    let tool_root = ctx.home.join("python");
+    let old_dir = tool_root.join("old");
+    let python = old_dir.join("install").join("bin").join("python3");
+    fs::create_dir_all(python.parent().unwrap()).unwrap();
+    fs::write(&python, b"").unwrap();
+    #[cfg(unix)]
+    {
+        symlink(&old_dir, tool_root.join("active")).unwrap();
+    }
+    set_run_output(
+        python.to_string_lossy().as_ref(),
+        &["-m", "pip", "list", "--format=json"],
+        output_with_status(1, b"", b""),
+    );
+
+    let url = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest";
+    let json = r#"{"tag_name":"v3.11.9","assets":[{"name":"cpython-3.11.9+20240224-x86_64-unknown-linux-gnu.tar.zst","browser_download_url":"https://example.com/python.tgz"}]}"#;
+    set_http_plan(
+        url,
+        vec![
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+        ],
+    );
+
+    update_python(&ctx).unwrap();
+}
+
+#[test]
+fn update_python_warns_on_restore_pip_globals() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = ctx_with_dirs();
+    fs::create_dir_all(&ctx.bindir).unwrap();
+    set_which("python3", None);
+    set_which("python", None);
+
+    fn fake_pip_global_packages(_active: &std::path::Path) -> anyhow::Result<Vec<String>> {
+        Ok(vec!["foo==1.0.0".to_string()])
+    }
+    fn fake_restore_pip_globals(
+        _active: &std::path::Path,
+        _packages: &[String],
+    ) -> anyhow::Result<()> {
+        Err(anyhow!("boom"))
+    }
+    let _patch_list = patch!(pip_global_packages => fake_pip_global_packages).unwrap();
+    let _patch_restore = patch!(restore_pip_globals => fake_restore_pip_globals).unwrap();
+
+    let url = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest";
+    let json = r#"{"tag_name":"v3.11.9","assets":[{"name":"cpython-3.11.9+20240224-x86_64-unknown-linux-gnu.tar.zst","browser_download_url":"https://example.com/python.tgz"}]}"#;
+    set_http_plan(
+        url,
+        vec![
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+        ],
+    );
+    let tar = {
+        let mut bytes = Vec::new();
+        {
+            let mut tar = tar::Builder::new(&mut bytes);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_cksum();
+            tar.append_data(&mut header, "python/install/bin/python3", std::io::empty())
+                .unwrap();
+            tar.finish().unwrap();
+        }
+        zstd::stream::encode_all(&bytes[..], 0).unwrap()
+    };
+    set_http_plan(
+        "https://example.com/python.tgz",
+        vec![Ok(MockResponse::new(tar.clone(), Some(tar.len() as u64)))],
+    );
+
+    update_python(&ctx).unwrap();
+}
+
+#[test]
+fn update_python_warns_on_restore_pip_globals_run_output() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = ctx_with_dirs();
+    fs::create_dir_all(&ctx.bindir).unwrap();
+    set_which("python3", None);
+    set_which("python", None);
+
+    let tool_root = ctx.home.join("python");
+    let old_dir = tool_root.join("old");
+    let old_python = old_dir.join("install").join("bin").join("python3");
+    fs::create_dir_all(old_python.parent().unwrap()).unwrap();
+    fs::write(&old_python, b"").unwrap();
+    #[cfg(unix)]
+    {
+        symlink(&old_dir, tool_root.join("active")).unwrap();
+    }
+    set_run_output(
+        old_python.to_string_lossy().as_ref(),
+        &["-m", "pip", "list", "--format=json"],
+        output_with_status(0, br#"[{"name":"foo","version":"1.0.0"}]"#, b""),
+    );
+
+    let url = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest";
+    let json = r#"{"tag_name":"v3.11.9","assets":[{"name":"cpython-3.11.9+20240224-x86_64-unknown-linux-gnu.tar.zst","browser_download_url":"https://example.com/python.tgz"}]}"#;
+    set_http_plan(
+        url,
+        vec![
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+        ],
+    );
+    let tar = {
+        let mut bytes = Vec::new();
+        {
+            let mut tar = tar::Builder::new(&mut bytes);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_cksum();
+            tar.append_data(&mut header, "python/install/bin/python3", std::io::empty())
+                .unwrap();
+            tar.finish().unwrap();
+        }
+        zstd::stream::encode_all(&bytes[..], 0).unwrap()
+    };
+    set_http_plan(
+        "https://example.com/python.tgz",
+        vec![Ok(MockResponse::new(tar.clone(), Some(tar.len() as u64)))],
+    );
+
+    let new_python = tool_root
+        .join("3.11.9")
+        .join("python")
+        .join("install")
+        .join("bin")
+        .join("python3");
+    set_run_output(
+        new_python.to_string_lossy().as_ref(),
+        &["-m", "pip", "install", "foo==1.0.0"],
+        output_with_status(1, b"", b""),
+    );
+
+    update_python(&ctx).unwrap();
 }
 
 #[test]

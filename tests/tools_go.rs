@@ -1,3 +1,5 @@
+use anyhow::anyhow;
+use jmpln::patch;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
@@ -8,8 +10,9 @@ use upkit::test_support::{
     set_http_plan, set_prune_tool_versions_error, set_run_output, set_which,
 };
 use upkit::tools::go::{
-    GoToolSpec, check_go, go_global_bin_dirs, go_global_tools, go_latest, go_os_arch, go_pick_file,
-    go_tool_spec_from_binary, parse_go_version_metadata, restore_go_globals, update_go,
+    GoToolSpec, check_go, go_env_value, go_global_bin_dirs, go_global_tools, go_latest, go_os_arch,
+    go_pick_file, go_tool_spec_from_binary, parse_go_version_metadata, restore_go_globals,
+    update_go,
 };
 use upkit::{Ctx, Status, Version};
 
@@ -336,6 +339,165 @@ fn update_go_up_to_date() {
         output_with_status(0, b"go version go1.2.3 linux/amd64", b""),
     );
     update_go(&ctx).unwrap();
+}
+
+#[test]
+fn update_go_warns_on_globals_and_restore() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = ctx_with_dirs();
+    fs::create_dir_all(&ctx.bindir).unwrap();
+    set_which("go", None);
+
+    let tar_bytes = make_go_tar_gz();
+    let mut hasher = Sha256::new();
+    hasher.update(&tar_bytes);
+    let good_sha = hex::encode(hasher.finalize());
+    let json = go_json("go1.2.3", &good_sha);
+    let url = "https://go.dev/dl/?mode=json";
+    set_http_plan(
+        url,
+        vec![
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+        ],
+    );
+    let dl = "https://go.dev/dl/go1.2.3.linux-amd64.tar.gz";
+    set_http_plan(
+        dl,
+        vec![Ok(MockResponse::new(
+            tar_bytes.clone(),
+            Some(tar_bytes.len() as u64),
+        ))],
+    );
+
+    fn fake_go_global_tools(_bin: Option<&std::path::Path>) -> anyhow::Result<Vec<GoToolSpec>> {
+        Err(anyhow!("boom"))
+    }
+    fn fake_restore_go_globals(
+        _bin: Option<&std::path::Path>,
+        _tools: &[GoToolSpec],
+    ) -> anyhow::Result<()> {
+        Err(anyhow!("boom"))
+    }
+
+    let _patch_globals = patch!(go_global_tools => fake_go_global_tools).unwrap();
+    let _patch_restore = patch!(restore_go_globals => fake_restore_go_globals).unwrap();
+
+    update_go(&ctx).unwrap();
+}
+
+#[test]
+fn update_go_warns_on_restore_globals_run_output() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = ctx_with_dirs();
+    fs::create_dir_all(&ctx.bindir).unwrap();
+    set_which("go", None);
+
+    let tool_root = ctx.home.join("go");
+    let old_active = tool_root.join("old");
+    let active = tool_root.join("active");
+    let active_bin = old_active.join("bin");
+    fs::create_dir_all(&active_bin).unwrap();
+    fs::write(active_bin.join("go"), b"").unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&old_active, &active).unwrap();
+    }
+
+    let gobin = ctx.home.join("gobin");
+    fs::create_dir_all(&gobin).unwrap();
+    let tool_bin = gobin.join("tool");
+    fs::write(&tool_bin, b"").unwrap();
+    set_env_var("GOBIN", Some(gobin.to_string_lossy().to_string()));
+
+    let tool_bin_str = tool_bin.to_string_lossy().to_string();
+    let go_program = active_bin.join("go");
+    set_run_output(
+        go_program.to_string_lossy().as_ref(),
+        &["version", "-m", tool_bin_str.as_str()],
+        output_with_status(0, b"mod example.com/tool v1.2.3\n", b""),
+    );
+    set_run_output(
+        go_program.to_string_lossy().as_ref(),
+        &["install", "example.com/tool@v1.2.3"],
+        output_with_status(1, b"", b""),
+    );
+
+    let tar_bytes = make_go_tar_gz();
+    let mut hasher = Sha256::new();
+    hasher.update(&tar_bytes);
+    let good_sha = hex::encode(hasher.finalize());
+    let json = go_json("go1.2.3", &good_sha);
+    let url = "https://go.dev/dl/?mode=json";
+    set_http_plan(
+        url,
+        vec![
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+        ],
+    );
+    let dl = "https://go.dev/dl/go1.2.3.linux-amd64.tar.gz";
+    set_http_plan(
+        dl,
+        vec![Ok(MockResponse::new(
+            tar_bytes.clone(),
+            Some(tar_bytes.len() as u64),
+        ))],
+    );
+
+    update_go(&ctx).unwrap();
+}
+
+#[test]
+fn go_env_value_reads_env_var() {
+    let _guard = reset_guard();
+    set_env_var("GOBIN", Some("/tmp/gobin".to_string()));
+    assert_eq!(go_env_value(None, "GOBIN"), Some("/tmp/gobin".to_string()));
+}
+
+#[test]
+fn go_global_tools_edge_cases() {
+    let _guard = reset_guard();
+    set_env_var("GOBIN", None);
+    set_run_output("go", &["env", "GOBIN"], output_with_status(0, b"", b""));
+    set_run_output("go", &["env", "GOPATH"], output_with_status(0, b"", b""));
+    set_home_dir(None);
+    assert!(go_global_tools(None).unwrap().is_empty());
+
+    let dir = tempdir().unwrap();
+    let gobin = dir.path().join("gobin");
+    set_env_var("GOBIN", Some(gobin.to_string_lossy().to_string()));
+    assert!(go_global_tools(None).unwrap().is_empty());
+
+    fs::create_dir_all(&gobin).unwrap();
+    let broken = gobin.join("broken");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("missing", &broken).unwrap();
+    }
+    let subdir = gobin.join("dir");
+    fs::create_dir_all(&subdir).unwrap();
+    assert!(go_global_tools(None).unwrap().is_empty());
+}
+
+#[test]
+fn parse_go_version_metadata_without_mod() {
+    assert!(parse_go_version_metadata("go version go1.2.3").is_none());
+}
+
+#[test]
+fn restore_go_globals_uses_explicit_bin() {
+    let _guard = reset_guard();
+    let tool = GoToolSpec {
+        module: "example.com/tool".to_string(),
+        version: "v1.2.3".to_string(),
+    };
+    set_run_output(
+        "/tmp/go",
+        &["install", "example.com/tool@v1.2.3"],
+        output_with_status(0, b"", b""),
+    );
+    restore_go_globals(Some(std::path::Path::new("/tmp/go")), &[tool]).unwrap();
 }
 
 #[test]
