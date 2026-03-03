@@ -1566,13 +1566,29 @@ fn run_paths_warns_missing_status() {
 
 #[test]
 fn run_doctor_writable_paths_coverage() {
+    let _env_guard = ENV_LOCK.lock().unwrap();
     let _guard = reset_guard();
     let dir = tempdir().unwrap();
     let home = dir.path().join("home");
     let bindir = dir.path().join("bin");
     fs::create_dir_all(&home).unwrap();
     fs::create_dir_all(&bindir).unwrap();
+    #[cfg(unix)]
+    {
+        let mut perms = fs::metadata(&home).unwrap().permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(&home, perms).unwrap();
+
+        let mut perms = fs::metadata(&bindir).unwrap().permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(&bindir, perms).unwrap();
+    }
     set_env_var("PATH", Some(bindir.display().to_string()));
+    set_which("go", Some(std::path::PathBuf::from("/bin/go")));
+    set_which("rustc", Some(std::path::PathBuf::from("/bin/rustc")));
+    set_which("node", Some(std::path::PathBuf::from("/bin/node")));
+    set_which("python3", Some(std::path::PathBuf::from("/bin/python3")));
+    set_which("flutter", Some(std::path::PathBuf::from("/bin/flutter")));
     let prompt = Arc::new(TestPrompt::default());
     let mut ctx = base_ctx(home, bindir, prompt);
     ctx.offline = true;
