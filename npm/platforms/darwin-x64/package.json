@@ -1,0 +1,26 @@
+{
+  "name": "@christiandoxa/upkit-darwin-x64",
+  "version": "0.4.5",
+  "description": "Native upkit binary for x86_64-apple-darwin",
+  "license": "MIT OR Apache-2.0",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "vendor"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/christiandoxa/upkit.git",
+    "directory": "npm/platforms/darwin-x64"
+  }
+}

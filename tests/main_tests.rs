@@ -737,6 +737,41 @@ fn run_self_update_paths() {
     run_self_update(&ctx, false).unwrap();
     ctx.json = true;
     run_self_update(&ctx, true).unwrap();
+
+    set_env_var("UPKIT_INSTALLER", Some("npm".to_string()));
+    set_env_var(
+        "UPKIT_NPM_PACKAGE_NAME",
+        Some("@christiandoxa/upkit".to_string()),
+    );
+    set_which("npm", None);
+    assert!(run_self_update(&ctx, true).is_err());
+
+    set_which("npm", Some(std::path::PathBuf::from("/bin/npm")));
+    ctx.json = false;
+    ctx.dry_run = true;
+    run_self_update(&ctx, false).unwrap();
+
+    ctx.dry_run = false;
+    set_run_output(
+        "npm",
+        &["install", "-g", "@christiandoxa/upkit@latest"],
+        output_with_status(1, b"", b""),
+    );
+    assert!(run_self_update(&ctx, false).is_err());
+
+    set_run_output(
+        "npm",
+        &["install", "-g", "@christiandoxa/upkit@latest"],
+        output_with_status(0, b"", b""),
+    );
+    set_run_output(
+        "npm",
+        &["install", "-g", "@christiandoxa/upkit@latest"],
+        output_with_status(0, b"", b""),
+    );
+    run_self_update(&ctx, false).unwrap();
+    ctx.json = true;
+    run_self_update(&ctx, true).unwrap();
 }
 
 #[test]

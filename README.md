@@ -13,6 +13,14 @@ One CLI to check and update Go, Rust, Node, Python, and Flutter toolchains.
 
 ## Install
 
+From npm:
+
+```bash
+npm install -g @christiandoxa/upkit
+```
+
+The npm package installs a native `upkit` binary for the current platform.
+
 From crates.io:
 
 ```bash
@@ -138,6 +146,8 @@ Update upkit itself:
 ```bash
 upkit self-update
 ```
+
+If `upkit` was installed from npm, `self-update` uses `npm install -g @christiandoxa/upkit@latest`.
 
 Generate shell completions:
 

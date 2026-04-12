@@ -219,6 +219,12 @@ pub fn print_reports(ctx: &Ctx, reports: &[ToolReport]) {
 
 pub fn maybe_path_hint(ctx: &Ctx) {
     maybe_path_hint_for_dir(ctx, &ctx.bindir, "upkit bin");
+    if upkit_installed_via_npm() {
+        if let Some(dir) = npm_global_bin_dir(ctx) {
+            maybe_path_hint_for_dir(ctx, &dir, "npm global bin");
+        }
+        return;
+    }
     if let Some(dir) = upkit_exe_dir() {
         let upkit_dir = if is_dev_exe_dir(&dir) {
             ctx.bindir.clone()
@@ -424,18 +430,20 @@ fn required_path_targets(ctx: &Ctx) -> Vec<PathTarget> {
         label: "upkit bin",
         dir: ctx.bindir.clone(),
     });
-    if let Some(dir) = upkit_exe_dir() {
-        let matches_cargo = cargo_dir.as_ref().map_or(false, |cargo| cargo == &dir);
-        let upkit_dir = if is_dev_exe_dir(&dir) {
-            ctx.bindir.clone()
-        } else {
-            dir
-        };
-        if !matches_cargo
-            && !path_contains_dir(&upkit_dir)
-            && !targets.iter().any(|target| target.dir == upkit_dir)
-        {
-            push_target(&mut targets, "upkit exe", upkit_dir);
+    if !upkit_installed_via_npm() {
+        if let Some(dir) = upkit_exe_dir() {
+            let matches_cargo = cargo_dir.as_ref().map_or(false, |cargo| cargo == &dir);
+            let upkit_dir = if is_dev_exe_dir(&dir) {
+                ctx.bindir.clone()
+            } else {
+                dir
+            };
+            if !matches_cargo
+                && !path_contains_dir(&upkit_dir)
+                && !targets.iter().any(|target| target.dir == upkit_dir)
+            {
+                push_target(&mut targets, "upkit exe", upkit_dir);
+            }
         }
     }
     if let Some(dir) = cargo_dir {
@@ -464,6 +472,10 @@ fn required_path_targets(ctx: &Ctx) -> Vec<PathTarget> {
         }
     }
     targets
+}
+
+fn upkit_installed_via_npm() -> bool {
+    matches!(get_env_var("UPKIT_INSTALLER").as_deref(), Some("npm"))
 }
 
 fn is_dev_exe_dir(dir: &Path) -> bool {

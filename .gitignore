@@ -3,6 +3,9 @@
 *.pdb
 Cargo.lock
 coverage.out
+node_modules/
+artifacts/
+release/
 
 # IntelliJ / Rust plugin
 *.iml

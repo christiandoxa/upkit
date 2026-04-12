@@ -1,0 +1,102 @@
+#!/usr/bin/env node
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { spawn } = require("node:child_process");
+const { createRequire } = require("node:module");
+
+const PLATFORM_PACKAGES = {
+  linux: {
+    x64: {
+      packageName: "@christiandoxa/upkit-linux-x64",
+      binaryFileName: "upkit",
+    },
+    arm64: {
+      packageName: "@christiandoxa/upkit-linux-arm64",
+      binaryFileName: "upkit",
+    },
+  },
+  darwin: {
+    x64: {
+      packageName: "@christiandoxa/upkit-darwin-x64",
+      binaryFileName: "upkit",
+    },
+    arm64: {
+      packageName: "@christiandoxa/upkit-darwin-arm64",
+      binaryFileName: "upkit",
+    },
+  },
+  win32: {
+    x64: {
+      packageName: "@christiandoxa/upkit-win32-x64",
+      binaryFileName: "upkit.exe",
+    },
+    arm64: {
+      packageName: "@christiandoxa/upkit-win32-arm64",
+      binaryFileName: "upkit.exe",
+    },
+  },
+};
+
+const requireFromHere = createRequire(__filename);
+const packageJson = requireFromHere("./package.json");
+const platformPackage = PLATFORM_PACKAGES[process.platform]?.[process.arch];
+
+if (!platformPackage) {
+  process.stderr.write(
+    `Unsupported platform for ${packageJson.name}: ${process.platform} ${process.arch}\n`,
+  );
+  process.exit(1);
+}
+
+let nativeBinaryPath;
+try {
+  const platformPackageJsonPath = requireFromHere.resolve(
+    `${platformPackage.packageName}/package.json`,
+  );
+  nativeBinaryPath = path.join(
+    path.dirname(platformPackageJsonPath),
+    "vendor",
+    platformPackage.binaryFileName,
+  );
+} catch {
+  process.stderr.write(
+    `Unable to locate ${platformPackage.packageName}; reinstall ${packageJson.name} with optional dependencies enabled.\n`,
+  );
+  process.exit(1);
+}
+
+if (!fs.existsSync(nativeBinaryPath)) {
+  process.stderr.write(`Missing upkit native binary at ${nativeBinaryPath}\n`);
+  process.exit(1);
+}
+
+const child = spawn(nativeBinaryPath, process.argv.slice(2), {
+  env: {
+    ...process.env,
+    UPKIT_INSTALLER: "npm",
+    UPKIT_NPM_PACKAGE_NAME: packageJson.name,
+    UPKIT_NPM_PACKAGE_VERSION: packageJson.version,
+  },
+  stdio: "inherit",
+});
+
+for (const signalName of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+  process.on(signalName, () => {
+    child.kill(signalName);
+  });
+}
+
+child.on("error", (error) => {
+  process.stderr.write(`${error.message}\n`);
+  process.exit(1);
+});
+
+child.on("exit", (code, signal) => {
+  if (signal) {
+    process.kill(process.pid, signal);
+    return;
+  }
+  process.exit(code ?? 1);
+});

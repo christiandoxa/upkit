@@ -884,13 +884,44 @@ pub fn run_self_update(ctx: &Ctx, json: bool) -> Result<()> {
     if !ctx.stdin_is_tty && !ctx.yes {
         return Err(anyhow!("non-interactive mode: use --yes to proceed"));
     }
-    if which_or_none("cargo").is_none() {
-        bail!("cargo not found in PATH; reinstall manually");
-    }
+    let install_via_npm = matches!(get_env_var("UPKIT_INSTALLER").as_deref(), Some("npm"));
+    let package_name = get_env_var("UPKIT_NPM_PACKAGE_NAME")
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "@christiandoxa/upkit".to_string());
+    let (program, args, prompt_text, dry_run_text, via) = if install_via_npm {
+        if which_or_none("npm").is_none() {
+            bail!("npm not found in PATH; reinstall manually");
+        }
+        let command = format!("npm install -g {package_name}@latest");
+        (
+            "npm".to_string(),
+            vec![
+                "install".to_string(),
+                "-g".to_string(),
+                format!("{package_name}@latest"),
+            ],
+            format!("Update upkit via {command}?"),
+            command,
+            "npm",
+        )
+    } else {
+        if which_or_none("cargo").is_none() {
+            bail!("cargo not found in PATH; reinstall manually");
+        }
+        (
+            "cargo".to_string(),
+            vec![
+                "install".to_string(),
+                "--force".to_string(),
+                "upkit".to_string(),
+            ],
+            "Update upkit via cargo install --force upkit?".to_string(),
+            "cargo install --force upkit".to_string(),
+            "cargo",
+        )
+    };
     if !ctx.yes {
-        let ok = ctx
-            .prompt
-            .confirm("Update upkit via cargo install --force upkit?", false)?;
+        let ok = ctx.prompt.confirm(&prompt_text, false)?;
         if !ok {
             info(ctx, "Canceled.");
             return Ok(());
@@ -902,15 +933,15 @@ pub fn run_self_update(ctx: &Ctx, json: bool) -> Result<()> {
                 "command": "self-update",
                 "ok": true,
                 "dry_run": true,
+                "via": via,
             });
             emit_json(ctx, payload)?;
         } else {
-            info(ctx, "[dry-run] would run: cargo install --force upkit");
+            info(ctx, format!("[dry-run] would run: {dry_run_text}"));
         }
         return Ok(());
     }
-    let status = run_status("cargo", &["install", "--force", "upkit"])
-        .context("failed to run cargo install")?;
+    let status = run_status(program, &args).context("failed to run self-update command")?;
     if !status.success() {
         bail!("self-update failed");
     }
@@ -918,6 +949,7 @@ pub fn run_self_update(ctx: &Ctx, json: bool) -> Result<()> {
         let payload = serde_json::json!({
             "command": "self-update",
             "ok": true,
+            "via": via,
         });
         emit_json(ctx, payload)?;
     } else {
