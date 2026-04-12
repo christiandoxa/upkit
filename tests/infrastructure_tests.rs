@@ -3,10 +3,12 @@ use std::sync::Arc;
 use tempfile::tempdir;
 use upkit::Prompt;
 use upkit::ToolKind;
+#[cfg(coverage)]
+use upkit::infrastructure::http_get_text;
 use upkit::infrastructure::{
-    DialoguerPrompt, MockAttempt, code_to_index, download_to_temp, finish_spinner, http_get_text,
-    index_to_code, maybe_path_hint_for_dir, mock_http_attempt, prune_tool_versions,
-    remove_path_hint_for_label, start_spinner, tool_path_hint_labels,
+    DialoguerPrompt, MockAttempt, code_to_index, download_to_temp, finish_spinner, index_to_code,
+    maybe_path_hint_for_dir, mock_http_attempt, prune_tool_versions, remove_path_hint_for_label,
+    start_spinner, tool_path_hint_labels,
 };
 use upkit::test_support::{
     MockResponse, TestPrompt, base_ctx, reset_guard, set_env_var, set_home_dir, set_http_plan,
@@ -283,6 +285,7 @@ fn download_to_temp_with_active_spinner() {
     assert_eq!(fs::read(tmp.path()).unwrap(), vec![1]);
 }
 
+#[cfg(coverage)]
 #[test]
 fn http_get_requires_mocking_under_coverage() {
     let _guard = reset_guard();
