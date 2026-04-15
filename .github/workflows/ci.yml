@@ -51,3 +51,46 @@ jobs:
 
       - name: Run test suite
         run: cargo test --locked -- --test-threads=1
+
+  action-smoke:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build upkit binary
+        run: cargo build --release --locked
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Stage local npm packages
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./npm/upkit/package.json').version")"
+          mkdir -p dist/npm dist/package-build/upkit-linux-x64/vendor
+          cp target/release/upkit dist/package-build/upkit-linux-x64/vendor/upkit
+          cp npm/platforms/linux-x64/package.json dist/package-build/upkit-linux-x64/package.json
+          npm pack ./npm/upkit --pack-destination dist/npm
+          npm pack ./dist/package-build/upkit-linux-x64 --pack-destination dist/npm
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install via local action
+        id: setup-upkit
+        uses: ./
+        with:
+          package: ./dist/npm/christiandoxa-upkit-${{ steps.pack.outputs.version }}.tgz
+          extra-packages: ./dist/npm/christiandoxa-upkit-linux-x64-${{ steps.pack.outputs.version }}.tgz
+
+      - name: Verify installed CLI
+        run: |
+          upkit --version
+          test "${{ steps.setup-upkit.outputs.version }}" = "${{ steps.pack.outputs.version }}"

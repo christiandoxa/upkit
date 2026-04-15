@@ -24,7 +24,7 @@ use crate::{test_support, tools};
 #[derive(Parser, Debug)]
 #[command(name = "upkit")]
 #[command(version)]
-#[command(about = "Check and update Go/Rust/Node/Python/Flutter", long_about = None)]
+#[command(about = "Check and update Go/Rust/Node/Python/Flutter/Zig", long_about = None)]
 pub struct Cli {
     /// Print JSON instead of pretty text
     #[arg(long, global = true)]
@@ -664,6 +664,7 @@ pub fn check_tool(ctx: &Ctx, tool: ToolKind) -> Result<ToolReport> {
         ToolKind::Python => tools::python::check_python(ctx),
         ToolKind::Rust => tools::rust::check_rust(ctx),
         ToolKind::Flutter => tools::flutter::check_flutter(ctx),
+        ToolKind::Zig => tools::zig::check_zig(ctx),
     }
 }
 
@@ -677,12 +678,15 @@ pub fn update_tool(ctx: &Ctx, tool: ToolKind) -> Result<()> {
         ToolKind::Python => tools::python::update_python(ctx),
         ToolKind::Rust => tools::rust::update_rust(ctx),
         ToolKind::Flutter => tools::flutter::update_flutter(ctx),
+        ToolKind::Zig => tools::zig::update_zig(ctx),
     }
 }
 
 pub fn tool_method(tool: ToolKind) -> UpdateMethod {
     match tool {
-        ToolKind::Go | ToolKind::Node | ToolKind::Python => UpdateMethod::DirectDownload,
+        ToolKind::Go | ToolKind::Node | ToolKind::Python | ToolKind::Zig => {
+            UpdateMethod::DirectDownload
+        }
         ToolKind::Rust | ToolKind::Flutter => UpdateMethod::BuiltIn,
     }
 }
@@ -814,6 +818,7 @@ pub fn run_doctor(ctx: &Ctx, json: bool) -> Result<()> {
             ToolKind::Node => "node",
             ToolKind::Python => "python3",
             ToolKind::Flutter => "flutter",
+            ToolKind::Zig => "zig",
         };
         if which_or_none(bin).is_none() {
             missing.push(bin);

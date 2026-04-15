@@ -9,6 +9,7 @@ pub enum ToolKind {
     Node,
     Python,
     Flutter,
+    Zig,
 }
 
 impl ToolKind {
@@ -19,6 +20,7 @@ impl ToolKind {
             ToolKind::Node,
             ToolKind::Python,
             ToolKind::Flutter,
+            ToolKind::Zig,
         ]
     }
 
@@ -29,6 +31,7 @@ impl ToolKind {
             ToolKind::Node => "node",
             ToolKind::Python => "python",
             ToolKind::Flutter => "flutter",
+            ToolKind::Zig => "zig",
         }
     }
 }

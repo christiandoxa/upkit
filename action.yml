@@ -1,0 +1,87 @@
+name: Setup upkit
+description: Install upkit from npm and add the CLI to PATH for later workflow steps.
+branding:
+  color: blue
+  icon: package
+
+inputs:
+  package:
+    description: npm package name, tarball, folder, or URL to install.
+    required: false
+    default: "@christiandoxa/upkit"
+  version:
+    description: Version to install when package points at an npm registry package.
+    required: false
+    default: "latest"
+  extra-packages:
+    description: Additional npm package specs to install in the same command.
+    required: false
+    default: ""
+  node-version:
+    description: Node.js version used for npm install.
+    required: false
+    default: "22"
+
+outputs:
+  version:
+    description: Installed upkit CLI version.
+    value: ${{ steps.install.outputs.version }}
+  bin_dir:
+    description: Directory added to PATH for the upkit binary.
+    value: ${{ steps.install.outputs.bin_dir }}
+  package_spec:
+    description: Primary package spec passed to npm install.
+    value: ${{ steps.install.outputs.package_spec }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Install upkit
+      id: install
+      shell: bash
+      env:
+        INPUT_PACKAGE: ${{ inputs.package }}
+        INPUT_VERSION: ${{ inputs.version }}
+        INPUT_EXTRA_PACKAGES: ${{ inputs.extra-packages }}
+      run: |
+        set -euo pipefail
+
+        package_spec="$INPUT_PACKAGE"
+        case "$INPUT_PACKAGE" in
+          ./*|../*|/*|*://*|*.tgz|*.tar.gz)
+            ;;
+          *)
+            package_spec="${INPUT_PACKAGE}@${INPUT_VERSION:-latest}"
+            ;;
+        esac
+
+        packages=("$package_spec")
+        while IFS= read -r line; do
+          if [ -n "$line" ]; then
+            packages+=("$line")
+          fi
+        done <<< "$INPUT_EXTRA_PACKAGES"
+
+        install_prefix="${RUNNER_TEMP}/upkit-npm-global"
+        rm -rf "$install_prefix"
+        mkdir -p "$install_prefix"
+
+        npm install --global --prefix "$install_prefix" "${packages[@]}"
+
+        if [ "${RUNNER_OS}" = "Windows" ]; then
+          bin_dir="$install_prefix"
+        else
+          bin_dir="$install_prefix/bin"
+        fi
+
+        printf '%s\n' "$bin_dir" >> "$GITHUB_PATH"
+
+        installed_version="$(upkit --version)"
+        printf 'version=%s\n' "$installed_version" >> "$GITHUB_OUTPUT"
+        printf 'bin_dir=%s\n' "$bin_dir" >> "$GITHUB_OUTPUT"
+        printf 'package_spec=%s\n' "$package_spec" >> "$GITHUB_OUTPUT"

@@ -103,7 +103,7 @@ export function mainPackageManifest(version) {
     name: mainPackageName,
     version,
     description:
-      "One CLI to check and update Go, Rust, Node, Python, and Flutter toolchains",
+      "One CLI to check and update Go, Rust, Node, Python, Flutter, and Zig toolchains",
     license: "MIT OR Apache-2.0",
     bin: {
       upkit: "./upkit",

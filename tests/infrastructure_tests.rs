@@ -377,4 +377,5 @@ fn tool_path_hint_labels_variants() {
         tool_path_hint_labels(ToolKind::Flutter),
         &["flutter bin", "pub cache bin"]
     );
+    assert!(tool_path_hint_labels(ToolKind::Zig).is_empty());
 }

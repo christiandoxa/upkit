@@ -2,7 +2,7 @@
 
 ![Coverage](https://github.com/christiandoxa/upkit/actions/workflows/coverage.yml/badge.svg)
 
-One CLI to check and update Go, Rust, Node, Python, and Flutter toolchains.
+One CLI to check and update Go, Rust, Node, Python, Flutter, and Zig toolchains.
 
 ## Features
 
@@ -20,6 +20,18 @@ npm install -g @christiandoxa/upkit
 ```
 
 The npm package installs a native `upkit` binary for the current platform.
+
+From GitHub Actions:
+
+```yaml
+- uses: christiandoxa/upkit@main
+  with:
+    version: latest
+
+- run: upkit check --json
+```
+
+The action installs `@christiandoxa/upkit` from npm and adds the CLI to `PATH`.
 
 From crates.io:
 
@@ -47,7 +59,7 @@ Full help output:
 
 ```bash
 $ upkit help
-Check and update Go/Rust/Node/Python/Flutter
+Check and update Go/Rust/Node/Python/Flutter/Zig
 
 Usage: upkit [OPTIONS] [COMMAND]
 
@@ -74,7 +86,7 @@ Options:
       --offline            Disable network access (skip latest checks and downloads)
       --timeout <TIMEOUT>  Network timeout in seconds [default: 60]
       --retries <RETRIES>  Retry failed network requests this many times [default: 2]
-      --only <ONLY>        Limit which tools to operate on [possible values: go, rust, node, python, flutter]
+      --only <ONLY>        Limit which tools to operate on [possible values: go, rust, node, python, flutter, zig]
       --home <HOME>        Where upkit stores tool installs (default: ~/.local/share/upkit)
       --bindir <BINDIR>    Where upkit places symlinks (default: ~/.local/bin)
   -h, --help               Print help
@@ -115,6 +127,7 @@ upkit update rust
 upkit update node
 upkit update python
 upkit update flutter
+upkit update zig
 ```
 
 Clean managed installs and symlinks:

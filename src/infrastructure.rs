@@ -1411,6 +1411,7 @@ pub fn tool_bin_names(tool: ToolKind) -> &'static [&'static str] {
         ToolKind::Python => &["python", "python3", "pip", "pip3"],
         ToolKind::Flutter => &["flutter", "dart", "pub"],
         ToolKind::Rust => &[],
+        ToolKind::Zig => &["zig"],
     }
 }
 
@@ -1421,6 +1422,7 @@ pub fn tool_path_hint_labels(tool: ToolKind) -> &'static [&'static str] {
         ToolKind::Python => &["python user base bin"],
         ToolKind::Flutter => &["flutter bin", "pub cache bin"],
         ToolKind::Rust => &["cargo bin"],
+        ToolKind::Zig => &[],
     }
 }
 
