@@ -10,8 +10,9 @@ use std::{
 
 use crate::{
     Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, atomic_symlink, download_to_temp,
-    ensure_clean_dir, home_dir, http_get_json, info, keep_latest_version, link_dir_bins,
-    maybe_path_hint_for_dir, prune_tool_versions, run_capture, run_output, warn, which_or_none,
+    ensure_clean_dir, home_dir, http_get_json, http_get_text, info, keep_latest_version,
+    link_dir_bins, maybe_path_hint_for_dir, prune_tool_versions, run_capture, run_output, warn,
+    which_or_none,
 };
 
 #[derive(Debug, Deserialize)]
@@ -27,6 +28,11 @@ pub struct GhAsset {
 }
 
 const PIP_GLOBALS_SNAPSHOT: &str = "pip-globals.txt";
+const PYTHON_RELEASES_LATEST_URL: &str =
+    "https://github.com/astral-sh/python-build-standalone/releases/latest";
+const PYTHON_RELEASES_API_URL: &str =
+    "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest";
+const PYTHON_RELEASES_BASE_URL: &str = "https://github.com";
 
 pub fn check_python(ctx: &Ctx) -> Result<ToolReport> {
     let installed = if let Some(bin) = python_bin_in_bindir(ctx, "python3") {
@@ -46,7 +52,18 @@ pub fn check_python(ctx: &Ctx) -> Result<ToolReport> {
         .and_then(|out| Version::parse_loose(&out))
     });
 
-    let latest = python_latest(ctx).ok();
+    let mut notes = vec![
+        "Uses astral-sh/python-build-standalone assets (.tar.zst).".into(),
+        "Note: Upstream release assets don't reliably publish sha256; this MVP does best-effort verification (download integrity via TLS)."
+            .into(),
+    ];
+    let latest = match python_latest(ctx) {
+        Ok(version) => Some(version),
+        Err(err) => {
+            notes.push(format!("Latest check failed: {err}"));
+            None
+        }
+    };
     let status = Status::from_versions(installed.as_ref(), latest.as_ref());
 
     Ok(ToolReport {
@@ -55,11 +72,7 @@ pub fn check_python(ctx: &Ctx) -> Result<ToolReport> {
         latest,
         status,
         method: UpdateMethod::DirectDownload,
-        notes: vec![
-            "Uses astral-sh/python-build-standalone assets (.tar.zst).".into(),
-            "Note: Upstream release assets don't reliably publish sha256; this MVP does best-effort verification (download integrity via TLS)."
-                .into(),
-        ],
+        notes,
     })
 }
 
@@ -80,9 +93,7 @@ pub fn python_target(ctx: &Ctx) -> Result<&'static str> {
 
 pub fn python_latest(ctx: &Ctx) -> Result<Version> {
     // Pick the highest CPython version found in latest release assets.
-    // API: /releases/latest
-    let url = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest";
-    let rel: GhRelease = http_get_json(ctx, url)?;
+    let rel = python_release_assets(ctx)?;
 
     let target = python_target(ctx)?;
     let re = Regex::new(r"^cpython-(\d+)\.(\d+)\.(\d+).*-([A-Za-z0-9_+-]+)\.tar\.zst$")?;
@@ -115,11 +126,10 @@ pub fn python_latest(ctx: &Ctx) -> Result<Version> {
 }
 
 pub fn python_pick_asset(ctx: &Ctx, want: &Version) -> Result<GhAsset> {
-    let url = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest";
-    let rel: GhRelease = http_get_json(ctx, url)?;
+    let rel = python_release_assets(ctx)?;
 
     let target = python_target(ctx)?;
-    // prefer "install_only" if present; otherwise take first match
+    // Prefer smaller runtime installs, then optimized non-debug builds.
     let want_prefix = format!("cpython-{}.{}.{}", want.major, want.minor, want.patch);
 
     let mut candidates = rel
@@ -132,18 +142,85 @@ pub fn python_pick_asset(ctx: &Ctx, want: &Version) -> Result<GhAsset> {
         })
         .collect::<Vec<_>>();
 
-    candidates.sort_by_key(|a| {
-        if a.name.contains("install_only") {
-            0
-        } else {
-            1
-        }
-    });
+    candidates.sort_by_key(|a| (python_asset_priority(&a.name), a.name.clone()));
 
     candidates
         .into_iter()
         .next()
         .ok_or_else(|| anyhow!("no python asset found for {}", want.to_string()))
+}
+
+fn python_asset_priority(name: &str) -> u8 {
+    let debug = name.contains("debug");
+    let freethreaded = name.contains("freethreaded");
+    if name.contains("install_only") && !debug {
+        return 0;
+    }
+    if name.contains("pgo+lto") && !debug && !freethreaded {
+        return 1;
+    }
+    if !debug && !freethreaded {
+        return 2;
+    }
+    if name.contains("pgo+lto") && !debug {
+        return 3;
+    }
+    if !debug {
+        return 4;
+    }
+    5
+}
+
+fn python_release_assets(ctx: &Ctx) -> Result<GhRelease> {
+    match http_get_json(ctx, PYTHON_RELEASES_API_URL) {
+        Ok(release) => Ok(release),
+        Err(api_err) => python_release_assets_from_html(ctx).map_err(|html_err| {
+            anyhow!("GitHub API failed: {api_err}; HTML fallback failed: {html_err}")
+        }),
+    }
+}
+
+fn python_release_assets_from_html(ctx: &Ctx) -> Result<GhRelease> {
+    let latest_page = http_get_text(ctx, PYTHON_RELEASES_LATEST_URL)?;
+    let expanded_re = Regex::new(r#"expanded_assets/([0-9A-Za-z._+-]+)"#)?;
+    let tag = expanded_re
+        .captures(&latest_page)
+        .and_then(|captures| captures.get(1).map(|value| value.as_str().to_string()))
+        .ok_or_else(|| anyhow!("could not find python-build-standalone expanded assets link"))?;
+
+    let assets_url = format!(
+        "{PYTHON_RELEASES_BASE_URL}/astral-sh/python-build-standalone/releases/expanded_assets/{tag}"
+    );
+    let assets_page = http_get_text(ctx, &assets_url)?;
+    let asset_re = Regex::new(
+        r#"/astral-sh/python-build-standalone/releases/download/([0-9A-Za-z._+-]+)/([^"<>]+\.tar\.zst)"#,
+    )?;
+    let mut assets = Vec::new();
+    for captures in asset_re.captures_iter(&assets_page) {
+        let Some(asset_tag) = captures.get(1).map(|value| value.as_str()) else {
+            continue;
+        };
+        let Some(name) = captures.get(2).map(|value| value.as_str()) else {
+            continue;
+        };
+        if assets.iter().any(|asset: &GhAsset| asset.name == name) {
+            continue;
+        }
+        assets.push(GhAsset {
+            name: name.to_string(),
+            browser_download_url: format!(
+                "{PYTHON_RELEASES_BASE_URL}/astral-sh/python-build-standalone/releases/download/{asset_tag}/{name}"
+            ),
+        });
+    }
+    if assets.is_empty() {
+        bail!("could not find python-build-standalone assets in expanded assets page");
+    }
+
+    Ok(GhRelease {
+        tag_name: tag,
+        assets,
+    })
 }
 
 pub fn update_python(ctx: &Ctx) -> Result<()> {

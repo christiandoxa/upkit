@@ -157,6 +157,7 @@ fn update_zig_installs_and_prunes() {
     let _guard = reset_guard();
     let (ctx, _dir) = ctx_with_dirs();
     fs::create_dir_all(&ctx.bindir).unwrap();
+    set_which("zig", None);
     let url = "https://ziglang.org/download/index.json";
     let archive = make_zig_tar_xz("0.16.0");
     let mut hasher = Sha256::new();
@@ -192,6 +193,7 @@ fn update_zig_sha_mismatch() {
     let _guard = reset_guard();
     let (ctx, _dir) = ctx_with_dirs();
     fs::create_dir_all(&ctx.bindir).unwrap();
+    set_which("zig", None);
     let url = "https://ziglang.org/download/index.json";
     let archive = make_zig_tar_xz("0.16.0");
     let json = zig_index("0.16.0", "bad");

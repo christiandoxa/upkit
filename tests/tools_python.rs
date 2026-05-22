@@ -90,6 +90,73 @@ fn python_latest_matches_simple_asset() {
 }
 
 #[test]
+fn python_latest_falls_back_to_expanded_assets_html() {
+    let _guard = reset_guard();
+    let (mut ctx, _dir) = ctx_with_dirs();
+    ctx.os = "linux".into();
+    ctx.arch = "x86_64".into();
+
+    let api_url = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest";
+    set_http_plan(api_url, vec![Err("rate limited".to_string())]);
+    set_http_plan(
+        "https://github.com/astral-sh/python-build-standalone/releases/latest",
+        vec![Ok(MockResponse::new(
+            br#"<include-fragment src="/astral-sh/python-build-standalone/releases/expanded_assets/20260510"></include-fragment>"#.to_vec(),
+            None,
+        ))],
+    );
+    let assets_html = r#"
+        <a href="/astral-sh/python-build-standalone/releases/download/20260510/cpython-3.14.5+20260510-x86_64-unknown-linux-gnu-pgo+lto-full.tar.zst">asset</a>
+        <a href="/astral-sh/python-build-standalone/releases/download/20260510/cpython-3.15.0b1+20260510-x86_64-unknown-linux-gnu-pgo+lto-full.tar.zst">asset</a>
+    "#;
+    set_http_plan(
+        "https://github.com/astral-sh/python-build-standalone/releases/expanded_assets/20260510",
+        vec![Ok(MockResponse::new(assets_html.as_bytes().to_vec(), None))],
+    );
+
+    let v = python_latest(&ctx).unwrap();
+    assert_eq!(v.to_string(), "3.15.0");
+}
+
+#[test]
+fn python_pick_asset_falls_back_to_expanded_assets_html() {
+    let _guard = reset_guard();
+    let (mut ctx, _dir) = ctx_with_dirs();
+    ctx.os = "linux".into();
+    ctx.arch = "x86_64".into();
+
+    let api_url = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest";
+    set_http_plan(api_url, vec![Err("rate limited".to_string())]);
+    set_http_plan(
+        "https://github.com/astral-sh/python-build-standalone/releases/latest",
+        vec![Ok(MockResponse::new(
+            br#"<include-fragment src="/astral-sh/python-build-standalone/releases/expanded_assets/20260510"></include-fragment>"#.to_vec(),
+            None,
+        ))],
+    );
+    let assets_html = r#"
+        <a href="/astral-sh/python-build-standalone/releases/download/20260510/cpython-3.15.0b1+20260510-x86_64-unknown-linux-gnu-debug-full.tar.zst">asset</a>
+        <a href="/astral-sh/python-build-standalone/releases/download/20260510/cpython-3.15.0b1+20260510-x86_64-unknown-linux-gnu-pgo+lto-full.tar.zst">asset</a>
+    "#;
+    set_http_plan(
+        "https://github.com/astral-sh/python-build-standalone/releases/expanded_assets/20260510",
+        vec![Ok(MockResponse::new(assets_html.as_bytes().to_vec(), None))],
+    );
+
+    let want = Version {
+        major: 3,
+        minor: 15,
+        patch: 0,
+        pre: None,
+    };
+    let asset = python_pick_asset(&ctx, &want).unwrap();
+    assert!(asset.name.starts_with("cpython-3.15.0b1+20260510"));
+    assert!(asset.name.contains("pgo+lto-full"));
+    assert!(!asset.name.contains("debug"));
+    assert!(asset.browser_download_url.contains("/download/20260510/"));
+}
+
+#[test]
 fn python_target_variants() {
     let _guard = reset_guard();
     let (mut ctx, _dir) = ctx_with_dirs();
