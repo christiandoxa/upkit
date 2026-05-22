@@ -23,6 +23,22 @@ fn ctx_with_dirs() -> (Ctx, tempfile::TempDir) {
     (ctx, dir)
 }
 
+fn python_tar(entries: &[&str]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    {
+        let mut tar = tar::Builder::new(&mut bytes);
+        for entry in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_cksum();
+            tar.append_data(&mut header, entry, std::io::empty())
+                .unwrap();
+        }
+        tar.finish().unwrap();
+    }
+    zstd::stream::encode_all(&bytes[..], 0).unwrap()
+}
+
 #[test]
 fn python_target_and_latest() {
     let _guard = reset_guard();
@@ -745,6 +761,113 @@ fn update_python_warns_on_restore_pip_globals_run_output() {
     );
 
     update_python(&ctx).unwrap();
+}
+
+#[test]
+fn update_python_writes_pip_globals_snapshot() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = ctx_with_dirs();
+    fs::create_dir_all(&ctx.bindir).unwrap();
+    set_which("python3", None);
+    set_which("python", None);
+
+    let tool_root = ctx.home.join("python");
+    let old_dir = tool_root.join("old");
+    let old_python = old_dir.join("install").join("bin").join("python3");
+    let active_python = tool_root
+        .join("active")
+        .join("install")
+        .join("bin")
+        .join("python3");
+    fs::create_dir_all(old_python.parent().unwrap()).unwrap();
+    fs::write(&old_python, b"").unwrap();
+    #[cfg(unix)]
+    {
+        symlink(&old_dir, tool_root.join("active")).unwrap();
+    }
+    set_run_output(
+        active_python.to_string_lossy().as_ref(),
+        &["-m", "pip", "list", "--format=json"],
+        output_with_status(
+            0,
+            br#"[{"name":"requests","version":"2.31.0"},{"name":"black","version":"23.7"}]"#,
+            b"",
+        ),
+    );
+
+    let url = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest";
+    let json = r#"{"tag_name":"v3.11.9","assets":[{"name":"cpython-3.11.9+20240224-x86_64-unknown-linux-gnu.tar.zst","browser_download_url":"https://example.com/python.tgz"}]}"#;
+    set_http_plan(
+        url,
+        vec![
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+        ],
+    );
+    let tar = python_tar(&["python/install/bin/python3"]);
+    set_http_plan(
+        "https://example.com/python.tgz",
+        vec![Ok(MockResponse::new(tar.clone(), Some(tar.len() as u64)))],
+    );
+
+    set_run_output(
+        active_python.to_string_lossy().as_ref(),
+        &["-m", "pip", "install", "black==23.7", "requests==2.31.0"],
+        output_with_status(0, b"", b""),
+    );
+
+    update_python(&ctx).unwrap();
+
+    let snapshot = fs::read_to_string(tool_root.join("pip-globals.txt")).unwrap();
+    assert_eq!(snapshot, "black==23.7\nrequests==2.31.0\n");
+}
+
+#[test]
+fn update_python_restores_pip_globals_from_snapshot_when_active_missing() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = ctx_with_dirs();
+    fs::create_dir_all(&ctx.bindir).unwrap();
+    set_which("python3", None);
+    set_which("python", None);
+
+    let tool_root = ctx.home.join("python");
+    fs::create_dir_all(&tool_root).unwrap();
+    let active_python = tool_root
+        .join("active")
+        .join("install")
+        .join("bin")
+        .join("python3");
+    fs::write(
+        tool_root.join("pip-globals.txt"),
+        "# saved pip globals\nrequests==2.31.0\nblack==23.7\nrequests==2.31.0\n",
+    )
+    .unwrap();
+
+    let url = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest";
+    let json = r#"{"tag_name":"v3.11.9","assets":[{"name":"cpython-3.11.9+20240224-x86_64-unknown-linux-gnu.tar.zst","browser_download_url":"https://example.com/python.tgz"}]}"#;
+    set_http_plan(
+        url,
+        vec![
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+            Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+        ],
+    );
+    let tar = python_tar(&["python/install/bin/python3"]);
+    set_http_plan(
+        "https://example.com/python.tgz",
+        vec![Ok(MockResponse::new(tar.clone(), Some(tar.len() as u64)))],
+    );
+
+    set_run_output(
+        active_python.to_string_lossy().as_ref(),
+        &["-m", "pip", "install", "black==23.7", "requests==2.31.0"],
+        output_with_status(0, b"", b""),
+    );
+
+    update_python(&ctx).unwrap();
+
+    let snapshot = fs::read_to_string(tool_root.join("pip-globals.txt")).unwrap();
+    assert_eq!(snapshot, "black==23.7\nrequests==2.31.0\n");
 }
 
 #[test]

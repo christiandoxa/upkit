@@ -1,7 +1,12 @@
 use anyhow::{Result, anyhow, bail};
 use regex::Regex;
 use serde::Deserialize;
-use std::{env, ffi::OsStr, fs, path::PathBuf};
+use std::{
+    env,
+    ffi::OsStr,
+    fs, io,
+    path::{Path, PathBuf},
+};
 
 use crate::{
     Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, atomic_symlink, download_to_temp,
@@ -20,6 +25,8 @@ pub struct GhAsset {
     pub name: String,
     pub browser_download_url: String,
 }
+
+const PIP_GLOBALS_SNAPSHOT: &str = "pip-globals.txt";
 
 pub fn check_python(ctx: &Ctx) -> Result<ToolReport> {
     let installed = if let Some(bin) = python_bin_in_bindir(ctx, "python3") {
@@ -160,13 +167,7 @@ pub fn update_python(ctx: &Ctx) -> Result<()> {
     info(ctx, format!("Updating python -> {}", latest.to_string()));
 
     let tool_root = ctx.home.join("python");
-    let prior_globals = match pip_global_packages(&tool_root.join("active")) {
-        Ok(list) => list,
-        Err(err) => {
-            warn(ctx, format!("Failed to list pip globals: {err}"));
-            Vec::new()
-        }
-    };
+    let prior_globals = collect_prior_pip_globals(ctx, &tool_root, !ctx.dry_run);
     let asset = python_pick_asset(ctx, &latest)?;
     let dl = asset.browser_download_url;
 
@@ -214,6 +215,8 @@ pub fn update_python(ctx: &Ctx) -> Result<()> {
     maybe_hint_python_bins(ctx, &active);
     if let Err(err) = restore_pip_globals(&active, &prior_globals) {
         warn(ctx, format!("Failed to restore pip globals: {err}"));
+    } else if let Err(err) = write_pip_globals_snapshot(&tool_root, &prior_globals) {
+        warn(ctx, format!("Failed to write pip globals snapshot: {err}"));
     }
 
     if let Err(err) = prune_tool_versions(&tool_root, &ver_dir, &["active"]) {
@@ -224,14 +227,93 @@ pub fn update_python(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-fn maybe_hint_python_bins(ctx: &Ctx, active: &std::path::Path) {
+fn collect_prior_pip_globals(ctx: &Ctx, tool_root: &Path, write_snapshot: bool) -> Vec<String> {
+    let active = tool_root.join("active");
+    if python_executable(&active).is_some() {
+        match pip_global_packages(&active) {
+            Ok(list) => {
+                if write_snapshot {
+                    if let Err(err) = write_pip_globals_snapshot(tool_root, &list) {
+                        warn(ctx, format!("Failed to write pip globals snapshot: {err}"));
+                    }
+                }
+                return list;
+            }
+            Err(err) => warn(ctx, format!("Failed to list pip globals: {err}")),
+        }
+    }
+
+    match read_pip_globals_snapshot(tool_root) {
+        Ok(list) => {
+            if !list.is_empty() {
+                info(
+                    ctx,
+                    format!(
+                        "Restoring {} pip global package(s) from saved snapshot",
+                        list.len()
+                    ),
+                );
+            }
+            list
+        }
+        Err(err) => {
+            warn(ctx, format!("Failed to read pip globals snapshot: {err}"));
+            Vec::new()
+        }
+    }
+}
+
+fn pip_globals_snapshot_path(tool_root: &Path) -> PathBuf {
+    tool_root.join(PIP_GLOBALS_SNAPSHOT)
+}
+
+fn read_pip_globals_snapshot(tool_root: &Path) -> Result<Vec<String>> {
+    let path = pip_globals_snapshot_path(tool_root);
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    };
+    let mut packages = content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    packages.sort();
+    packages.dedup();
+    Ok(packages)
+}
+
+fn write_pip_globals_snapshot(tool_root: &Path, packages: &[String]) -> Result<()> {
+    let path = pip_globals_snapshot_path(tool_root);
+    fs::create_dir_all(tool_root)?;
+    if packages.is_empty() {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+        return Ok(());
+    }
+
+    let mut packages = packages.to_vec();
+    packages.sort();
+    packages.dedup();
+    let mut output = packages.join("\n");
+    output.push('\n');
+    fs::write(path, output)?;
+    Ok(())
+}
+
+fn maybe_hint_python_bins(ctx: &Ctx, active: &Path) {
     let user_base = python_user_base(active).or_else(default_python_user_base);
     if let Some(base) = user_base {
         maybe_path_hint_for_dir(ctx, &base.join("bin"), "python user base bin");
     }
 }
 
-fn python_user_base(active: &std::path::Path) -> Option<PathBuf> {
+fn python_user_base(active: &Path) -> Option<PathBuf> {
     let python = active.join("install").join("bin").join("python3");
     let python = if python.exists() {
         python
@@ -266,7 +348,7 @@ fn python_bin_in_bindir(ctx: &Ctx, name: &str) -> Option<PathBuf> {
     None
 }
 
-fn python_executable(active: &std::path::Path) -> Option<PathBuf> {
+fn python_executable(active: &Path) -> Option<PathBuf> {
     let install_bin = active.join("install").join("bin").join("python3");
     if install_bin.exists() {
         return Some(install_bin);
@@ -278,7 +360,7 @@ fn python_executable(active: &std::path::Path) -> Option<PathBuf> {
     None
 }
 
-pub fn pip_global_packages(active: &std::path::Path) -> Result<Vec<String>> {
+pub fn pip_global_packages(active: &Path) -> Result<Vec<String>> {
     let python = match python_executable(active) {
         Some(path) => path,
         None => return Ok(Vec::new()),
@@ -324,7 +406,7 @@ pub fn pip_global_packages(active: &std::path::Path) -> Result<Vec<String>> {
     Ok(packages)
 }
 
-pub fn restore_pip_globals(active: &std::path::Path, packages: &[String]) -> Result<()> {
+pub fn restore_pip_globals(active: &Path, packages: &[String]) -> Result<()> {
     if packages.is_empty() {
         return Ok(());
     }
