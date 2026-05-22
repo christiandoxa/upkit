@@ -29,7 +29,6 @@ fn zig_index(version: &str, shasum: &str) -> String {
     }}
   }},
   "0.15.9": {{
-    "version": "0.15.9",
     "x86_64-linux": {{
       "tarball": "https://ziglang.org/download/0.15.9/zig-x86_64-linux-0.15.9.tar.xz",
       "shasum": "old",
@@ -38,6 +37,7 @@ fn zig_index(version: &str, shasum: &str) -> String {
   }},
   "{version}": {{
     "version": "{version}",
+    "minimumBuiltinOptimizeMode": "ReleaseFast",
     "x86_64-linux": {{
       "tarball": "https://ziglang.org/download/{version}/zig-x86_64-linux-{version}.tar.xz",
       "shasum": "{shasum}",

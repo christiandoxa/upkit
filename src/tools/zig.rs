@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
+use serde_json::Value;
 use std::{collections::HashMap, ffi::OsStr, fs, path::PathBuf};
 
 use crate::{
@@ -10,7 +11,6 @@ use crate::{
 
 const ZIG_INDEX_URL: &str = "https://ziglang.org/download/index.json";
 
-#[allow(dead_code)]
 #[derive(Clone, Debug, Deserialize)]
 pub struct ZigArtifact {
     pub tarball: String,
@@ -22,21 +22,10 @@ pub struct ZigArtifact {
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct ZigRelease {
-    version: String,
     #[serde(default)]
-    date: Option<String>,
-    #[serde(default)]
-    docs: Option<String>,
-    #[serde(rename = "stdDocs", default)]
-    std_docs: Option<String>,
-    #[serde(default)]
-    notes: Option<String>,
-    #[serde(default)]
-    src: Option<ZigArtifact>,
-    #[serde(default)]
-    bootstrap: Option<ZigArtifact>,
+    version: Option<String>,
     #[serde(flatten)]
-    targets: HashMap<String, ZigArtifact>,
+    targets: HashMap<String, Value>,
 }
 
 fn zig_releases(ctx: &Ctx) -> Result<HashMap<String, ZigRelease>> {
@@ -66,7 +55,8 @@ pub fn zig_latest(ctx: &Ctx) -> Result<Version> {
         if name == "master" {
             continue;
         }
-        let Some(version) = Version::parse_loose(&release.version) else {
+        let raw_version = release.version.as_deref().unwrap_or(&name);
+        let Some(version) = Version::parse_loose(raw_version) else {
             continue;
         };
         if version.pre.is_some() {
@@ -85,14 +75,17 @@ pub fn zig_pick_asset(ctx: &Ctx, want: &Version) -> Result<ZigArtifact> {
         if name == "master" {
             continue;
         }
-        let Some(version) = Version::parse_loose(&release.version) else {
+        let raw_version = release.version.as_deref().unwrap_or(&name);
+        let Some(version) = Version::parse_loose(raw_version) else {
             continue;
         };
         if &version != want || version.pre.is_some() {
             continue;
         }
         if let Some(asset) = release.targets.get(target) {
-            return Ok(asset.clone());
+            let artifact = serde_json::from_value(asset.clone())
+                .with_context(|| format!("parse Zig artifact for target {target}"))?;
+            return Ok(artifact);
         }
         bail!(
             "no Zig artifact found for {} target {}",
@@ -113,7 +106,15 @@ pub fn check_zig(ctx: &Ctx) -> Result<ToolReport> {
     }
     .and_then(|out| Version::parse_loose(&out));
 
-    let latest = zig_latest(ctx).ok();
+    let mut notes =
+        vec!["Uses official ziglang.org stable release index and checks shasum.".into()];
+    let latest = match zig_latest(ctx) {
+        Ok(version) => Some(version),
+        Err(err) => {
+            notes.push(format!("Latest check failed: {err}"));
+            None
+        }
+    };
     let status = Status::from_versions(installed.as_ref(), latest.as_ref());
 
     Ok(ToolReport {
@@ -122,7 +123,7 @@ pub fn check_zig(ctx: &Ctx) -> Result<ToolReport> {
         latest,
         status,
         method: UpdateMethod::DirectDownload,
-        notes: vec!["Uses official ziglang.org stable release index and checks shasum.".into()],
+        notes,
     })
 }
 
