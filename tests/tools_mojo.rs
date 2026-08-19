@@ -95,7 +95,7 @@ fn update_mojo_falls_back_to_uv() {
     set_which("uv", Some(PathBuf::from("/bin/uv")));
     set_run_output(
         "uv",
-        &["pip", "install", "--upgrade", "mojo"],
+        &["pip", "install", "--system", "--upgrade", "mojo"],
         output_with_status(0, b"", b""),
     );
     let page = releases_page("1.0.0");

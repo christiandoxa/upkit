@@ -131,7 +131,7 @@ upkit update mojo
 ```
 
 Mojo updates use `pixi update mojo` for Pixi projects, or
-`uv pip install --upgrade mojo` otherwise. See the [official Mojo install
+`uv pip install --system --upgrade mojo` otherwise. See the [official Mojo install
 docs](https://mojolang.org/install/).
 
 Clean managed installs and symlinks:

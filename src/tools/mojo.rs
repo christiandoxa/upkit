@@ -3,13 +3,13 @@ use regex::Regex;
 
 use crate::{
     Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, http_get_text, info, run_capture,
-    run_status, which_or_none,
+    which_or_none,
 };
 
 const MOJO_RELEASES_URL: &str = "https://mojolang.org/releases/";
 const PIXI_ADD_ARGS: &[&str] = &["add", "mojo"];
 const PIXI_UPDATE_ARGS: &[&str] = &["update", "mojo"];
-const UV_INSTALL_ARGS: &[&str] = &["pip", "install", "--upgrade", "mojo"];
+const UV_INSTALL_ARGS: &[&str] = &["pip", "install", "--system", "--upgrade", "mojo"];
 const PIP_INSTALL_ARGS: &[&str] = &["install", "--upgrade", "mojo"];
 
 pub fn mojo_latest(ctx: &Ctx) -> Result<Version> {
@@ -92,11 +92,8 @@ pub fn update_mojo(ctx: &Ctx) -> Result<()> {
         return Ok(());
     }
 
-    let status = run_status(program, args)
+    run_capture(program, args)
         .with_context(|| format!("failed to run {program} update command"))?;
-    if !status.success() {
-        bail!("{program} Mojo update failed");
-    }
     info(ctx, "mojo updated");
     Ok(())
 }
