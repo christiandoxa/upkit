@@ -9,7 +9,7 @@ pub enum ToolKind {
     Node,
     Python,
     Flutter,
-    Zig,
+    Mojo,
 }
 
 impl ToolKind {
@@ -20,7 +20,7 @@ impl ToolKind {
             ToolKind::Node,
             ToolKind::Python,
             ToolKind::Flutter,
-            ToolKind::Zig,
+            ToolKind::Mojo,
         ]
     }
 
@@ -31,7 +31,7 @@ impl ToolKind {
             ToolKind::Node => "node",
             ToolKind::Python => "python",
             ToolKind::Flutter => "flutter",
-            ToolKind::Zig => "zig",
+            ToolKind::Mojo => "mojo",
         }
     }
 }
@@ -102,9 +102,10 @@ pub struct Version {
 impl Version {
     pub fn parse_loose(s: &str) -> Option<Self> {
         // Accept: "1.2.3", "v1.2.3", "go1.22.5", "rustc 1.85.0", "3.22.1-foo"
-        let re =
-            Regex::new(r"(?i)(?:go|v|rustc\s+)?(\d+)\.(\d+)\.(\d+)(?:[-+~._]([0-9A-Za-z.-]+))?")
-                .ok()?;
+        let re = Regex::new(
+            r"(?i)(?:go|v|rustc\s+)?(\d+)\.(\d+)\.(\d+)(?:[-+~._]?([0-9A-Za-z][0-9A-Za-z.-]*))?",
+        )
+        .ok()?;
         let caps = re.captures(s)?;
         let major = caps.get(1)?.as_str().parse().ok()?;
         let minor = caps.get(2)?.as_str().parse().ok()?;
@@ -128,12 +129,17 @@ impl Version {
 
 impl Ord for Version {
     fn cmp(&self, other: &Self) -> Ordering {
-        (self.major, self.minor, self.patch, &self.pre).cmp(&(
-            other.major,
-            other.minor,
-            other.patch,
-            &other.pre,
-        ))
+        let base =
+            (self.major, self.minor, self.patch).cmp(&(other.major, other.minor, other.patch));
+        if base != Ordering::Equal {
+            return base;
+        }
+        match (&self.pre, &other.pre) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (Some(a), Some(b)) => a.cmp(b),
+        }
     }
 }
 impl PartialOrd for Version {

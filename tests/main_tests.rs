@@ -40,6 +40,8 @@ fn version_parse_and_order() {
     assert_eq!(v.to_string(), "1.2.3-beta");
     assert!(Version::parse_loose("go1.2.3").is_some());
     assert!(Version::parse_loose("rustc 1.2.3").is_some());
+    let mojo_beta = Version::parse_loose("mojo 1.0.0b2").expect("parse Mojo beta");
+    assert!(mojo_beta < Version::parse_loose("1.0.0").unwrap());
     assert!(Version::parse_loose("bad").is_none());
 
     let a = Version::parse_loose("1.2.3").unwrap();
@@ -51,19 +53,16 @@ fn version_parse_and_order() {
 fn toolkind_helpers() {
     let all = ToolKind::all();
     assert!(all.contains(&ToolKind::Go));
-    assert!(all.contains(&ToolKind::Zig));
+    assert!(all.contains(&ToolKind::Mojo));
     assert_eq!(ToolKind::Python.as_str(), "python");
-    assert_eq!(ToolKind::Zig.as_str(), "zig");
+    assert_eq!(ToolKind::Mojo.as_str(), "mojo");
     assert_eq!(select_kinds(Some(ToolKind::Rust)), vec![ToolKind::Rust]);
     assert_eq!(select_kinds(None).len(), 6);
     assert!(matches!(
         tool_method(ToolKind::Go),
         UpdateMethod::DirectDownload
     ));
-    assert!(matches!(
-        tool_method(ToolKind::Zig),
-        UpdateMethod::DirectDownload
-    ));
+    assert!(matches!(tool_method(ToolKind::Mojo), UpdateMethod::BuiltIn));
     assert_eq!(tool_bin_names(ToolKind::Go), &["go", "gofmt"]);
 }
 
@@ -646,7 +645,7 @@ fn run_doctor_variants() {
     set_which("node", None);
     set_which("python3", None);
     set_which("flutter", None);
-    set_which("zig", None);
+    set_which("mojo", None);
     set_http_plan("https://example.com", vec![Err("no".to_string())]);
     let err = run_doctor(&ctx, false).unwrap_err();
     assert!(err.to_string().contains("doctor found"));
@@ -660,7 +659,7 @@ fn run_doctor_variants() {
     set_which("node", Some(std::path::PathBuf::from("/bin/node")));
     set_which("python3", Some(std::path::PathBuf::from("/bin/python3")));
     set_which("flutter", Some(std::path::PathBuf::from("/bin/flutter")));
-    set_which("zig", Some(std::path::PathBuf::from("/bin/zig")));
+    set_which("mojo", Some(std::path::PathBuf::from("/bin/mojo")));
     run_doctor(&ctx, true).unwrap();
 }
 
@@ -1109,7 +1108,7 @@ fn tool_routing_and_safe_errors() {
     set_which("python3", None);
     set_which("python", None);
     set_which("flutter", None);
-    set_which("zig", None);
+    set_which("mojo", None);
 
     for tool in ToolKind::all() {
         let _ = check_tool(&ctx, tool);
@@ -1147,7 +1146,6 @@ fn colorize_and_tool_bins_variants() {
         tool_bin_names(ToolKind::Flutter),
         &["flutter", "dart", "pub"]
     );
-    assert_eq!(tool_bin_names(ToolKind::Zig), &["zig"]);
 }
 
 #[test]
@@ -1251,7 +1249,7 @@ fn run_doctor_no_issues_and_errors() {
     set_which("node", Some(std::path::PathBuf::from("/bin/node")));
     set_which("python3", Some(std::path::PathBuf::from("/bin/python3")));
     set_which("flutter", Some(std::path::PathBuf::from("/bin/flutter")));
-    set_which("zig", Some(std::path::PathBuf::from("/bin/zig")));
+    set_which("mojo", Some(std::path::PathBuf::from("/bin/mojo")));
     ctx.offline = true;
     run_doctor(&ctx, false).unwrap();
 
@@ -1271,7 +1269,7 @@ fn run_doctor_no_issues_and_errors() {
     set_which("node", None);
     set_which("python3", None);
     set_which("flutter", None);
-    set_which("zig", None);
+    set_which("mojo", None);
     assert!(run_doctor(&bad_ctx, false).is_err());
 }
 
@@ -1334,7 +1332,7 @@ fn run_doctor_and_self_update_with_spinners() {
     set_which("node", Some(std::path::PathBuf::from("/bin/node")));
     set_which("python3", Some(std::path::PathBuf::from("/bin/python3")));
     set_which("flutter", Some(std::path::PathBuf::from("/bin/flutter")));
-    set_which("zig", Some(std::path::PathBuf::from("/bin/zig")));
+    set_which("mojo", Some(std::path::PathBuf::from("/bin/mojo")));
     run(&cli, &mut ctx).unwrap();
 
     let cli = Cli::parse_from(["upkit", "-y", "self-update"]);
@@ -1562,7 +1560,7 @@ fn run_doctor_metadata_ok() {
     set_which("node", Some(std::path::PathBuf::from("/bin/node")));
     set_which("python3", Some(std::path::PathBuf::from("/bin/python3")));
     set_which("flutter", Some(std::path::PathBuf::from("/bin/flutter")));
-    set_which("zig", Some(std::path::PathBuf::from("/bin/zig")));
+    set_which("mojo", Some(std::path::PathBuf::from("/bin/mojo")));
     let prompt = Arc::new(TestPrompt::default());
     let mut ctx = base_ctx(home, bindir, prompt);
     ctx.offline = true;
@@ -1638,7 +1636,7 @@ fn run_doctor_writable_paths_coverage() {
     set_which("node", Some(std::path::PathBuf::from("/bin/node")));
     set_which("python3", Some(std::path::PathBuf::from("/bin/python3")));
     set_which("flutter", Some(std::path::PathBuf::from("/bin/flutter")));
-    set_which("zig", Some(std::path::PathBuf::from("/bin/zig")));
+    set_which("mojo", Some(std::path::PathBuf::from("/bin/mojo")));
     let prompt = Arc::new(TestPrompt::default());
     let mut ctx = base_ctx(home, bindir, prompt);
     ctx.offline = true;

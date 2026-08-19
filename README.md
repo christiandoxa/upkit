@@ -2,7 +2,7 @@
 
 ![Coverage](https://github.com/christiandoxa/upkit/actions/workflows/coverage.yml/badge.svg)
 
-One CLI to check and update Go, Rust, Node, Python, Flutter, and Zig toolchains.
+One CLI to check and update Go, Rust, Node, Python, Flutter, and Mojo toolchains.
 
 ## Features
 
@@ -59,7 +59,7 @@ Full help output:
 
 ```bash
 $ upkit help
-Check and update Go/Rust/Node/Python/Flutter/Zig
+Check and update Go/Rust/Node/Python/Flutter/Mojo
 
 Usage: upkit [OPTIONS] [COMMAND]
 
@@ -86,7 +86,7 @@ Options:
       --offline            Disable network access (skip latest checks and downloads)
       --timeout <TIMEOUT>  Network timeout in seconds [default: 60]
       --retries <RETRIES>  Retry failed network requests this many times [default: 2]
-      --only <ONLY>        Limit which tools to operate on [possible values: go, rust, node, python, flutter, zig]
+      --only <ONLY>        Limit which tools to operate on [possible values: go, rust, node, python, flutter, mojo]
       --home <HOME>        Where upkit stores tool installs (default: ~/.local/share/upkit)
       --bindir <BINDIR>    Where upkit places symlinks (default: ~/.local/bin)
   -h, --help               Print help
@@ -127,8 +127,12 @@ upkit update rust
 upkit update node
 upkit update python
 upkit update flutter
-upkit update zig
+upkit update mojo
 ```
+
+Mojo updates use `pixi update mojo` for Pixi projects, or
+`uv pip install --upgrade mojo` otherwise. See the [official Mojo install
+docs](https://mojolang.org/install/).
 
 Clean managed installs and symlinks:
 
