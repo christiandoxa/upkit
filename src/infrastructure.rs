@@ -1411,7 +1411,7 @@ pub fn tool_bin_names(tool: ToolKind) -> &'static [&'static str] {
         ToolKind::Python => &["python", "python3", "pip", "pip3"],
         ToolKind::Flutter => &["flutter", "dart", "pub"],
         ToolKind::Rust => &[],
-        ToolKind::Mojo => &[],
+        ToolKind::Mojo => &["mojo"],
     }
 }
 

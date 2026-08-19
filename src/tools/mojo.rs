@@ -1,9 +1,10 @@
 use anyhow::{Context, Result, anyhow, bail};
 use regex::Regex;
+use std::fs;
 
 use crate::{
-    Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, http_get_text, info, run_capture,
-    which_or_none,
+    Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, http_get_text, info, link_dir_bins,
+    run_capture, which_or_none,
 };
 
 const MOJO_RELEASES_URL: &str = "https://mojolang.org/releases/";
@@ -94,6 +95,22 @@ pub fn update_mojo(ctx: &Ctx) -> Result<()> {
 
     run_capture(program, args)
         .with_context(|| format!("failed to run {program} update command"))?;
+    if matches!(program, "uv" | "pip" | "pip3") {
+        link_mojo_binary(ctx)?;
+    }
     info(ctx, "mojo updated");
     Ok(())
+}
+
+fn link_mojo_binary(ctx: &Ctx) -> Result<()> {
+    let Some(python) = which_or_none("python3").or_else(|| which_or_none("python")) else {
+        return Ok(());
+    };
+    let Ok(python) = fs::canonicalize(python) else {
+        return Ok(());
+    };
+    let Some(bin_dir) = python.parent() else {
+        return Ok(());
+    };
+    link_dir_bins(bin_dir, &ctx.bindir, &["mojo"])
 }

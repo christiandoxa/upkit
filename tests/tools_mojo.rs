@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -84,7 +85,13 @@ fn update_mojo_uses_pixi() {
 #[test]
 fn update_mojo_falls_back_to_uv() {
     let _guard = reset_guard();
-    let (ctx, _dir) = ctx_with_dirs();
+    let (ctx, dir) = ctx_with_dirs();
+    fs::create_dir_all(&ctx.bindir).unwrap();
+    let python_bin = dir.path().join("python-bin");
+    fs::create_dir_all(&python_bin).unwrap();
+    fs::write(python_bin.join("python3"), b"").unwrap();
+    fs::write(python_bin.join("mojo"), b"").unwrap();
+    set_which("python3", Some(python_bin.join("python3")));
     set_which("mojo", Some(PathBuf::from("/bin/mojo")));
     set_run_output(
         "mojo",
@@ -104,4 +111,5 @@ fn update_mojo_falls_back_to_uv() {
         vec![Ok(MockResponse::new(page.into_bytes(), None))],
     );
     update_mojo(&ctx).unwrap();
+    assert!(ctx.bindir.join("mojo").exists());
 }

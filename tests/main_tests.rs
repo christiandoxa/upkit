@@ -1146,6 +1146,7 @@ fn colorize_and_tool_bins_variants() {
         tool_bin_names(ToolKind::Flutter),
         &["flutter", "dart", "pub"]
     );
+    assert_eq!(tool_bin_names(ToolKind::Mojo), &["mojo"]);
 }
 
 #[test]
