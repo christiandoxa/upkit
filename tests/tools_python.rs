@@ -115,6 +115,22 @@ fn python_latest_falls_back_to_expanded_assets_html() {
     );
 
     let v = python_latest(&ctx).unwrap();
+    assert_eq!(v.to_string(), "3.15.0-b1");
+}
+
+#[test]
+fn python_latest_prefers_stable_over_prerelease() {
+    let _guard = reset_guard();
+    let (mut ctx, _dir) = ctx_with_dirs();
+    ctx.os = "linux".into();
+    ctx.arch = "x86_64".into();
+    let url = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest";
+    let json = r#"{"tag_name":"v3.15.0","assets":[{"name":"cpython-3.15.0rc1+20260801-x86_64-unknown-linux-gnu.tar.zst","browser_download_url":"https://example.com/python-rc.tar.zst"},{"name":"cpython-3.15.0+20260815-x86_64-unknown-linux-gnu.tar.zst","browser_download_url":"https://example.com/python.tar.zst"}]}"#;
+    set_http_plan(
+        url,
+        vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
+    );
+    let v = python_latest(&ctx).unwrap();
     assert_eq!(v.to_string(), "3.15.0");
 }
 
@@ -147,7 +163,7 @@ fn python_pick_asset_falls_back_to_expanded_assets_html() {
         major: 3,
         minor: 15,
         patch: 0,
-        pre: None,
+        pre: Some("b1".to_string()),
     };
     let asset = python_pick_asset(&ctx, &want).unwrap();
     assert!(asset.name.starts_with("cpython-3.15.0b1+20260510"));

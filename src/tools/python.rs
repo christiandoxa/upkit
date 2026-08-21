@@ -28,6 +28,8 @@ pub struct GhAsset {
 }
 
 const PIP_GLOBALS_SNAPSHOT: &str = "pip-globals.txt";
+const PYTHON_ASSET_VERSION_RE: &str =
+    r"^cpython-(\d+)\.(\d+)\.(\d+)([A-Za-z][0-9A-Za-z.-]*)?(?:\+[^-]+)?-[A-Za-z0-9_+-]+\.tar\.zst$";
 const PYTHON_RELEASES_LATEST_URL: &str =
     "https://github.com/astral-sh/python-build-standalone/releases/latest";
 const PYTHON_RELEASES_API_URL: &str =
@@ -96,7 +98,7 @@ pub fn python_latest(ctx: &Ctx) -> Result<Version> {
     let rel = python_release_assets(ctx)?;
 
     let target = python_target(ctx)?;
-    let re = Regex::new(r"^cpython-(\d+)\.(\d+)\.(\d+).*-([A-Za-z0-9_+-]+)\.tar\.zst$")?;
+    let re = Regex::new(PYTHON_ASSET_VERSION_RE)?;
 
     let mut best: Option<Version> = None;
     for a in &rel.assets {
@@ -106,13 +108,7 @@ pub fn python_latest(ctx: &Ctx) -> Result<Version> {
         if !a.name.contains(target) {
             continue;
         }
-        if let Some(c) = re.captures(&a.name) {
-            let v = Version {
-                major: c[1].parse()?,
-                minor: c[2].parse()?,
-                patch: c[3].parse()?,
-                pre: None,
-            };
+        if let Some(v) = python_asset_version(&re, &a.name) {
             keep_latest_version(&mut best, v);
         }
     }
@@ -129,14 +125,13 @@ pub fn python_pick_asset(ctx: &Ctx, want: &Version) -> Result<GhAsset> {
     let rel = python_release_assets(ctx)?;
 
     let target = python_target(ctx)?;
-    // Prefer smaller runtime installs, then optimized non-debug builds.
-    let want_prefix = format!("cpython-{}.{}.{}", want.major, want.minor, want.patch);
+    let re = Regex::new(PYTHON_ASSET_VERSION_RE)?;
 
     let mut candidates = rel
         .assets
         .into_iter()
         .filter(|a| {
-            a.name.starts_with(&want_prefix)
+            python_asset_matches(&re, &a.name, want)
                 && a.name.contains(target)
                 && a.name.ends_with(".tar.zst")
         })
@@ -148,6 +143,24 @@ pub fn python_pick_asset(ctx: &Ctx, want: &Version) -> Result<GhAsset> {
         .into_iter()
         .next()
         .ok_or_else(|| anyhow!("no python asset found for {}", want.to_string()))
+}
+
+fn python_asset_version(re: &Regex, name: &str) -> Option<Version> {
+    let captures = re.captures(name)?;
+    Some(Version {
+        major: captures.get(1)?.as_str().parse().ok()?,
+        minor: captures.get(2)?.as_str().parse().ok()?,
+        patch: captures.get(3)?.as_str().parse().ok()?,
+        pre: captures.get(4).map(|value| value.as_str().to_string()),
+    })
+}
+
+fn python_asset_matches(re: &Regex, name: &str, want: &Version) -> bool {
+    let Some(version) = python_asset_version(re, name) else {
+        return false;
+    };
+    (version.major, version.minor, version.patch) == (want.major, want.minor, want.patch)
+        && (want.pre.is_none() || version.pre.as_deref() == want.pre.as_deref())
 }
 
 fn python_asset_priority(name: &str) -> u8 {
