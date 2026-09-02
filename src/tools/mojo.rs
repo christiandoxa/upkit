@@ -1,6 +1,9 @@
 use anyhow::{Context, Result, anyhow, bail};
 use regex::Regex;
-use std::fs;
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 use crate::{
     Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, http_get_text, info, link_dir_bins,
@@ -65,21 +68,22 @@ pub fn update_mojo(ctx: &Ctx) -> Result<()> {
         return Ok(());
     }
 
-    let (program, args): (&str, &[&str]) = if which_or_none("pixi").is_some() {
-        if report.installed.is_some() {
-            ("pixi", PIXI_UPDATE_ARGS)
+    let (program, args): (&str, &[&str]) =
+        if which_or_none("pixi").is_some() && pixi_project_dir().is_some() {
+            if report.installed.is_some() {
+                ("pixi", PIXI_UPDATE_ARGS)
+            } else {
+                ("pixi", PIXI_ADD_ARGS)
+            }
+        } else if which_or_none("uv").is_some() {
+            ("uv", UV_INSTALL_ARGS)
+        } else if which_or_none("pip3").is_some() {
+            ("pip3", PIP_INSTALL_ARGS)
+        } else if which_or_none("pip").is_some() {
+            ("pip", PIP_INSTALL_ARGS)
         } else {
-            ("pixi", PIXI_ADD_ARGS)
-        }
-    } else if which_or_none("uv").is_some() {
-        ("uv", UV_INSTALL_ARGS)
-    } else if which_or_none("pip3").is_some() {
-        ("pip3", PIP_INSTALL_ARGS)
-    } else if which_or_none("pip").is_some() {
-        ("pip", PIP_INSTALL_ARGS)
-    } else {
-        bail!("Mojo update requires pixi, uv, or pip; see https://mojolang.org/install/");
-    };
+            bail!("Mojo update requires pixi, uv, or pip; see https://mojolang.org/install/");
+        };
 
     info(
         ctx,
@@ -102,6 +106,35 @@ pub fn update_mojo(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+fn pixi_project_dir() -> Option<PathBuf> {
+    env::current_dir()
+        .ok()
+        .and_then(|cwd| find_pixi_project(&cwd))
+}
+
+fn find_pixi_project(start: &Path) -> Option<PathBuf> {
+    let mut dir = Some(start);
+    while let Some(path) = dir {
+        if path.join("pixi.toml").is_file() || is_pixi_pyproject(&path.join("pyproject.toml")) {
+            return Some(path.to_path_buf());
+        }
+        dir = path.parent();
+    }
+    None
+}
+
+fn is_pixi_pyproject(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| toml::from_str::<toml::Value>(&text).ok())
+        .is_some_and(|value| {
+            value
+                .get("tool")
+                .and_then(|tool| tool.get("pixi"))
+                .is_some()
+        })
+}
+
 fn link_mojo_binary(ctx: &Ctx) -> Result<()> {
     let Some(python) = which_or_none("python3").or_else(|| which_or_none("python")) else {
         return Ok(());
@@ -113,4 +146,30 @@ fn link_mojo_binary(ctx: &Ctx) -> Result<()> {
         return Ok(());
     };
     link_dir_bins(bin_dir, &ctx.bindir, &["mojo"])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_pixi_project;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn finds_pixi_manifests_in_parent_directories() {
+        let dir = tempdir().unwrap();
+        let nested = dir.path().join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        assert!(find_pixi_project(&nested).is_none());
+
+        fs::write(dir.path().join("pixi.toml"), "[workspace]\n").unwrap();
+        assert_eq!(find_pixi_project(&nested).as_deref(), Some(dir.path()));
+
+        fs::remove_file(dir.path().join("pixi.toml")).unwrap();
+        fs::write(
+            dir.path().join("pyproject.toml"),
+            "[tool.pixi.workspace]\nchannels = [\"conda-forge\"]\n",
+        )
+        .unwrap();
+        assert_eq!(find_pixi_project(&nested).as_deref(), Some(dir.path()));
+    }
 }

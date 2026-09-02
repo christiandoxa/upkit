@@ -63,7 +63,7 @@ fn mojo_check_not_installed() {
 }
 
 #[test]
-fn update_mojo_uses_pixi() {
+fn update_mojo_skips_pixi_outside_project() {
     let _guard = reset_guard();
     let (ctx, _dir) = ctx_with_dirs();
     set_which("mojo", Some(PathBuf::from("/bin/mojo")));
@@ -73,7 +73,14 @@ fn update_mojo_uses_pixi() {
         output_with_status(0, b"mojo 0.26.2", b""),
     );
     set_which("pixi", Some(PathBuf::from("/bin/pixi")));
-    set_run_output("pixi", &["update", "mojo"], output_with_status(0, b"", b""));
+    set_which("uv", Some(PathBuf::from("/bin/uv")));
+    set_which("python3", None);
+    set_which("python", None);
+    set_run_output(
+        "uv",
+        &["pip", "install", "--system", "--upgrade", "mojo"],
+        output_with_status(0, b"", b""),
+    );
     let page = releases_page("1.0.0");
     set_http_plan(
         RELEASES_URL,
