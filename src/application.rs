@@ -890,7 +890,10 @@ pub fn run_self_update(ctx: &Ctx, json: bool) -> Result<()> {
         return Err(anyhow!("non-interactive mode: use --yes to proceed"));
     }
     let install_via_npm = matches!(get_env_var("UPKIT_INSTALLER").as_deref(), Some("npm"));
-    let exe = env::current_exe().context("locate the running upkit binary")?;
+    let exe = env::current_exe()
+        .context("locate the running upkit binary")?
+        .canonicalize()
+        .context("resolve the running upkit binary")?;
     let exe_dir = exe.parent().context("locate the upkit install directory")?;
     let cargo_home = get_env_var("CARGO_HOME")
         .map(PathBuf::from)

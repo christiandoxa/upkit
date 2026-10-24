@@ -92,6 +92,27 @@ jobs:
           else
             cargo build --release --locked --target "$TARGET"
           fi
+      - name: Verify standalone libraries
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          binary="target/$TARGET/release/upkit"
+          if [ "$RUNNER_OS" = Linux ]; then
+            libraries="$(readelf -d "$binary")"
+            if printf '%s\n' "$libraries" | grep -E 'NEEDED.*(liblzma|libzstd)'; then
+              echo 'Compression libraries must be linked statically' >&2
+              exit 1
+            fi
+          else
+            libraries="$(otool -L "$binary" | awk 'NR > 1 {print $1}')"
+            if printf '%s\n' "$libraries" | grep -Ev '^(/usr/lib/|/System/Library/)'; then
+              echo 'Standalone binaries must only link macOS system libraries' >&2
+              exit 1
+            fi
+          fi
       - name: Verify native binary
         if: matrix.target != 'aarch64-unknown-linux-gnu'
         shell: bash
