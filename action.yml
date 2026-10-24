@@ -20,7 +20,7 @@ inputs:
   node-version:
     description: Node.js version used for npm install.
     required: false
-    default: "22"
+    default: "26.12.1"
 
 outputs:
   version:
@@ -37,9 +37,10 @@ runs:
   using: composite
   steps:
     - name: Install Node.js
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@v7.1.0
       with:
         node-version: ${{ inputs.node-version }}
+        package-manager-cache: false
 
     - name: Install upkit
       id: install
@@ -81,7 +82,8 @@ runs:
 
         printf '%s\n' "$bin_dir" >> "$GITHUB_PATH"
 
-        installed_version="$(upkit --version)"
+        installed_version="$("$bin_dir/upkit" --version)"
+        installed_version="${installed_version#upkit }"
         printf 'version=%s\n' "$installed_version" >> "$GITHUB_OUTPUT"
         printf 'bin_dir=%s\n' "$bin_dir" >> "$GITHUB_OUTPUT"
         printf 'package_spec=%s\n' "$package_spec" >> "$GITHUB_OUTPUT"

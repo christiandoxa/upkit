@@ -1,7 +1,7 @@
 {
   "name": "upkit-workspace",
   "private": true,
-  "packageManager": "npm@11.12.1",
+  "packageManager": "npm@12.2.1",
   "workspaces": [
     "npm/upkit",
     "npm/platforms/*"
