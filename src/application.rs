@@ -977,11 +977,13 @@ pub fn run_self_update(ctx: &Ctx, json: bool) -> Result<()> {
     }
     if via == "github" {
         let windows = ctx.os == "windows";
-        let installer = tempfile::Builder::new()
-            .suffix(if windows { ".ps1" } else { ".sh" })
-            .tempfile()?;
+        let installer = tempfile::tempdir()?;
+        let installer_path =
+            installer
+                .path()
+                .join(if windows { "install.ps1" } else { "install.sh" });
         fs::write(
-            installer.path(),
+            &installer_path,
             if windows {
                 include_str!("../install.ps1")
             } else {
@@ -995,7 +997,7 @@ pub fn run_self_update(ctx: &Ctx, json: bool) -> Result<()> {
         } else {
             Vec::new()
         };
-        args.push(installer.path().as_os_str().to_owned());
+        args.push(installer_path.into_os_string());
         args.push(
             if windows {
                 "-InstallDir"
@@ -1007,7 +1009,8 @@ pub fn run_self_update(ctx: &Ctx, json: bool) -> Result<()> {
         args.push(exe_dir.as_os_str().to_owned());
         args.push(if windows { "-Release" } else { "--release" }.into());
         args.push("latest".into());
-        run_capture(OsString::from(program), &args).context("GitHub self-update failed")?;
+        run_capture(OsString::from(program), &args)
+            .map_err(|err| anyhow!("GitHub self-update failed: {err:#}"))?;
     } else {
         let status = run_status(program, &args).context("failed to run self-update command")?;
         if !status.success() {
