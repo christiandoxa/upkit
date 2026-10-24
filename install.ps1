@@ -60,7 +60,13 @@ try {
         if ($_ -cmatch $pattern) { $Matches[1].ToLowerInvariant() }
     })
     if ($digests.Count -ne 1) { throw "Missing or invalid SHA256SUMS entry for $asset" }
-    if ((Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash.ToLowerInvariant() -cne $digests[0]) {
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $actualDigest = [BitConverter]::ToString($sha256.ComputeHash([System.IO.File]::ReadAllBytes($download))).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $sha256.Dispose()
+    }
+    if ($actualDigest -cne $digests[0]) {
         throw "SHA256 mismatch for $asset"
     }
     $version = (& $download --version | Out-String).Trim()
