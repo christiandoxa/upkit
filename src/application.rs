@@ -3,7 +3,9 @@ use clap::{CommandFactory, Parser, Subcommand};
 use reqwest::{Certificate, blocking::Client};
 use std::process::ExitCode;
 use std::{
-    env, fs, io,
+    env,
+    ffi::OsString,
+    fs, io,
     io::IsTerminal,
     path::PathBuf,
     sync::mpsc,
@@ -15,8 +17,8 @@ use crate::domain::{Status, ToolKind, ToolReport, UpdateMethod};
 use crate::infrastructure::{
     Ctx, DialoguerPrompt, data_local_dir, debug, emit_json, ensure_required_paths, error,
     finish_spinner, get_env_var, home_dir, http_get_text, info, maybe_path_hint, print_json_error,
-    print_reports, progress_allowed, remove_path_hint_for_label, reports_to_json, run_status,
-    start_spinner, tool_bin_names, tool_path_hint_labels, warn, which_or_none,
+    print_reports, progress_allowed, remove_path_hint_for_label, reports_to_json, run_capture,
+    run_status, start_spinner, tool_bin_names, tool_path_hint_labels, warn, which_or_none,
 };
 use crate::{test_support, tools};
 
@@ -888,6 +890,15 @@ pub fn run_self_update(ctx: &Ctx, json: bool) -> Result<()> {
         return Err(anyhow!("non-interactive mode: use --yes to proceed"));
     }
     let install_via_npm = matches!(get_env_var("UPKIT_INSTALLER").as_deref(), Some("npm"));
+    let exe = env::current_exe().context("locate the running upkit binary")?;
+    let exe_dir = exe.parent().context("locate the upkit install directory")?;
+    let cargo_home = get_env_var("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(".cargo")));
+    let install_via_cargo = matches!(get_env_var("UPKIT_INSTALLER").as_deref(), Some("cargo"))
+        || cargo_home
+            .and_then(|home| home.join("bin").canonicalize().ok())
+            .is_some_and(|bin| exe_dir == bin);
     let package_name = get_env_var("UPKIT_NPM_PACKAGE_NAME")
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "@christiandoxa/upkit".to_string());
@@ -907,7 +918,7 @@ pub fn run_self_update(ctx: &Ctx, json: bool) -> Result<()> {
             command,
             "npm",
         )
-    } else {
+    } else if install_via_cargo {
         if which_or_none("cargo").is_none() {
             bail!("cargo not found in PATH; reinstall manually");
         }
@@ -921,6 +932,26 @@ pub fn run_self_update(ctx: &Ctx, json: bool) -> Result<()> {
             "Update upkit via cargo install --force upkit?".to_string(),
             "cargo install --force upkit".to_string(),
             "cargo",
+        )
+    } else {
+        let program = if ctx.os == "windows" {
+            if which_or_none("pwsh").is_some() {
+                "pwsh"
+            } else {
+                "powershell"
+            }
+        } else {
+            "sh"
+        };
+        if which_or_none(program).is_none() {
+            bail!("{program} not found in PATH; reinstall manually");
+        }
+        (
+            program.to_string(),
+            Vec::new(),
+            "Update upkit from GitHub Releases?".to_string(),
+            format!("install latest GitHub release into {}", exe_dir.display()),
+            "github",
         )
     };
     if !ctx.yes {
@@ -944,9 +975,44 @@ pub fn run_self_update(ctx: &Ctx, json: bool) -> Result<()> {
         }
         return Ok(());
     }
-    let status = run_status(program, &args).context("failed to run self-update command")?;
-    if !status.success() {
-        bail!("self-update failed");
+    if via == "github" {
+        let windows = ctx.os == "windows";
+        let installer = tempfile::Builder::new()
+            .suffix(if windows { ".ps1" } else { ".sh" })
+            .tempfile()?;
+        fs::write(
+            installer.path(),
+            if windows {
+                include_str!("../install.ps1")
+            } else {
+                include_str!("../install.sh")
+            },
+        )?;
+        let mut args: Vec<OsString> = if windows {
+            ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]
+                .map(OsString::from)
+                .to_vec()
+        } else {
+            Vec::new()
+        };
+        args.push(installer.path().as_os_str().to_owned());
+        args.push(
+            if windows {
+                "-InstallDir"
+            } else {
+                "--install-dir"
+            }
+            .into(),
+        );
+        args.push(exe_dir.as_os_str().to_owned());
+        args.push(if windows { "-Release" } else { "--release" }.into());
+        args.push("latest".into());
+        run_capture(OsString::from(program), &args).context("GitHub self-update failed")?;
+    } else {
+        let status = run_status(program, &args).context("failed to run self-update command")?;
+        if !status.success() {
+            bail!("self-update failed");
+        }
     }
     if json {
         let payload = serde_json::json!({

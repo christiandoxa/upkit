@@ -13,39 +13,87 @@ One CLI to check and update Go, Rust, Node, Python, Flutter, and Mojo toolchains
 
 ## Install
 
-From npm:
+### Linux and macOS
+
+Install the standalone binary without Rust or Node.js:
 
 ```bash
-npm install -g @christiandoxa/upkit
+curl -fsSL https://github.com/christiandoxa/upkit/releases/latest/download/install.sh | sh
 ```
 
-The npm package installs a native `upkit` binary for the current platform.
+The installer detects x86_64 or ARM64, verifies the download against
+`SHA256SUMS`, and installs to `~/.local/bin`. If that directory is missing from
+your `PATH`, add this line to your shell profile (`~/.bashrc` or `~/.zshrc`), then
+open a new terminal:
 
-From GitHub Actions:
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+To install a specific release or choose a different directory:
+
+```bash
+curl -fsSL https://github.com/christiandoxa/upkit/releases/latest/download/install.sh |
+  sh -s -- --release v0.4.15 --install-dir "$HOME/.local/bin"
+```
+
+### Windows
+
+Run in PowerShell:
+
+```powershell
+irm https://github.com/christiandoxa/upkit/releases/latest/download/install.ps1 | iex
+```
+
+The installer detects x64 or ARM64, verifies `SHA256SUMS`, and installs to
+`%LOCALAPPDATA%\upkit\bin`. It adds that directory to your user `PATH`; open a new
+terminal if an existing terminal does not find `upkit`. Administrator access is
+not required.
+
+To choose a release or install directory, set these variables before running
+the installer:
+
+```powershell
+$env:UPKIT_RELEASE = 'v0.4.15'
+$env:UPKIT_INSTALL_DIR = "$env:LOCALAPPDATA\upkit\bin"
+irm https://github.com/christiandoxa/upkit/releases/latest/download/install.ps1 | iex
+```
+
+Standalone binaries for Linux, macOS, and Windows, each on x86_64 and ARM64, are
+also available from [GitHub Releases](https://github.com/christiandoxa/upkit/releases).
+Linux binaries target glibc-based distributions.
+
+### GitHub Actions
 
 ```yaml
-- uses: christiandoxa/upkit@main
+- uses: christiandoxa/upkit@v0.4.15
   with:
     version: latest
 
 - run: upkit check --json
 ```
 
-The action installs `@christiandoxa/upkit` from npm and adds the CLI to `PATH`.
+The action downloads a verified standalone binary from GitHub Releases and adds
+the CLI to `PATH`.
 
-From crates.io:
+### Cargo
 
 ```bash
-cargo install upkit
+cargo install upkit --locked
 ```
 
-From source:
+### From source
 
 ```bash
 git clone https://github.com/christiandoxa/upkit.git
 cd upkit
 cargo install --path .
 ```
+
+New standalone releases are published to GitHub instead of npm. If you previously
+installed with npm, remove the old package with
+`npm uninstall -g @christiandoxa/upkit`, then run the standalone installer so the
+old npm launcher does not take precedence on `PATH`.
 
 ## Usage
 
@@ -164,7 +212,9 @@ Update upkit itself:
 upkit self-update
 ```
 
-If `upkit` was installed from npm, `self-update` uses `npm install -g @christiandoxa/upkit@latest`.
+Standalone installations update from GitHub Releases, verifying the checksum
+before replacing the running binary. Cargo installations continue using Cargo.
+You can also update a standalone installation by running its installer again.
 
 Generate shell completions:
 
@@ -202,3 +252,17 @@ Override locations:
 upkit check --home ~/.local/share/upkit
 upkit check --bindir ~/.local/bin
 ```
+
+## Publishing standalone releases
+
+Set the version in `Cargo.toml`, commit the change, and push a matching tag:
+
+```bash
+git tag v0.4.15
+git push origin v0.4.15
+```
+
+The standalone release workflow checks the tag against `Cargo.toml`, runs the
+tests, builds all six targets, and publishes the binaries, `install.sh`,
+`install.ps1`, and `SHA256SUMS` to GitHub Releases. It does not publish to npm.
+For a manual rerun, select the matching version tag when running the workflow.

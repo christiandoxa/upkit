@@ -1,6 +1,6 @@
 {
   "name": "@christiandoxa/upkit-linux-x64",
-  "version": "0.4.14",
+  "version": "0.4.15",
   "description": "Native upkit binary for x86_64-unknown-linux-gnu",
   "license": "MIT OR Apache-2.0",
   "os": [

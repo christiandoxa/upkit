@@ -1,89 +1,51 @@
 name: Setup upkit
-description: Install upkit from npm and add the CLI to PATH for later workflow steps.
+description: Install a verified standalone upkit binary from GitHub Releases.
 branding:
   color: blue
   icon: package
 
 inputs:
-  package:
-    description: npm package name, tarball, folder, or URL to install.
-    required: false
-    default: "@christiandoxa/upkit"
   version:
-    description: Version to install when package points at an npm registry package.
+    description: Release version to install, or latest.
     required: false
-    default: "latest"
-  extra-packages:
-    description: Additional npm package specs to install in the same command.
-    required: false
-    default: ""
-  node-version:
-    description: Node.js version used for npm install.
-    required: false
-    default: "26.12.1"
+    default: latest
 
 outputs:
   version:
     description: Installed upkit CLI version.
-    value: ${{ steps.install.outputs.version }}
+    value: ${{ steps.unix.outputs.version || steps.windows.outputs.version }}
   bin_dir:
     description: Directory added to PATH for the upkit binary.
-    value: ${{ steps.install.outputs.bin_dir }}
-  package_spec:
-    description: Primary package spec passed to npm install.
-    value: ${{ steps.install.outputs.package_spec }}
+    value: ${{ steps.unix.outputs.bin_dir || steps.windows.outputs.bin_dir }}
 
 runs:
   using: composite
   steps:
-    - name: Install Node.js
-      uses: actions/setup-node@v7.1.0
-      with:
-        node-version: ${{ inputs.node-version }}
-        package-manager-cache: false
-
-    - name: Install upkit
-      id: install
+    - name: Install upkit on Linux or macOS
+      id: unix
+      if: runner.os != 'Windows'
       shell: bash
       env:
-        INPUT_PACKAGE: ${{ inputs.package }}
-        INPUT_VERSION: ${{ inputs.version }}
-        INPUT_EXTRA_PACKAGES: ${{ inputs.extra-packages }}
+        UPKIT_VERSION: ${{ inputs.version }}
       run: |
         set -euo pipefail
-
-        package_spec="$INPUT_PACKAGE"
-        case "$INPUT_PACKAGE" in
-          ./*|../*|/*|*://*|*.tgz|*.tar.gz)
-            ;;
-          *)
-            package_spec="${INPUT_PACKAGE}@${INPUT_VERSION:-latest}"
-            ;;
-        esac
-
-        packages=("$package_spec")
-        while IFS= read -r line; do
-          if [ -n "$line" ]; then
-            packages+=("$line")
-          fi
-        done <<< "$INPUT_EXTRA_PACKAGES"
-
-        install_prefix="${RUNNER_TEMP}/upkit-npm-global"
-        rm -rf "$install_prefix"
-        mkdir -p "$install_prefix"
-
-        npm install --global --prefix "$install_prefix" "${packages[@]}"
-
-        if [ "${RUNNER_OS}" = "Windows" ]; then
-          bin_dir="$install_prefix"
-        else
-          bin_dir="$install_prefix/bin"
-        fi
-
+        bin_dir="$RUNNER_TEMP/upkit/bin"
+        sh "$GITHUB_ACTION_PATH/install.sh" --release "$UPKIT_VERSION" --install-dir "$bin_dir"
         printf '%s\n' "$bin_dir" >> "$GITHUB_PATH"
-
-        installed_version="$("$bin_dir/upkit" --version)"
-        installed_version="${installed_version#upkit }"
-        printf 'version=%s\n' "$installed_version" >> "$GITHUB_OUTPUT"
+        version="$("$bin_dir/upkit" --version)"
+        printf 'version=%s\n' "${version#upkit }" >> "$GITHUB_OUTPUT"
         printf 'bin_dir=%s\n' "$bin_dir" >> "$GITHUB_OUTPUT"
-        printf 'package_spec=%s\n' "$package_spec" >> "$GITHUB_OUTPUT"
+    - name: Install upkit on Windows
+      id: windows
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        UPKIT_VERSION: ${{ inputs.version }}
+        UPKIT_NO_PATH_UPDATE: "1"
+      run: |
+        $binDir = Join-Path $env:RUNNER_TEMP 'upkit/bin'
+        & "$env:GITHUB_ACTION_PATH/install.ps1" -Release $env:UPKIT_VERSION -InstallDir $binDir
+        $binDir >> $env:GITHUB_PATH
+        $version = (& (Join-Path $binDir 'upkit.exe') --version) -replace '^upkit ', ''
+        "version=$version" >> $env:GITHUB_OUTPUT
+        "bin_dir=$binDir" >> $env:GITHUB_OUTPUT

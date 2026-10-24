@@ -690,6 +690,7 @@ fn run_doctor_unwritable_dirs() {
 #[test]
 fn run_self_update_paths() {
     let _guard = reset_guard();
+    set_env_var("UPKIT_INSTALLER", Some("cargo".to_string()));
     let dir = tempdir().unwrap();
     let home = dir.path().join("home");
     let bindir = dir.path().join("bin");
@@ -779,6 +780,22 @@ fn run_self_update_paths() {
     run_self_update(&ctx, false).unwrap();
     ctx.json = true;
     run_self_update(&ctx, true).unwrap();
+
+    set_env_var("UPKIT_INSTALLER", Some("standalone".to_string()));
+    ctx.dry_run = true;
+    set_which("sh", None);
+    assert!(run_self_update(&ctx, true).is_err());
+    set_which("sh", Some(std::path::PathBuf::from("/bin/sh")));
+    run_self_update(&ctx, true).unwrap();
+
+    ctx.os = "windows".into();
+    set_which("pwsh", Some(std::path::PathBuf::from("pwsh")));
+    run_self_update(&ctx, true).unwrap();
+    set_which("pwsh", None);
+    set_which("powershell", Some(std::path::PathBuf::from("powershell")));
+    run_self_update(&ctx, true).unwrap();
+    set_which("powershell", None);
+    assert!(run_self_update(&ctx, true).is_err());
 }
 
 #[test]
@@ -892,6 +909,7 @@ fn run_uninstall_prompts_for_selection() {
 #[test]
 fn run_command_doctor_version_completions_self_update() {
     let _guard = reset_guard();
+    set_env_var("UPKIT_INSTALLER", Some("cargo".to_string()));
     let dir = tempdir().unwrap();
     let home = dir.path().join("home");
     let bindir = dir.path().join("bin");
@@ -1059,6 +1077,7 @@ fn main_with_make_ctx_error_paths() {
 #[test]
 fn main_with_run_error_paths() {
     let _guard = reset_guard();
+    set_env_var("UPKIT_INSTALLER", Some("cargo".to_string()));
     set_which("cargo", None);
     let code = main_with(Cli::parse_from(["upkit", "-y", "self-update"]));
     assert_eq!(code, std::process::ExitCode::from(1));
@@ -1317,6 +1336,7 @@ fn run_update_and_clean_json_paths() {
 fn run_doctor_and_self_update_with_spinners() {
     let _env_guard = ENV_LOCK.lock().unwrap();
     let _guard = reset_guard();
+    set_env_var("UPKIT_INSTALLER", Some("cargo".to_string()));
     let dir = tempdir().unwrap();
     let home = dir.path().join("home");
     let bindir = dir.path().join("bin");
@@ -1512,6 +1532,7 @@ fn run_update_and_clean_cancel_paths() {
 #[test]
 fn run_self_update_confirm_true() {
     let _guard = reset_guard();
+    set_env_var("UPKIT_INSTALLER", Some("cargo".to_string()));
     let dir = tempdir().unwrap();
     let prompt = Arc::new(TestPrompt::default());
     prompt.push_confirm(true);

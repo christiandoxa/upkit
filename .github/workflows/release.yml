@@ -1,0 +1,151 @@
+name: Standalone release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: standalone-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Verify release tag
+        id: version
+        shell: python
+        run: |
+          import os, pathlib, tomllib
+          version = tomllib.loads(pathlib.Path("Cargo.toml").read_text())["package"]["version"]
+          if os.environ["GITHUB_REF"] != f"refs/tags/v{version}":
+              raise SystemExit(f"Run this workflow on tag v{version}, matching Cargo.toml")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"version={version}\n")
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2.9.3
+      - run: cargo fmt --check
+      - run: cargo test --locked -- --test-threads=1
+      - run: python3 tests/test_installers.py
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            cross: true
+            extension: ""
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            cross: true
+            extension: ""
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            cross: false
+            extension: ""
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            cross: false
+            extension: ""
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            cross: false
+            extension: ".exe"
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+            cross: false
+            extension: ".exe"
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          key: release-${{ matrix.target }}
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --version 0.2.5 --locked
+      - name: Build release binary
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          USE_CROSS: ${{ matrix.cross }}
+        run: |
+          set -euo pipefail
+          if [ "$USE_CROSS" = true ]; then
+            cross build --release --locked --target "$TARGET"
+          else
+            cargo build --release --locked --target "$TARGET"
+          fi
+      - name: Verify native binary
+        if: matrix.target != 'aarch64-unknown-linux-gnu'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          EXTENSION: ${{ matrix.extension }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          test "$("target/$TARGET/release/upkit$EXTENSION" --version)" = "upkit $VERSION"
+      - name: Stage release asset
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          EXTENSION: ${{ matrix.extension }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/$TARGET/release/upkit$EXTENSION" "dist/upkit-$TARGET$EXTENSION"
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: upkit-${{ matrix.target }}
+          path: dist/upkit-*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          pattern: upkit-*
+          path: dist
+          merge-multiple: true
+      - name: Add installers and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(find dist -maxdepth 1 -type f -name 'upkit-*' | wc -l)" -eq 6
+          cp install.sh install.ps1 dist/
+          cd dist
+          sha256sum upkit-* install.sh install.ps1 > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - name: Publish standalone assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag --title "upkit $VERSION" --generate-notes --latest

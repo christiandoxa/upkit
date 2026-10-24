@@ -1,6 +1,6 @@
 {
   "name": "@christiandoxa/upkit",
-  "version": "0.4.14",
+  "version": "0.4.15",
   "description": "One CLI to check and update Go, Rust, Node, Python, Flutter, and Mojo toolchains",
   "license": "MIT OR Apache-2.0",
   "bin": {
@@ -13,12 +13,12 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@christiandoxa/upkit-linux-x64": "0.4.14",
-    "@christiandoxa/upkit-linux-arm64": "0.4.14",
-    "@christiandoxa/upkit-darwin-x64": "0.4.14",
-    "@christiandoxa/upkit-darwin-arm64": "0.4.14",
-    "@christiandoxa/upkit-win32-x64": "0.4.14",
-    "@christiandoxa/upkit-win32-arm64": "0.4.14"
+    "@christiandoxa/upkit-linux-x64": "0.4.15",
+    "@christiandoxa/upkit-linux-arm64": "0.4.15",
+    "@christiandoxa/upkit-darwin-x64": "0.4.15",
+    "@christiandoxa/upkit-darwin-arm64": "0.4.15",
+    "@christiandoxa/upkit-win32-x64": "0.4.15",
+    "@christiandoxa/upkit-win32-arm64": "0.4.15"
   },
   "publishConfig": {
     "access": "public"

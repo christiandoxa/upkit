@@ -1,6 +1,6 @@
 {
   "name": "@christiandoxa/upkit-win32-x64",
-  "version": "0.4.14",
+  "version": "0.4.15",
   "description": "Native upkit binary for x86_64-pc-windows-msvc",
   "license": "MIT OR Apache-2.0",
   "os": [
