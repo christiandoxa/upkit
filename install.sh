@@ -70,7 +70,14 @@ trap cleanup 0
 trap 'exit 1' 1 2 15
 download "${base_url%/}/SHA256SUMS" "$tmp_dir/SHA256SUMS"
 download "${base_url%/}/$asset" "$tmp_dir/$asset"
-expected=$(awk -v asset="$asset" '$2 == asset { print tolower($1); exit }' "$tmp_dir/SHA256SUMS")
+if ! expected=$(awk -v asset="$asset" '
+  { filename = $2; sub(/^\*/, "", filename) }
+  filename == asset { count++; if (NF != 2) invalid = 1; digest = tolower($1) }
+  END { if (count != 1 || invalid) exit 1; print digest }
+' "$tmp_dir/SHA256SUMS"); then
+  echo "Expected exactly one SHA256SUMS entry for $asset" >&2
+  exit 1
+fi
 printf '%s\n' "$expected" | grep -Eq '^[0-9a-f]{64}$' || {
   echo "Missing or invalid SHA256SUMS entry for $asset" >&2; exit 1;
 }

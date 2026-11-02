@@ -10,6 +10,8 @@ pub enum ToolKind {
     Python,
     Flutter,
     Mojo,
+    Java,
+    Dotnet,
 }
 
 impl ToolKind {
@@ -21,6 +23,8 @@ impl ToolKind {
             ToolKind::Python,
             ToolKind::Flutter,
             ToolKind::Mojo,
+            ToolKind::Java,
+            ToolKind::Dotnet,
         ]
     }
 
@@ -32,6 +36,8 @@ impl ToolKind {
             ToolKind::Python => "python",
             ToolKind::Flutter => "flutter",
             ToolKind::Mojo => "mojo",
+            ToolKind::Java => "java",
+            ToolKind::Dotnet => "dotnet",
         }
     }
 }
@@ -118,11 +124,13 @@ impl Version {
             pre,
         })
     }
+}
 
-    pub fn to_string(&self) -> String {
+impl std::fmt::Display for Version {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.pre {
-            Some(p) => format!("{}.{}.{}-{}", self.major, self.minor, self.patch, p),
-            None => format!("{}.{}.{}", self.major, self.minor, self.patch),
+            Some(p) => write!(f, "{}.{}.{}-{}", self.major, self.minor, self.patch, p),
+            None => write!(f, "{}.{}.{}", self.major, self.minor, self.patch),
         }
     }
 }

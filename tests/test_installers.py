@@ -121,6 +121,42 @@ class Installers(unittest.TestCase):
         self.assertNotEqual(self.install().returncode, 0)
         self.assertEqual(destination.read_bytes(), b"previous installation")
 
+    def test_duplicate_checksum_preserves_existing_install(self):
+        destination = self.existing()
+        digest = hashlib.sha256(self.binary).hexdigest()
+        self.assets["SHA256SUMS"] = f"{digest}  {self.asset}\n{digest}  {self.asset}\n".encode()
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(destination.read_bytes(), b"previous installation")
+
+    def test_binary_checksum_marker(self):
+        digest = hashlib.sha256(self.binary).hexdigest()
+        self.assets["SHA256SUMS"] = f"{digest} *{self.asset}\n".encode()
+        self.assert_success(self.install())
+        self.assertEqual((self.bin_dir / f"upkit{EXTENSION}").read_bytes(), self.binary)
+
+    def test_duplicate_checksum_binary_marker_preserves_existing_install(self):
+        destination = self.existing()
+        digest = hashlib.sha256(self.binary).hexdigest()
+        self.assets["SHA256SUMS"] = f"{digest}  {self.asset}\n{digest} *{self.asset}\n".encode()
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(destination.read_bytes(), b"previous installation")
+
+    def test_malformed_checksum_entry_preserves_existing_install(self):
+        destination = self.existing()
+        digest = hashlib.sha256(self.binary).hexdigest()
+        self.assets["SHA256SUMS"] = f"{digest}  {self.asset} extra\n".encode()
+        self.assertNotEqual(self.install().returncode, 0)
+        self.assertEqual(destination.read_bytes(), b"previous installation")
+
+    def test_valid_and_malformed_duplicate_checksum_preserves_existing_install(self):
+        destination = self.existing()
+        digest = hashlib.sha256(self.binary).hexdigest()
+        self.assets["SHA256SUMS"] = f"{digest}  {self.asset}\ninvalid  {self.asset}\n".encode()
+        self.assertNotEqual(self.install().returncode, 0)
+        self.assertEqual(destination.read_bytes(), b"previous installation")
+
     def test_wrong_version_preserves_existing_install(self):
         destination = self.existing()
         result = self.install("0.0.1")

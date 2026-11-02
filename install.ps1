@@ -55,11 +55,18 @@ try {
     Download-Asset 'SHA256SUMS' (Join-Path $temp 'SHA256SUMS')
     $download = Join-Path $temp $asset
     Download-Asset $asset $download
-    $pattern = '^([0-9a-fA-F]{64})\s+' + [regex]::Escape($asset) + '$'
-    $digests = @(Get-Content -LiteralPath (Join-Path $temp 'SHA256SUMS') | ForEach-Object {
-        if ($_ -cmatch $pattern) { $Matches[1].ToLowerInvariant() }
-    })
-    if ($digests.Count -ne 1) { throw "Missing or invalid SHA256SUMS entry for $asset" }
+    $digests = @()
+    $invalidEntry = $false
+    foreach ($line in Get-Content -LiteralPath (Join-Path $temp 'SHA256SUMS')) {
+        $fields = @($line.Trim() -split '\s+')
+        if ($fields.Count -ge 2 -and ($fields[1] -creplace '^\*', '') -ceq $asset) {
+            if ($fields.Count -ne 2 -or $fields[0] -cnotmatch '^[0-9a-fA-F]{64}$') {
+                $invalidEntry = $true
+            }
+            $digests += $fields[0].ToLowerInvariant()
+        }
+    }
+    if ($invalidEntry -or $digests.Count -ne 1) { throw "Missing or invalid SHA256SUMS entry for $asset" }
     $sha256 = [System.Security.Cryptography.SHA256]::Create()
     try {
         $actualDigest = [BitConverter]::ToString($sha256.ComputeHash([System.IO.File]::ReadAllBytes($download))).Replace('-', '').ToLowerInvariant()

@@ -139,7 +139,7 @@ fn dialoguer_multi_select_out_of_range() {
 }
 
 #[test]
-fn prune_tool_versions_removes_old_dirs() {
+fn prune_tool_versions_preserves_unverified_old_dirs() {
     let dir = tempdir().unwrap();
     let tool_root = dir.path().join("tool");
     let keep_dir = tool_root.join("1.2.3");
@@ -149,6 +149,7 @@ fn prune_tool_versions_removes_old_dirs() {
 
     fs::create_dir_all(&keep_dir).unwrap();
     fs::create_dir_all(&old_dir).unwrap();
+    fs::write(old_dir.join("source.txt"), "keep").unwrap();
     fs::create_dir_all(&wrappers).unwrap();
     fs::write(&cache_file, b"cache").unwrap();
 
@@ -159,10 +160,14 @@ fn prune_tool_versions_removes_old_dirs() {
         symlink(&keep_dir, &active).unwrap();
     }
 
-    prune_tool_versions(&tool_root, &keep_dir, &["active", "wrappers"]).unwrap();
+    assert!(prune_tool_versions(&tool_root, &keep_dir, &["active", "wrappers"]).is_err());
 
     assert!(keep_dir.exists());
-    assert!(!old_dir.exists());
+    assert!(old_dir.exists());
+    assert_eq!(
+        fs::read_to_string(old_dir.join("source.txt")).unwrap(),
+        "keep"
+    );
     assert!(wrappers.exists());
     assert!(cache_file.exists());
 }
@@ -185,6 +190,38 @@ fn maybe_path_hint_updates_missing_path_line() {
     maybe_path_hint_for_dir(&ctx, &bindir, "upkit bin");
     let updated = fs::read_to_string(&rc).unwrap();
     assert!(updated.contains("export PATH="));
+}
+
+#[cfg(unix)]
+#[test]
+fn path_hint_does_not_execute_path_contents() {
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let bindir = dir.path().join("bin$(touch INJECTED)\"'\\path");
+    set_env_var("SHELL", Some("bash".to_owned()));
+    set_env_var("PATH", Some("/usr/bin:/bin".to_owned()));
+    set_home_dir(Some(home.clone()));
+    let ctx = base_ctx(
+        home.clone(),
+        bindir.clone(),
+        Arc::new(TestPrompt::default()),
+    );
+    maybe_path_hint_for_dir(&ctx, &bindir, "upkit bin");
+    let output = std::process::Command::new("/bin/sh")
+        .args(["-c", ". \"$1\"; printf '%s' \"$PATH\"", "sh"])
+        .arg(home.join(".bashrc"))
+        .env("PATH", "/usr/bin:/bin")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("{}:/usr/bin:/bin", bindir.display())
+    );
+    assert!(!dir.path().join("INJECTED").exists());
 }
 
 #[test]
@@ -349,8 +386,8 @@ fn prune_tool_versions_coverage_name_branch() {
     let extra_dir = tool_root.join("extra");
     fs::create_dir_all(&keep_dir).unwrap();
     fs::create_dir_all(&extra_dir).unwrap();
-    prune_tool_versions(&tool_root, &keep_dir, &[]).unwrap();
-    assert!(!extra_dir.exists());
+    assert!(prune_tool_versions(&tool_root, &keep_dir, &[]).is_err());
+    assert!(extra_dir.exists());
 }
 
 #[test]

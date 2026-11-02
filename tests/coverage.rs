@@ -21,6 +21,11 @@ fn runs_binary() {
         .iter()
         .map(|report| report["tool"].as_str().unwrap())
         .collect();
-    assert_eq!(tools, ["go", "rust", "node", "python", "flutter", "mojo"]);
+    assert_eq!(
+        tools,
+        [
+            "go", "rust", "node", "python", "flutter", "mojo", "java", "dotnet"
+        ]
+    );
     assert!(reports.iter().all(|report| report["latest"].is_null()));
 }

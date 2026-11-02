@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use regex::Regex;
 use serde::Deserialize;
 use std::{
@@ -9,9 +9,9 @@ use std::{
 };
 
 use crate::{
-    Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, atomic_symlink, download_to_temp,
-    ensure_clean_dir, home_dir, http_get_json, http_get_text, info, keep_latest_version,
-    link_dir_bins, maybe_path_hint_for_dir, prune_tool_versions, run_capture, run_output, warn,
+    Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, download_to_temp, home_dir,
+    http_get_json, http_get_text, info, keep_latest_version, link_managed_tool_bins,
+    maybe_path_hint_for_dir, prune_tool_versions, run_capture, run_output, sha256_file, warn,
     which_or_none,
 };
 
@@ -25,6 +25,7 @@ struct GhRelease {
 pub struct GhAsset {
     pub name: String,
     pub browser_download_url: String,
+    pub digest: Option<String>,
 }
 
 const PIP_GLOBALS_SNAPSHOT: &str = "pip-globals.txt";
@@ -37,28 +38,45 @@ const PYTHON_RELEASES_API_URL: &str =
 const PYTHON_RELEASES_BASE_URL: &str = "https://github.com";
 
 pub fn check_python(ctx: &Ctx) -> Result<ToolReport> {
-    let installed = if let Some(bin) = python_bin_in_bindir(ctx, "python3") {
-        let args = [OsStr::new("--version")];
-        run_capture(bin.as_os_str(), &args).ok()
+    let names: &[&str] = if ctx.os == "windows" {
+        &["python.exe", "python"]
     } else {
-        which_or_none("python3").and_then(|_| run_capture("python3", &["--version"]).ok())
-    }
-    .and_then(|out| Version::parse_loose(&out))
-    .or_else(|| {
-        if let Some(bin) = python_bin_in_bindir(ctx, "python") {
-            let args = [OsStr::new("--version")];
+        &["python3", "python"]
+    };
+    let mut executable_found = false;
+    let installed = names.iter().find_map(|name| {
+        let bindir_bin = python_bin_in_bindir(ctx, name);
+        let path_bin = if bindir_bin.is_none() {
+            which_or_none(name)
+        } else {
+            None
+        };
+        if bindir_bin.is_none() && path_bin.is_none() {
+            return None;
+        }
+        executable_found = true;
+        if ctx.dry_run {
+            return None;
+        }
+        let args = [OsStr::new("--version")];
+        let output = if let Some(bin) = bindir_bin {
             run_capture(bin.as_os_str(), &args).ok()
         } else {
-            which_or_none("python").and_then(|_| run_capture("python", &["--version"]).ok())
-        }
-        .and_then(|out| Version::parse_loose(&out))
+            run_capture(*name, &["--version"]).ok()
+        }?;
+        Version::parse_loose(&output)
     });
 
     let mut notes = vec![
         "Uses astral-sh/python-build-standalone assets (.tar.zst).".into(),
-        "Note: Upstream release assets don't reliably publish sha256; this MVP does best-effort verification (download integrity via TLS)."
-            .into(),
+        "Archive installation requires a SHA-256 digest from GitHub release metadata.".into(),
     ];
+    if ctx.os == "windows" {
+        notes.push(
+            "Windows installs link python.exe into Upkit bin; use python -m pip because the archive has no pip.exe launcher.".into(),
+        );
+        notes.push("Windows installation requires permission to create symbolic links.".into());
+    }
     let latest = match python_latest(ctx) {
         Ok(version) => Some(version),
         Err(err) => {
@@ -66,7 +84,16 @@ pub fn check_python(ctx: &Ctx) -> Result<ToolReport> {
             None
         }
     };
-    let status = Status::from_versions(installed.as_ref(), latest.as_ref());
+    let status = if ctx.dry_run && executable_found {
+        Status::Unknown
+    } else {
+        Status::from_versions(installed.as_ref(), latest.as_ref())
+    };
+    if ctx.dry_run && executable_found {
+        notes.push(
+            "Dry-run found a Python executable; its version was not checked and is unknown.".into(),
+        );
+    }
 
     Ok(ToolReport {
         tool: ToolKind::Python,
@@ -79,12 +106,13 @@ pub fn check_python(ctx: &Ctx) -> Result<ToolReport> {
 }
 
 pub fn python_target(ctx: &Ctx) -> Result<&'static str> {
-    // Minimal targets; extend as needed.
     match (ctx.os.as_str(), ctx.arch.as_str()) {
         ("linux", "x86_64") => Ok("x86_64-unknown-linux-gnu"),
         ("linux", "aarch64") => Ok("aarch64-unknown-linux-gnu"),
         ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
         ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
+        ("windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
+        ("windows", "aarch64") => Ok("aarch64-pc-windows-msvc"),
         _ => bail!(
             "python target not supported in this MVP for {} {}",
             ctx.os,
@@ -105,10 +133,12 @@ pub fn python_latest(ctx: &Ctx) -> Result<Version> {
         if !a.name.ends_with(".tar.zst") {
             continue;
         }
-        if !a.name.contains(target) {
+        if !python_asset_target_matches(&a.name, target) {
             continue;
         }
-        if let Some(v) = python_asset_version(&re, &a.name) {
+        if let Some(v) = python_asset_version(&re, &a.name)
+            && v.pre.is_none()
+        {
             keep_latest_version(&mut best, v);
         }
     }
@@ -132,7 +162,7 @@ pub fn python_pick_asset(ctx: &Ctx, want: &Version) -> Result<GhAsset> {
         .into_iter()
         .filter(|a| {
             python_asset_matches(&re, &a.name, want)
-                && a.name.contains(target)
+                && python_asset_target_matches(&a.name, target)
                 && a.name.ends_with(".tar.zst")
         })
         .collect::<Vec<_>>();
@@ -142,7 +172,7 @@ pub fn python_pick_asset(ctx: &Ctx, want: &Version) -> Result<GhAsset> {
     candidates
         .into_iter()
         .next()
-        .ok_or_else(|| anyhow!("no python asset found for {}", want.to_string()))
+        .ok_or_else(|| anyhow!("no python asset found for {}", want))
 }
 
 fn python_asset_version(re: &Regex, name: &str) -> Option<Version> {
@@ -159,8 +189,14 @@ fn python_asset_matches(re: &Regex, name: &str, want: &Version) -> bool {
     let Some(version) = python_asset_version(re, name) else {
         return false;
     };
-    (version.major, version.minor, version.patch) == (want.major, want.minor, want.patch)
-        && (want.pre.is_none() || version.pre.as_deref() == want.pre.as_deref())
+    version == *want
+}
+
+fn python_asset_target_matches(name: &str, target: &str) -> bool {
+    name.strip_prefix("cpython-")
+        .and_then(|name| name.split_once('-'))
+        .and_then(|(_, suffix)| suffix.strip_prefix(target))
+        .is_some_and(|suffix| suffix.starts_with('-') || suffix == ".tar.zst")
 }
 
 fn python_asset_priority(name: &str) -> u8 {
@@ -224,6 +260,7 @@ fn python_release_assets_from_html(ctx: &Ctx) -> Result<GhRelease> {
             browser_download_url: format!(
                 "{PYTHON_RELEASES_BASE_URL}/astral-sh/python-build-standalone/releases/download/{asset_tag}/{name}"
             ),
+            digest: None,
         });
     }
     if assets.is_empty() {
@@ -247,21 +284,23 @@ pub fn update_python(ctx: &Ctx) -> Result<()> {
         .ok_or_else(|| anyhow!("latest unknown"))?;
 
     if matches!(report.status, Status::UpToDate) && !ctx.force {
-        info(
-            ctx,
-            format!("python is up-to-date ({})", latest.to_string()),
-        );
+        info(ctx, format!("python is up-to-date ({})", latest));
         return Ok(());
     }
 
-    info(ctx, format!("Updating python -> {}", latest.to_string()));
+    info(ctx, format!("Updating python -> {}", latest));
 
     let tool_root = ctx.home.join("python");
-    let prior_globals = collect_prior_pip_globals(ctx, &tool_root, !ctx.dry_run);
+    crate::infrastructure::validate_active_install(&tool_root)?;
     let asset = python_pick_asset(ctx, &latest)?;
-    let dl = asset.browser_download_url;
 
     if ctx.dry_run {
+        if matches!(report.status, Status::Unknown) {
+            info(
+                ctx,
+                "[dry-run] Python executable found; installed version is unknown because it was not checked",
+            );
+        }
         info(
             ctx,
             format!("[dry-run] would download {} and install", asset.name),
@@ -269,40 +308,102 @@ pub fn update_python(ctx: &Ctx) -> Result<()> {
         return Ok(());
     }
 
-    let tmp = download_to_temp(ctx, &dl)?;
+    let expected = asset
+        .digest
+        .as_deref()
+        .and_then(|digest| digest.strip_prefix("sha256:"))
+        .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| anyhow!("Python release metadata lacks a valid SHA-256 asset digest"))?;
 
-    fs::create_dir_all(&tool_root)?;
-    let ver_dir = tool_root.join(latest.to_string());
-    ensure_clean_dir(&ver_dir)?;
-
-    // Extract .tar.zst; per docs, tar content is prefixed with "python/".
-    {
-        let f = fs::File::open(tmp.path())?;
-        let zst = zstd::Decoder::new(f)?;
-        let mut ar = tar::Archive::new(zst);
-        ar.unpack(&ver_dir)?;
+    let tmp = download_to_temp(ctx, &asset.browser_download_url)?;
+    if !sha256_file(tmp.path())?.eq_ignore_ascii_case(expected) {
+        bail!("Python archive SHA-256 mismatch");
     }
+    let prior_globals = collect_prior_pip_globals(ctx, &tool_root, true);
 
-    let extracted = ver_dir.join("python");
-    if !extracted.exists() {
+    crate::infrastructure::ensure_tool_root(&tool_root)?;
+    crate::infrastructure::validate_active_install(&tool_root)?;
+    let stage = crate::infrastructure::new_install_stage(&tool_root)?;
+
+    // python-build-standalone archives are prefixed with "python/".
+    super::archive::unpack_tar_zst(tmp.path(), stage.path(), 1)?;
+
+    if !fs::symlink_metadata(stage.path().join("python"))
+        .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+    {
         bail!(
             "unexpected python-build-standalone layout (expected {}/python)",
-            ver_dir.display()
+            stage.path().display()
         );
     }
-
     let active = tool_root.join("active");
-    atomic_symlink(&extracted, &active)?;
+    let stage_python = stage.path().join("python");
+    let subdir = if ctx.os == "windows" {
+        "install"
+    } else if stage_python.join("install/bin").exists() {
+        "install/bin"
+    } else {
+        "bin"
+    };
+    let launcher = if ctx.os == "windows" {
+        "python.exe"
+    } else {
+        "python3"
+    };
+    let python_root = stage_python
+        .canonicalize()
+        .context("resolve staged Python installation")?;
+    let python3 = stage_python
+        .join(subdir)
+        .join(launcher)
+        .canonicalize()
+        .context("inspect staged Python launcher")?;
+    let metadata = fs::metadata(&python3)?;
+    if !python3.starts_with(&python_root) || !metadata.is_file() || metadata.len() == 0 {
+        bail!("staged Python launcher is missing or invalid inside its installation");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            bail!("staged python3 is not executable");
+        }
+    }
+    let bin_names: &[&str] = if ctx.os == "windows" {
+        &["python.exe"]
+    } else {
+        &["python", "python3", "pip", "pip3"]
+    };
+    crate::infrastructure::preflight_bin_links(
+        Some(&stage_python.join(subdir)),
+        &active.join(subdir),
+        &ctx.bindir,
+        bin_names,
+    )?;
+    crate::infrastructure::seal_managed_install(
+        ctx,
+        &tool_root,
+        &stage,
+        ToolKind::Python,
+        &latest.to_string(),
+    );
+    let ver_dir = stage.keep();
+    let extracted = ver_dir.join("python");
+    crate::infrastructure::activate_managed_install(ctx, &tool_root, &extracted, ToolKind::Python)?;
 
     // Link python + pip (the best effort; python-build-standalone uses install/bin).
-    let bin = active.join("install").join("bin");
-    let bin = if bin.exists() {
-        bin
-    } else {
-        active.join("bin")
-    };
-    link_dir_bins(&bin, &ctx.bindir, &["python", "python3", "pip", "pip3"])?;
-    maybe_hint_python_bins(ctx, &active);
+    let bin = active.join(subdir);
+    link_managed_tool_bins(
+        ctx,
+        &tool_root,
+        ToolKind::Python,
+        &bin,
+        &ctx.bindir,
+        bin_names,
+    )?;
+    if ctx.os != "windows" {
+        maybe_hint_python_bins(ctx, &active);
+    }
     if let Err(err) = restore_pip_globals(&active, &prior_globals) {
         warn(ctx, format!("Failed to restore pip globals: {err}"));
     } else if let Err(err) = write_pip_globals_snapshot(&tool_root, &prior_globals) {
@@ -313,7 +414,7 @@ pub fn update_python(ctx: &Ctx) -> Result<()> {
         warn(ctx, format!("Failed to remove old python versions: {err}"));
     }
 
-    info(ctx, format!("python updated to {}", latest.to_string()));
+    info(ctx, format!("python updated to {}", latest));
     Ok(())
 }
 
@@ -322,10 +423,8 @@ fn collect_prior_pip_globals(ctx: &Ctx, tool_root: &Path, write_snapshot: bool) 
     if python_executable(&active).is_some() {
         match pip_global_packages(&active) {
             Ok(list) => {
-                if write_snapshot {
-                    if let Err(err) = write_pip_globals_snapshot(tool_root, &list) {
-                        warn(ctx, format!("Failed to write pip globals snapshot: {err}"));
-                    }
+                if write_snapshot && let Err(err) = write_pip_globals_snapshot(tool_root, &list) {
+                    warn(ctx, format!("Failed to write pip globals snapshot: {err}"));
                 }
                 return list;
             }
@@ -404,12 +503,7 @@ fn maybe_hint_python_bins(ctx: &Ctx, active: &Path) {
 }
 
 fn python_user_base(active: &Path) -> Option<PathBuf> {
-    let python = active.join("install").join("bin").join("python3");
-    let python = if python.exists() {
-        python
-    } else {
-        active.join("bin").join("python3")
-    };
+    let python = python_executable(active)?;
     let args = [
         OsStr::new("-m"),
         OsStr::new("site"),
@@ -439,15 +533,15 @@ fn python_bin_in_bindir(ctx: &Ctx, name: &str) -> Option<PathBuf> {
 }
 
 fn python_executable(active: &Path) -> Option<PathBuf> {
-    let install_bin = active.join("install").join("bin").join("python3");
-    if install_bin.exists() {
-        return Some(install_bin);
-    }
-    let bin = active.join("bin").join("python3");
-    if bin.exists() {
-        return Some(bin);
-    }
-    None
+    [
+        "install/bin/python3",
+        "install/python.exe",
+        "bin/python3",
+        "python.exe",
+    ]
+    .iter()
+    .map(|path| active.join(path))
+    .find(|path| path.exists())
 }
 
 pub fn pip_global_packages(active: &Path) -> Result<Vec<String>> {
@@ -509,4 +603,50 @@ pub fn restore_pip_globals(active: &Path, packages: &[String]) -> Result<()> {
     args.extend(packages.iter().cloned());
     run_capture(program, &args)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod windows_archive_fixture {
+    use std::{fs, path::Path};
+
+    #[test]
+    #[ignore = "set UPKIT_PYTHON_WINDOWS_ARCHIVE to an official Windows CPython .tar.zst"]
+    fn official_windows_archive_fits_extractor_limits_and_contains_launcher() {
+        let archive = std::env::var_os("UPKIT_PYTHON_WINDOWS_ARCHIVE")
+            .expect("official Python Windows archive path");
+        let stage = tempfile::tempdir().unwrap();
+        super::super::archive::unpack_tar_zst(Path::new(&archive), stage.path(), 1).unwrap();
+
+        let descriptor: serde_json::Value =
+            serde_json::from_slice(&fs::read(stage.path().join("python/PYTHON.json")).unwrap())
+                .unwrap();
+        assert!(matches!(
+            descriptor["target_triple"].as_str(),
+            Some("aarch64-pc-windows-msvc" | "x86_64-pc-windows-msvc")
+        ));
+        let launcher = fs::metadata(stage.path().join("python/install/python.exe")).unwrap();
+        assert!(launcher.is_file() && launcher.len() > 0);
+        #[cfg(windows)]
+        {
+            let native_target = match std::env::consts::ARCH {
+                "x86_64" => "x86_64-pc-windows-msvc",
+                "aarch64" => "aarch64-pc-windows-msvc",
+                _ => "",
+            };
+            if descriptor["target_triple"].as_str() == Some(native_target) {
+                let output =
+                    std::process::Command::new(stage.path().join("python/install/python.exe"))
+                        .arg("--version")
+                        .output()
+                        .unwrap();
+                assert!(output.status.success());
+                let version = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(version.starts_with("Python "));
+            }
+        }
+    }
 }

@@ -213,7 +213,7 @@ pub fn json_pretty_override(
 ) -> Option<Result<String, serde_json::Error>> {
     let hooks = hooks().lock().unwrap();
     if hooks.json_pretty_error {
-        let err = std::io::Error::new(std::io::ErrorKind::Other, "forced json error");
+        let err = std::io::Error::other("forced json error");
         return Some(Err(serde_json::Error::io(err)));
     }
     let _ = value;

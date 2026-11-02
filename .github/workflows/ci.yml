@@ -20,37 +20,53 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.99.1
+        uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
         with:
           components: rustfmt
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2.9.3
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Check formatting
         run: cargo fmt --check
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.99.1
+        uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
+        with:
+          components: clippy
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2.9.3
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
-      - name: Check build graph
-        run: cargo check --locked
-
-      - name: Run test suite
-        run: cargo test --locked -- --test-threads=1
+      - name: Check, lint, and test
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          export HOME="$RUNNER_TEMP/upkit-test-home"
+          export XDG_CONFIG_HOME="$HOME/config" XDG_DATA_HOME="$HOME/data" XDG_CACHE_HOME="$HOME/cache"
+          mkdir -p "$HOME"
+          cargo check --locked
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked -- --test-threads=1
+          cargo build --locked
+          python3 tests/test_tui_pty.py
+          python3 tests/test_release_order.py
 
   action-smoke:
     runs-on: ${{ matrix.os }}
@@ -61,16 +77,89 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.99.1
+        uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2.9.3
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Build upkit binary
         run: cargo build --locked
+
+      - name: Test Doctor PATH and cache fixtures
+        if: runner.os == 'Windows' || runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --lib windows_node_doctor_tests -- --test-threads=1 --nocapture
+          cargo test --locked --lib cache::tests:: -- --test-threads=1 --nocapture
+          cargo test --locked --test cache_tests go_environment_ -- --test-threads=1
+          cargo test --locked --test tools_rust -- --test-threads=1
+
+      - name: Test Windows links and archive providers
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo test --locked --lib windows_links_preserve_file_and_directory_types -- --test-threads=1 --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --lib windows_trim_notification -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --lib windows_zip_ -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --lib windows_recycle_bin_ -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --lib windows_available_space_queries_only_existing_fixture_paths -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --lib sweep::tests::size_skips_windows_reparse_directories -- --test-threads=1 --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --lib sweep::tests::windows_scan_ -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --test sweep_tests scan_stays_on_the_verified_root_volume_for_descendant_directories -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --test sweep_tests vite_cache_scan_does_not_follow_reparse_directories -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --test sweep_tests age_filter_keeps_normal_artifacts_when_cache_estimates_are_platform_limited -- --test-threads=1 --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --test tools_java installs_windows_jdk_archive -- --test-threads=1 --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --test tools_dotnet installs_windows_arm64_sdk -- --test-threads=1 --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --test tools_go windows_go_zip_ -- --test-threads=1 --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --test tools_go windows_go_link_repair_ -- --test-threads=1 --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --test tools_node windows_node_ -- --test-threads=1 --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --test tools_python update_python_installs_windows_python_exe_layout -- --exact --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --test tools_flutter flutter_windows_ -- --test-threads=1 --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --lib schedule::windows::tests -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --test schedule_tests windows_schedule_preview_ -- --test-threads=1 --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $TARGET = (rustc -vV | Select-String '^host: ').ToString().Split(' ')[1]
+          cargo test --locked --target "$TARGET" --test report_tests report_rejects_hard_linked_record -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Test macOS Flutter archive installation
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --lib flutter_zip_ -- --test-threads=1
+          cargo test --locked --lib tools::archive::tests::tar_ -- --test-threads=1
+          cargo test --locked --lib macos_home_trash_tests -- --test-threads=1
+          cargo test --locked --lib schedule::launchd_ -- --test-threads=1
+          cargo test --locked --test schedule_tests launchd_schedule_ -- --test-threads=1
+          cargo test --locked --test tools_flutter flutter_macos_zip_ -- --test-threads=1
+          cargo test --locked --test tools_go go_update_validates_archive_before_switching_active -- --test-threads=1
+          cargo test --locked --lib available_space_reports_filesystem_value_and_missing_path -- --test-threads=1
+          cargo test --locked --test main_tests doctor_reports_broken_tool_links_without_changing_them -- --test-threads=1
+          TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+          cargo test --locked --target "$TARGET" --test report_tests report_rejects_hard_linked_record -- --test-threads=1
 
       - name: Test installers
         run: python tests/test_installers.py

@@ -1,10 +1,34 @@
 #![forbid(unsafe_code)]
 
+mod activity;
 pub mod application;
+pub mod artifact_cleanup;
+pub mod bytecode;
+pub mod cache;
+mod cargo_workspace;
+pub mod config;
+pub mod containers;
+mod doctor;
 pub mod domain;
+mod git_index;
+#[cfg(target_os = "linux")]
+mod guarded_tree;
 pub mod infrastructure;
+pub mod installation_identity;
+pub mod maintenance;
+pub mod managed_cleanup;
+pub mod reports;
+pub mod schedule;
+pub mod scheduled_cleanup;
+#[cfg(target_os = "linux")]
+pub mod scheduled_trash_cleanup;
+pub mod shared_cache_cleanup;
+pub mod sweep;
+pub mod temp_cleanup;
 pub mod test_support;
 pub mod tools;
+pub mod trash;
+pub mod tui;
 
 pub use application::{
     Cli, Commands, check_tool, check_tool_safe, check_tools_parallel, check_tools_with_spinner,
@@ -26,4 +50,5 @@ pub use infrastructure::{
     start_spinner, tool_bin_names, tool_path_hint_labels, warn, which_or_none, write_all_checked,
 };
 
+pub(crate) use infrastructure::link_managed_tool_bins;
 pub(crate) use infrastructure::sha256_file;

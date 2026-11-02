@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: standalone-release-${{ github.ref }}
+  group: standalone-release-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
@@ -17,8 +17,9 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      latest_tag: ${{ steps.release_order.outputs.latest_tag }}
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Verify release tag
         id: version
         shell: python
@@ -29,13 +30,32 @@ jobs:
               raise SystemExit(f"Run this workflow on tag v{version}, matching Cargo.toml")
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write(f"version={version}\n")
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - name: Verify this is a new, forward release
+        id: release_order
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/verify_release_order.py
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
         with:
-          components: rustfmt
-      - uses: Swatinem/rust-cache@v2.9.3
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --check
-      - run: cargo test --locked -- --test-threads=1
-      - run: python3 tests/test_installers.py
+      - name: Check, lint, and test
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          export HOME="$RUNNER_TEMP/upkit-test-home"
+          export XDG_CONFIG_HOME="$HOME/config" XDG_DATA_HOME="$HOME/data" XDG_CACHE_HOME="$HOME/cache"
+          mkdir -p "$HOME"
+          cargo check --locked
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked -- --test-threads=1
+          python3 tests/test_release_order.py
+          cargo build --locked
+          python3 tests/test_installers.py
+          python3 tests/test_tui_pty.py
 
   build:
     name: Build ${{ matrix.target }}
@@ -50,8 +70,8 @@ jobs:
             cross: true
             extension: ""
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
-            cross: true
+            runner: ubuntu-24.04-arm
+            cross: false
             extension: ""
           - target: x86_64-apple-darwin
             runner: macos-15-intel
@@ -70,13 +90,69 @@ jobs:
             cross: false
             extension: ".exe"
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2.9.3
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: release-${{ matrix.target }}
+      - name: Test Linux ARM64
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          export HOME="$RUNNER_TEMP/upkit-test-home"
+          export XDG_CONFIG_HOME="$HOME/config" XDG_DATA_HOME="$HOME/data" XDG_CACHE_HOME="$HOME/cache"
+          mkdir -p "$HOME"
+          cargo test --locked -- --test-threads=1
+          cargo build --locked
+          python3 tests/test_installers.py
+          python3 tests/test_tui_pty.py
+      - name: Test native macOS fixtures
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --target "$TARGET" --lib macos_home_trash_tests -- --test-threads=1
+          cargo test --locked --target "$TARGET" --lib tools::archive::tests::tar_ -- --test-threads=1
+          cargo test --locked --target "$TARGET" --lib cache::tests:: -- --test-threads=1
+          cargo test --locked --target "$TARGET" --test cache_tests go_environment_ -- --test-threads=1
+          cargo test --locked --target "$TARGET" --lib schedule::launchd_ -- --test-threads=1
+          cargo test --locked --target "$TARGET" --test schedule_tests launchd_schedule_ -- --test-threads=1
+          cargo test --locked --target "$TARGET" --test tools_rust -- --test-threads=1
+          cargo test --locked --target "$TARGET" --test tools_go go_update_validates_archive_before_switching_active -- --test-threads=1
+          cargo test --locked --target "$TARGET" --lib available_space_reports_filesystem_value_and_missing_path -- --test-threads=1
+          cargo test --locked --target "$TARGET" --test report_tests report_rejects_hard_linked_record -- --test-threads=1
+      - name: Test native Windows fixtures
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --target "$TARGET" --lib windows_trim_notification -- --test-threads=1
+          cargo test --locked --target "$TARGET" --lib windows_recycle_bin_ -- --test-threads=1
+          cargo test --locked --target "$TARGET" --lib windows_available_space_queries_only_existing_fixture_paths -- --test-threads=1
+          cargo test --locked --target "$TARGET" --lib windows_links_preserve_file_and_directory_types -- --test-threads=1
+          cargo test --locked --target "$TARGET" --lib sweep::tests::size_skips_windows_reparse_directories -- --test-threads=1 --nocapture
+          cargo test --locked --target "$TARGET" --lib sweep::tests::windows_scan_ -- --test-threads=1
+          cargo test --locked --target "$TARGET" --test sweep_tests scan_stays_on_the_verified_root_volume_for_descendant_directories -- --test-threads=1
+          cargo test --locked --target "$TARGET" --test sweep_tests vite_cache_scan_does_not_follow_reparse_directories -- --test-threads=1
+          cargo test --locked --target "$TARGET" --test sweep_tests age_filter_keeps_normal_artifacts_when_cache_estimates_are_platform_limited -- --test-threads=1
+          cargo test --locked --target "$TARGET" --lib cache::tests:: -- --test-threads=1
+          cargo test --locked --target "$TARGET" --test cache_tests go_environment_ -- --test-threads=1
+          cargo test --locked --target "$TARGET" --test tools_go windows_go_zip_ -- --test-threads=1 --nocapture
+          cargo test --locked --target "$TARGET" --test tools_go windows_go_link_repair_ -- --test-threads=1 --nocapture
+          cargo test --locked --target "$TARGET" --test tools_python update_python_installs_windows_python_exe_layout -- --exact --test-threads=1
+          cargo test --locked --target "$TARGET" --test tools_rust -- --test-threads=1
+          cargo test --locked --target "$TARGET" --lib schedule::windows::tests -- --test-threads=1
+          cargo test --locked --target "$TARGET" --test schedule_tests windows_schedule_preview_ -- --test-threads=1
+          cargo test --locked --target "$TARGET" --test report_tests report_rejects_hard_linked_record -- --test-threads=1
       - name: Install cross
         if: matrix.cross
         run: cargo install cross --version 0.2.5 --locked
@@ -92,6 +168,14 @@ jobs:
           else
             cargo build --release --locked --target "$TARGET"
           fi
+      - name: Smoke test native macOS dashboard
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          UPKIT_TUI_TEST_BINARY="target/$TARGET/release/upkit" python3 tests/test_tui_pty.py dashboard
       - name: Verify standalone libraries
         if: runner.os != 'Windows'
         shell: bash
@@ -114,7 +198,6 @@ jobs:
             fi
           fi
       - name: Verify native binary
-        if: matrix.target != 'aarch64-unknown-linux-gnu'
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
@@ -123,6 +206,17 @@ jobs:
         run: |
           set -euo pipefail
           test "$("target/$TARGET/release/upkit$EXTENSION" --version)" = "upkit $VERSION"
+      - name: Smoke test native binary
+        shell: python
+        env:
+          TARGET: ${{ matrix.target }}
+          EXTENSION: ${{ matrix.extension }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          import os, runpy, sys
+          binary = f"target/{os.environ['TARGET']}/release/upkit{os.environ['EXTENSION']}"
+          sys.argv = ["tests/test_release_smoke.py", binary, os.environ["VERSION"]]
+          runpy.run_path(sys.argv[0], run_name="__main__")
       - name: Stage release asset
         shell: bash
         env:
@@ -132,7 +226,7 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           cp "target/$TARGET/release/upkit$EXTENSION" "dist/upkit-$TARGET$EXTENSION"
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: upkit-${{ matrix.target }}
           path: dist/upkit-*
@@ -146,8 +240,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: actions/download-artifact@v8.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: upkit-*
           path: dist
@@ -156,11 +250,36 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(find dist -maxdepth 1 -type f -name 'upkit-*' | wc -l)" -eq 6
-          cp install.sh install.ps1 dist/
+          expected_assets=(
+            upkit-x86_64-unknown-linux-gnu
+            upkit-aarch64-unknown-linux-gnu
+            upkit-x86_64-apple-darwin
+            upkit-aarch64-apple-darwin
+            upkit-x86_64-pc-windows-msvc.exe
+            upkit-aarch64-pc-windows-msvc.exe
+          )
           cd dist
+          for asset in "${expected_assets[@]}"; do test -s "$asset"; done
+          test "$(find . -maxdepth 1 -type f -name 'upkit-*' | wc -l)" -eq "${#expected_assets[@]}"
+          cp ../install.sh ../install.ps1 .
           sha256sum upkit-* install.sh install.ps1 > SHA256SUMS
           sha256sum --check SHA256SUMS
+      - name: Verify release tag still points at this build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_REF_NAME" --jq .sha)"
+          test "$tag_sha" = "$GITHUB_SHA" || {
+            echo 'Release tag moved after this build started' >&2
+            exit 1
+          }
+      - name: Recheck release order before publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPKIT_EXPECTED_LATEST_TAG: ${{ needs.verify.outputs.latest_tag }}
+        run: python3 scripts/verify_release_order.py
       - name: Publish standalone assets
         env:
           GH_TOKEN: ${{ github.token }}

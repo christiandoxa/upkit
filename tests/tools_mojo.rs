@@ -63,6 +63,45 @@ fn mojo_check_not_installed() {
 }
 
 #[test]
+fn dry_run_does_not_execute_a_mojo_wrapper() {
+    use upkit::test_support::take_run_output;
+
+    let _guard = reset_guard();
+    let (mut ctx, dir) = ctx_with_dirs();
+    ctx.dry_run = true;
+    ctx.quiet = true;
+    set_which("mojo", Some(dir.path().join("mojo")));
+    set_which("pixi", None);
+    set_which("uv", Some(dir.path().join("uv")));
+    let page = releases_page("1.0.0");
+    set_http_plan(
+        RELEASES_URL,
+        vec![
+            Ok(MockResponse::new(page.as_bytes().to_vec(), None)),
+            Ok(MockResponse::new(page.into_bytes(), None)),
+        ],
+    );
+    let args = vec!["--version".to_owned()];
+    set_run_output(
+        "mojo",
+        &["--version"],
+        output_with_status(0, b"mojo 1.0.0", b""),
+    );
+    let report = check_mojo(&ctx).unwrap();
+    assert_eq!(report.status, Status::Unknown);
+    assert!(report.installed.is_none());
+    assert!(take_run_output("mojo", &args).is_some());
+    set_run_output(
+        "mojo",
+        &["--version"],
+        output_with_status(0, b"mojo 1.0.0", b""),
+    );
+    update_mojo(&ctx).unwrap();
+    assert!(take_run_output("mojo", &args).is_some());
+    assert!(!ctx.home.exists() && !ctx.bindir.exists());
+}
+
+#[test]
 fn update_mojo_skips_pixi_outside_project() {
     let _guard = reset_guard();
     let (ctx, _dir) = ctx_with_dirs();

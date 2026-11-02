@@ -15,6 +15,51 @@ use upkit::*;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+#[cfg(target_os = "linux")]
+fn reviewed_clean_tool(ctx: &Ctx, tool: ToolKind) -> anyhow::Result<()> {
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let plan = managed_cleanup::preview(ctx, tool, &cancel)?;
+    managed_cleanup::remove(ctx, &plan, &cancel)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn set_fixture_directory(path: &std::path::Path) {
+    fs::create_dir_all(path).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn sealed_tool_root_fixture(
+    home: &std::path::Path,
+    bindir: &std::path::Path,
+    tool: ToolKind,
+) -> std::path::PathBuf {
+    set_fixture_directory(home);
+    set_fixture_directory(bindir);
+    let root = home.join(tool.as_str());
+    set_fixture_directory(&root);
+
+    let stage = tempfile::Builder::new()
+        .prefix("install-")
+        .tempdir_in(&root)
+        .unwrap();
+    fs::set_permissions(stage.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let tool_dir = stage.path().join(tool.as_str());
+    let bin = tool_dir.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::set_permissions(&tool_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+    let fixture_file = tool_dir.join("fixture");
+    fs::write(&fixture_file, b"sealed fixture").unwrap();
+    fs::set_permissions(&fixture_file, fs::Permissions::from_mode(0o644)).unwrap();
+    installation_identity::seal(&root, &stage, tool, "fixture").unwrap();
+
+    let install = stage.keep();
+    std::os::unix::fs::symlink(install.join(tool.as_str()), root.join("active")).unwrap();
+    root
+}
+
 fn ctx_from_cli(
     cli: &Cli,
     home: std::path::PathBuf,
@@ -32,6 +77,27 @@ fn ctx_from_cli(
     ctx.json = cli.json;
     ctx.use_color = !cli.no_color && !cli.json;
     ctx
+}
+
+#[test]
+fn legacy_clean_tool_refuses_unreviewed_removal_even_with_yes() {
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("managed");
+    let bindir = dir.path().join("bin");
+    fs::create_dir_all(home.join("go")).unwrap();
+    fs::write(home.join("go/keep"), "fixture").unwrap();
+    let mut ctx = base_ctx(home.clone(), bindir, Arc::new(TestPrompt::default()));
+    ctx.yes = true;
+    assert!(
+        clean_tool(&ctx, ToolKind::Go)
+            .unwrap_err()
+            .to_string()
+            .contains("preview")
+    );
+    assert_eq!(fs::read_to_string(home.join("go/keep")).unwrap(), "fixture");
+    ctx.dry_run = true;
+    clean_tool(&ctx, ToolKind::Go).unwrap();
+    assert!(home.join("go/keep").exists());
 }
 
 #[test]
@@ -57,13 +123,20 @@ fn toolkind_helpers() {
     assert_eq!(ToolKind::Python.as_str(), "python");
     assert_eq!(ToolKind::Mojo.as_str(), "mojo");
     assert_eq!(select_kinds(Some(ToolKind::Rust)), vec![ToolKind::Rust]);
-    assert_eq!(select_kinds(None).len(), 6);
+    assert_eq!(select_kinds(None).len(), 8);
     assert!(matches!(
         tool_method(ToolKind::Go),
         UpdateMethod::DirectDownload
     ));
     assert!(matches!(tool_method(ToolKind::Mojo), UpdateMethod::BuiltIn));
-    assert_eq!(tool_bin_names(ToolKind::Go), &["go", "gofmt"]);
+    assert_eq!(
+        tool_bin_names(ToolKind::Go),
+        if cfg!(windows) {
+            &["go.exe", "gofmt.exe"][..]
+        } else {
+            &["go", "gofmt"][..]
+        }
+    );
 }
 
 #[test]
@@ -90,6 +163,68 @@ fn make_ctx_uses_dirs_overrides() {
     let ctx = make_ctx(&cli).unwrap();
     assert!(ctx.home.ends_with("upkit"));
     assert!(ctx.bindir.ends_with(".local/bin"));
+}
+
+#[test]
+fn non_interactive_flag_disables_prompt_input() {
+    let cli = Cli::parse_from(["upkit", "--non-interactive", "update"]);
+    assert!(cli.non_interactive);
+    assert!(!make_ctx(&cli).unwrap().stdin_is_tty);
+}
+
+#[test]
+fn non_interactive_mutations_require_confirmation_without_prompting() {
+    let dir = tempdir().unwrap();
+    for command in ["update", "clean", "uninstall"] {
+        let cli = Cli::parse_from(["upkit", "--non-interactive", command, "go"]);
+        let prompt = Arc::new(TestPrompt::default());
+        let mut ctx = base_ctx(dir.path().join("home"), dir.path().join("bin"), prompt);
+        let err = run(&cli, &mut ctx).unwrap_err();
+        assert!(err.to_string().contains("--yes"));
+        assert!(!ctx.home.exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn rejected_non_interactive_command_does_not_change_shell_config() {
+    let dir = tempdir().unwrap();
+    let rc = dir.path().join(".bashrc");
+    fs::write(&rc, "# unchanged\n").unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_upkit"))
+        .args(["--non-interactive", "update", "go"])
+        .env("HOME", dir.path())
+        .env("XDG_DATA_HOME", dir.path())
+        .env("SHELL", "bash")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--yes"));
+    assert_eq!(fs::read_to_string(rc).unwrap(), "# unchanged\n");
+    assert!(!dir.path().join("upkit").exists());
+}
+
+#[test]
+fn dry_run_does_not_create_directories_or_update_shell_config() {
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("managed");
+    let bindir = dir.path().join("bin");
+    let rc = dir.path().join(".bashrc");
+    fs::write(&rc, "# unchanged\n").unwrap();
+    set_home_dir(Some(dir.path().to_path_buf()));
+    set_env_var("SHELL", Some("bash".to_owned()));
+    let prompt = Arc::new(TestPrompt::default());
+    let mut ctx = base_ctx(home.clone(), bindir.clone(), prompt);
+    ctx.dry_run = true;
+    ctx.offline = true;
+    let cli = Cli::parse_from(["upkit", "--dry-run", "--offline", "paths"]);
+    run(&cli, &mut ctx).unwrap();
+    let _ = run_doctor(&ctx, false);
+    maybe_path_hint_for_dir(&ctx, &bindir, "test");
+    assert!(!home.exists());
+    assert!(!bindir.exists());
+    assert_eq!(fs::read_to_string(rc).unwrap(), "# unchanged\n");
 }
 
 #[test]
@@ -165,7 +300,7 @@ fn debug_and_spinner_template_errors() {
     let prompt = Arc::new(TestPrompt::default());
     let mut ctx = base_ctx(dir.path().join("home"), dir.path().join("bin"), prompt);
     ctx.verbose = 1;
-    debug(&ctx, "hello".to_string());
+    debug(&ctx, "hello");
 
     set_spinner_template(Some("{:"));
     set_finish_template(Some("{:"));
@@ -328,7 +463,7 @@ fn ensure_clean_dir_error() {
     let target = dir.path().join("not_a_dir");
     fs::write(&target, b"nope").unwrap();
     let err = ensure_clean_dir(&target).unwrap_err();
-    assert!(err.to_string().contains("remove"));
+    assert!(err.to_string().contains("refusing to replace"));
     fs::remove_file(&target).unwrap();
 }
 
@@ -531,17 +666,85 @@ fn filesystem_helpers() {
     let clean = dir.path().join("clean");
     fs::create_dir_all(&clean).unwrap();
     fs::write(clean.join("file"), b"data").unwrap();
-    ensure_clean_dir(&clean).unwrap();
-    assert!(fs::read_dir(&clean).unwrap().next().is_none());
+    assert!(ensure_clean_dir(&clean).is_err());
+    assert!(fs::read_dir(&clean).unwrap().next().is_some());
 }
 
+#[cfg(unix)]
+#[test]
+fn symlink_activation_preserves_unrelated_files_and_replaces_existing_link() {
+    let dir = tempdir().unwrap();
+    let old = dir.path().join("old");
+    let new = dir.path().join("new");
+    let link = dir.path().join("active");
+    let old_tmp = link.with_extension("tmp");
+    fs::create_dir(&old).unwrap();
+    fs::create_dir(&new).unwrap();
+    fs::write(&old_tmp, "keep temporary name").unwrap();
+    fs::write(&link, "keep destination").unwrap();
+    assert!(atomic_symlink(&new, &link).is_err());
+    assert_eq!(fs::read_to_string(&link).unwrap(), "keep destination");
+    assert_eq!(fs::read_to_string(&old_tmp).unwrap(), "keep temporary name");
+    fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&old, &link).unwrap();
+    atomic_symlink(&new, &link).unwrap();
+    assert_eq!(fs::read_link(&link).unwrap(), new);
+    assert_eq!(fs::read_to_string(&old_tmp).unwrap(), "keep temporary name");
+    assert!(!fs::read_dir(dir.path()).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".upkit-link-")
+    }));
+}
+
+#[cfg(unix)]
+#[test]
+fn link_dir_bins_preserves_unrelated_existing_symlink() {
+    use std::os::unix::fs::symlink;
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("source");
+    let bin = dir.path().join("bin");
+    fs::create_dir(&src).unwrap();
+    fs::create_dir(&bin).unwrap();
+    fs::write(src.join("go"), "new").unwrap();
+    let other = dir.path().join("other");
+    fs::write(&other, "keep").unwrap();
+    symlink(&other, bin.join("go")).unwrap();
+    assert!(link_dir_bins(&src, &bin, &["go"]).is_err());
+    assert_eq!(fs::read_link(bin.join("go")).unwrap(), other);
+    assert_eq!(fs::read_to_string(&other).unwrap(), "keep");
+    fs::remove_file(bin.join("go")).unwrap();
+    link_dir_bins(&src, &bin, &["go"]).unwrap();
+    link_dir_bins(&src, &bin, &["go"]).unwrap();
+    assert_eq!(fs::read_link(bin.join("go")).unwrap(), src.join("go"));
+}
+
+#[cfg(unix)]
+#[test]
+fn binary_link_preflight_checks_all_destinations_before_writing() {
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("source");
+    let bin = dir.path().join("bin");
+    fs::create_dir(&src).unwrap();
+    fs::create_dir(&bin).unwrap();
+    fs::write(src.join("go"), "fixture").unwrap();
+    fs::write(src.join("gofmt"), "fixture").unwrap();
+    fs::write(bin.join("gofmt"), "user file").unwrap();
+    assert!(link_dir_bins(&src, &bin, &["go", "gofmt"]).is_err());
+    assert!(!bin.join("go").exists());
+    assert_eq!(fs::read_to_string(bin.join("gofmt")).unwrap(), "user file");
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn bin_linking_and_clean_tool() {
     let dir = tempdir().unwrap();
     let home = dir.path().join("home");
     let bindir = dir.path().join("bin");
-    fs::create_dir_all(&home).unwrap();
-    fs::create_dir_all(&bindir).unwrap();
+    set_fixture_directory(&home);
+    set_fixture_directory(&bindir);
     let bin_dir = dir.path().join("bin_src");
     fs::create_dir_all(&bin_dir).unwrap();
     fs::write(bin_dir.join("go"), b"").unwrap();
@@ -554,37 +757,56 @@ fn bin_linking_and_clean_tool() {
     clean_tool(&ctx, ToolKind::Go).unwrap();
 
     ctx.dry_run = false;
-    let tool_root = home.join("go");
-    fs::create_dir_all(&tool_root).unwrap();
+    let tool_root = sealed_tool_root_fixture(&home, &bindir, ToolKind::Go);
     let symlink_path = bindir.join("go");
-    atomic_symlink(&tool_root, &symlink_path).unwrap();
-    clean_tool(&ctx, ToolKind::Go).unwrap();
+    let target = tool_root.join("active/bin");
+    atomic_symlink(&target, &symlink_path).unwrap();
+    installation_identity::record_active_link(&tool_root, &bindir, ToolKind::Go).unwrap();
+    installation_identity::record_created_links(
+        &tool_root,
+        &bindir,
+        ToolKind::Go,
+        &[(symlink_path.clone(), target)],
+    )
+    .unwrap();
+    assert!(clean_tool(&ctx, ToolKind::Go).is_err());
+    assert!(tool_root.exists());
+    assert!(fs::symlink_metadata(&symlink_path).is_ok());
+    reviewed_clean_tool(&ctx, ToolKind::Go).unwrap();
     assert!(!symlink_path.exists());
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn clean_tool_remove_symlink_error() {
     let _guard = reset_guard();
     let dir = tempdir().unwrap();
     let home = dir.path().join("home");
     let bindir = dir.path().join("bin");
-    fs::create_dir_all(&home).unwrap();
-    fs::create_dir_all(&bindir).unwrap();
     let prompt = Arc::new(TestPrompt::default());
     let ctx = base_ctx(home.clone(), bindir.clone(), prompt);
-    let tool_root = home.join("go");
-    fs::create_dir_all(&tool_root).unwrap();
+    let tool_root = sealed_tool_root_fixture(&home, &bindir, ToolKind::Go);
     let symlink_path = bindir.join("go");
-    atomic_symlink(&tool_root, &symlink_path).unwrap();
+    let target = tool_root.join("active/bin");
+    atomic_symlink(&target, &symlink_path).unwrap();
     let mut perms = fs::metadata(&bindir).unwrap().permissions();
     perms.set_mode(0o500);
     fs::set_permissions(&bindir, perms).unwrap();
-    let err = clean_tool(&ctx, ToolKind::Go).unwrap_err();
+    installation_identity::record_active_link(&tool_root, &bindir, ToolKind::Go).unwrap();
+    installation_identity::record_created_links(
+        &tool_root,
+        &bindir,
+        ToolKind::Go,
+        &[(symlink_path.clone(), target)],
+    )
+    .unwrap();
+    let err = reviewed_clean_tool(&ctx, ToolKind::Go).unwrap_err();
     let mut perms = fs::metadata(&bindir).unwrap().permissions();
-    perms.set_mode(0o700);
+    perms.set_mode(0o755);
     fs::set_permissions(&bindir, perms).unwrap();
-    assert!(err.to_string().contains("remove"));
+    assert!(err.to_string().contains("not owner-writable"));
+    assert!(tool_root.exists());
+    assert!(fs::symlink_metadata(symlink_path).is_ok());
 }
 
 #[test]
@@ -646,6 +868,8 @@ fn run_doctor_variants() {
     set_which("python3", None);
     set_which("flutter", None);
     set_which("mojo", None);
+    set_which("javac", None);
+    set_which("dotnet", None);
     set_http_plan("https://example.com", vec![Err("no".to_string())]);
     let err = run_doctor(&ctx, false).unwrap_err();
     assert!(err.to_string().contains("doctor found"));
@@ -660,6 +884,8 @@ fn run_doctor_variants() {
     set_which("python3", Some(std::path::PathBuf::from("/bin/python3")));
     set_which("flutter", Some(std::path::PathBuf::from("/bin/flutter")));
     set_which("mojo", Some(std::path::PathBuf::from("/bin/mojo")));
+    set_which("javac", Some(std::path::PathBuf::from("/bin/javac")));
+    set_which("dotnet", Some(std::path::PathBuf::from("/bin/dotnet")));
     run_doctor(&ctx, true).unwrap();
 }
 
@@ -871,11 +1097,13 @@ fn run_command_paths_check_update_clean() {
     prompt.push_selection(vec![]);
     let mut ctx = ctx_from_cli(&cli, home.clone(), bindir.clone(), prompt.clone());
     ctx.stdin_is_tty = true;
+    ctx.dry_run = true;
     run(&cli, &mut ctx).unwrap();
 
     prompt.push_selection(vec![0]);
     prompt.push_confirm(false);
     let mut ctx = ctx_from_cli(&cli, home.clone(), bindir.clone(), prompt.clone());
+    ctx.dry_run = true;
     run(&cli, &mut ctx).unwrap();
 
     let cli = Cli::parse_from(["upkit", "--json", "-y", "clean", "go"]);
@@ -971,6 +1199,8 @@ fn run_update_flow_variants() {
     set_check_tool(ToolKind::Node, Ok(report.clone()));
     set_check_tool(ToolKind::Python, Ok(report.clone()));
     set_check_tool(ToolKind::Flutter, Ok(report.clone()));
+    set_check_tool(ToolKind::Java, Ok(report.clone()));
+    set_check_tool(ToolKind::Dotnet, Ok(report.clone()));
     let cli = Cli::parse_from(["upkit", "update"]);
     let mut ctx = ctx_from_cli(&cli, home.clone(), bindir.clone(), prompt.clone());
     run(&cli, &mut ctx).unwrap();
@@ -1128,6 +1358,8 @@ fn tool_routing_and_safe_errors() {
     set_which("python", None);
     set_which("flutter", None);
     set_which("mojo", None);
+    set_which("javac", None);
+    set_which("dotnet", None);
 
     for tool in ToolKind::all() {
         let _ = check_tool(&ctx, tool);
@@ -1156,10 +1388,12 @@ fn colorize_and_tool_bins_variants() {
         tool_bin_names(ToolKind::Node),
         &["node", "npm", "npx", "corepack"]
     );
-    assert_eq!(
-        tool_bin_names(ToolKind::Python),
+    let python_bins: &[&str] = if cfg!(windows) {
+        &["python.exe"]
+    } else {
         &["python", "python3", "pip", "pip3"]
-    );
+    };
+    assert_eq!(tool_bin_names(ToolKind::Python), python_bins);
     assert!(tool_bin_names(ToolKind::Rust).is_empty());
     assert_eq!(
         tool_bin_names(ToolKind::Flutter),
@@ -1221,35 +1455,103 @@ fn download_to_temp_partial_progress() {
     assert!(err.to_string().contains("download incomplete"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn clean_tool_symlink_paths() {
     let dir = tempdir().unwrap();
     let home = dir.path().join("home");
     let bindir = dir.path().join("bin");
-    fs::create_dir_all(&home).unwrap();
-    fs::create_dir_all(&bindir).unwrap();
     let prompt = Arc::new(TestPrompt::default());
     let ctx = base_ctx(home.clone(), bindir.clone(), prompt);
 
-    let tool_root = home.join("go");
-    fs::create_dir_all(&tool_root).unwrap();
+    let tool_root = sealed_tool_root_fixture(&home, &bindir, ToolKind::Go);
     fs::write(bindir.join("go"), b"not a symlink").unwrap();
     let outside = dir.path().join("outside");
     fs::create_dir_all(&outside).unwrap();
     atomic_symlink(&outside, &bindir.join("gofmt")).unwrap();
-    clean_tool(&ctx, ToolKind::Go).unwrap();
+    let install = fs::read_link(tool_root.join("active"))
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    installation_identity::record_active_link(&tool_root, &bindir, ToolKind::Go).unwrap();
+    reviewed_clean_tool(&ctx, ToolKind::Go).unwrap();
     assert!(bindir.join("go").exists());
     assert!(bindir.join("gofmt").exists());
-    assert!(!tool_root.exists());
+    assert!(!tool_root.join("active").exists());
+    assert!(!install.exists());
 
-    let tool_root = home.join("go");
-    fs::create_dir_all(&tool_root).unwrap();
+    let tool_root = sealed_tool_root_fixture(&home, &bindir, ToolKind::Go);
     let home_link = bindir.join("gofmt");
-    let target = home.join("go").join("bin");
-    fs::create_dir_all(&target).unwrap();
+    let target = tool_root.join("active/bin");
     atomic_symlink(&target, &home_link).unwrap();
-    clean_tool(&ctx, ToolKind::Go).unwrap();
+    installation_identity::record_active_link(&tool_root, &bindir, ToolKind::Go).unwrap();
+    installation_identity::record_created_links(
+        &tool_root,
+        &bindir,
+        ToolKind::Go,
+        &[(home_link.clone(), target)],
+    )
+    .unwrap();
+    reviewed_clean_tool(&ctx, ToolKind::Go).unwrap();
     assert!(!home_link.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_cleanup_preserves_links_to_other_tools_and_parent_traversals() {
+    use std::os::unix::fs::symlink;
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("home");
+    let bin = dir.path().join("bin");
+    let go_root = sealed_tool_root_fixture(&home, &bin, ToolKind::Go);
+    set_fixture_directory(&home.join("node/bin"));
+    fs::write(home.join("node/bin/node"), "keep").unwrap();
+    let other = home.join("node/bin/node");
+    let traversal = go_root.join("../node/bin/node");
+    symlink(&other, bin.join("go")).unwrap();
+    symlink(&traversal, bin.join("gofmt")).unwrap();
+    let ctx = base_ctx(home.clone(), bin.clone(), Arc::new(TestPrompt::default()));
+    installation_identity::record_active_link(&go_root, &bin, ToolKind::Go).unwrap();
+    reviewed_clean_tool(&ctx, ToolKind::Go).unwrap();
+    assert_eq!(fs::read_link(bin.join("go")).unwrap(), other);
+    assert_eq!(fs::read_link(bin.join("gofmt")).unwrap(), traversal);
+    assert_eq!(
+        fs::read_to_string(home.join("node/bin/node")).unwrap(),
+        "keep"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn clean_rejects_linked_tool_root_and_user_home_scope() {
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("managed");
+    let outside = dir.path().join("source");
+    let bindir = dir.path().join("bin");
+    set_fixture_directory(&home);
+    fs::create_dir_all(&outside).unwrap();
+    set_fixture_directory(&bindir);
+    fs::write(outside.join("keep"), "source").unwrap();
+    std::os::unix::fs::symlink(&outside, home.join("go")).unwrap();
+    let ctx = base_ctx(home.clone(), bindir, Arc::new(TestPrompt::default()));
+    assert!(reviewed_clean_tool(&ctx, ToolKind::Go).is_err());
+    assert!(outside.join("keep").exists());
+    fs::remove_file(home.join("go")).unwrap();
+    let tool_root = sealed_tool_root_fixture(&home, &ctx.bindir, ToolKind::Go);
+    std::os::unix::fs::symlink(&outside, home.join("go/link")).unwrap();
+    installation_identity::record_active_link(&tool_root, &ctx.bindir, ToolKind::Go).unwrap();
+    reviewed_clean_tool(&ctx, ToolKind::Go).unwrap();
+    assert!(outside.join("keep").exists());
+    assert!(fs::symlink_metadata(home.join("go/link")).is_ok());
+    fs::remove_dir_all(&tool_root).unwrap();
+    fs::create_dir(&tool_root).unwrap();
+    fs::write(home.join("go/keep"), "source").unwrap();
+    let mut root_ctx = ctx.clone();
+    root_ctx.home = std::path::PathBuf::from("/");
+    assert!(reviewed_clean_tool(&root_ctx, ToolKind::Go).is_err());
+    assert!(home.join("go/keep").exists());
 }
 
 #[test]
@@ -1270,6 +1572,8 @@ fn run_doctor_no_issues_and_errors() {
     set_which("python3", Some(std::path::PathBuf::from("/bin/python3")));
     set_which("flutter", Some(std::path::PathBuf::from("/bin/flutter")));
     set_which("mojo", Some(std::path::PathBuf::from("/bin/mojo")));
+    set_which("javac", Some(std::path::PathBuf::from("/bin/javac")));
+    set_which("dotnet", Some(std::path::PathBuf::from("/bin/dotnet")));
     ctx.offline = true;
     run_doctor(&ctx, false).unwrap();
 
@@ -1290,7 +1594,182 @@ fn run_doctor_no_issues_and_errors() {
     set_which("python3", None);
     set_which("flutter", None);
     set_which("mojo", None);
+    set_which("javac", None);
+    set_which("dotnet", None);
     assert!(run_doctor(&bad_ctx, false).is_err());
+}
+
+#[test]
+fn doctor_reports_unavailable_space_without_creating_home() {
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("missing-home");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_upkit"))
+        .args(["--json", "--offline", "--dry-run", "doctor", "--home"])
+        .arg(&home)
+        .arg("--bindir")
+        .arg(dir.path())
+        .env("HOME", dir.path())
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(report.get("home_available_bytes").unwrap().is_null());
+    assert!(!home.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_reports_broken_tool_links_without_changing_them() {
+    use std::os::unix::fs::symlink;
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("home");
+    let bin = dir.path().join("bin");
+    fs::create_dir(&home).unwrap();
+    fs::create_dir(&bin).unwrap();
+    let target = home.join("missing");
+    symlink(&target, bin.join("go")).unwrap();
+    let node = home.join("node/active/bin/node");
+    fs::create_dir_all(node.parent().unwrap()).unwrap();
+    fs::write(&node, "fixture").unwrap();
+    fs::set_permissions(&node, fs::Permissions::from_mode(0o755)).unwrap();
+    symlink(&node, bin.join("node")).unwrap();
+    fs::write(home.join("python"), "fixture").unwrap();
+    fs::set_permissions(home.join("python"), fs::Permissions::from_mode(0o600)).unwrap();
+    symlink(home.join("python"), bin.join("python")).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_upkit"))
+        .args(["--json", "--offline", "--dry-run", "doctor", "--home"])
+        .arg(&home)
+        .arg("--bindir")
+        .arg(&bin)
+        .env("HOME", dir.path())
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    assert!(report["home_available_bytes"].as_u64().is_some());
+    let issues = report["issues"].as_array().unwrap();
+    assert!(
+        issues
+            .iter()
+            .any(|issue| issue.as_str().unwrap().contains("cannot resolve tool link"))
+    );
+    assert!(
+        issues
+            .iter()
+            .any(|issue| issue.as_str().unwrap().contains("non-executable file"))
+    );
+    assert!(
+        !issues
+            .iter()
+            .any(|issue| issue.as_str().unwrap().contains("tool link")
+                && issue.as_str().unwrap().contains("node"))
+    );
+    assert_eq!(fs::read_link(bin.join("go")).unwrap(), target);
+    assert_eq!(fs::read_to_string(node).unwrap(), "fixture");
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_reports_managed_tool_link_outside_installation_without_changing_it() {
+    use std::os::unix::fs::symlink;
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("home");
+    let bin = dir.path().join("bin");
+    let outside = dir.path().join("external/node");
+    let managed = home.join("node/active/bin/node");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(managed.parent().unwrap()).unwrap();
+    fs::create_dir_all(outside.parent().unwrap()).unwrap();
+    fs::write(&managed, "managed fixture").unwrap();
+    fs::write(&outside, "external fixture").unwrap();
+    fs::set_permissions(&managed, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o755)).unwrap();
+    symlink(&outside, bin.join("node")).unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_upkit"))
+        .args(["--json", "--offline", "--dry-run", "doctor", "--home"])
+        .arg(&home)
+        .arg("--bindir")
+        .arg(&bin)
+        .env("HOME", dir.path())
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(report["issues"].as_array().unwrap().iter().any(|issue| {
+        issue
+            .as_str()
+            .unwrap()
+            .contains("does not resolve inside the managed node installation")
+    }));
+    assert_eq!(fs::read_link(bin.join("node")).unwrap(), outside);
+    assert_eq!(fs::read_to_string(managed).unwrap(), "managed fixture");
+    assert_eq!(fs::read_to_string(outside).unwrap(), "external fixture");
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_checks_only_selected_workspace_roots_without_changes() {
+    use std::{os::unix::fs::symlink, process::Command};
+    let dir = tempdir().unwrap();
+    let valid = dir.path().join("valid");
+    let missing = dir.path().join("missing");
+    let linked = dir.path().join("linked");
+    let file = dir.path().join("file");
+    fs::create_dir(&valid).unwrap();
+    fs::write(&file, "fixture").unwrap();
+    symlink(&valid, &linked).unwrap();
+    let mut settings = upkit::config::Settings {
+        workspace_roots: vec![valid.clone()],
+        ..Default::default()
+    };
+    settings.profiles.insert(
+        "broken".into(),
+        upkit::config::Profile {
+            workspace_roots: vec![missing.clone(), linked.clone(), file.clone()],
+            ..Default::default()
+        },
+    );
+    let config = dir.path().join("config.toml");
+    fs::write(&config, toml::to_string(&settings).unwrap()).unwrap();
+    let run = |profile: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_upkit"));
+        command
+            .args(["--json", "--offline", "--dry-run", "--config"])
+            .arg(&config);
+        if let Some(profile) = profile {
+            command.args(["--profile", profile]);
+        }
+        command.arg("doctor").env("HOME", dir.path());
+        let output = command.output().unwrap();
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let default = run(None);
+    assert!(
+        !default["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue.as_str().unwrap().contains("workspace root"))
+    );
+    let selected = run(Some("broken"));
+    let issues = selected["issues"].as_array().unwrap();
+    for problem in [
+        "cannot be inspected",
+        "is a symbolic link",
+        "is not a directory",
+    ] {
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.as_str().unwrap().contains(problem))
+        );
+    }
+    assert!(!missing.exists());
+    assert_eq!(fs::read_link(linked).unwrap(), valid);
+    assert_eq!(fs::read_to_string(file).unwrap(), "fixture");
 }
 
 #[test]
@@ -1333,6 +1812,45 @@ fn run_update_and_clean_json_paths() {
 }
 
 #[test]
+fn managed_cleanup_json_dry_run_is_one_report_and_changes_nothing() {
+    use std::process::Command;
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("managed");
+    let bin = dir.path().join("bin");
+    fs::create_dir_all(home.join("go")).unwrap();
+    fs::write(home.join("go/fixture"), "keep").unwrap();
+    for command in ["clean", "uninstall"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_upkit"))
+            .args([
+                "--json",
+                "--dry-run",
+                "--non-interactive",
+                "--yes",
+                "--home",
+            ])
+            .arg(&home)
+            .arg("--bindir")
+            .arg(&bin)
+            .args([command, "go"])
+            .env("HOME", dir.path())
+            .env("XDG_CONFIG_HOME", dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["command"], command);
+        assert_eq!(report["dry_run"], true);
+        assert_eq!(report["results"][0]["executed"], false);
+        assert_eq!(fs::read_to_string(home.join("go/fixture")).unwrap(), "keep");
+        assert!(!bin.exists());
+    }
+}
+
+#[test]
 fn run_doctor_and_self_update_with_spinners() {
     let _env_guard = ENV_LOCK.lock().unwrap();
     let _guard = reset_guard();
@@ -1354,6 +1872,8 @@ fn run_doctor_and_self_update_with_spinners() {
     set_which("python3", Some(std::path::PathBuf::from("/bin/python3")));
     set_which("flutter", Some(std::path::PathBuf::from("/bin/flutter")));
     set_which("mojo", Some(std::path::PathBuf::from("/bin/mojo")));
+    set_which("javac", Some(std::path::PathBuf::from("/bin/javac")));
+    set_which("dotnet", Some(std::path::PathBuf::from("/bin/dotnet")));
     run(&cli, &mut ctx).unwrap();
 
     let cli = Cli::parse_from(["upkit", "-y", "self-update"]);
@@ -1501,6 +2021,7 @@ fn run_update_and_clean_cancel_paths() {
     prompt.push_confirm(false);
     let cli = Cli::parse_from(["upkit", "clean"]);
     let mut ctx = ctx_from_cli(&cli, home.clone(), bindir.clone(), prompt.clone());
+    ctx.dry_run = true;
     run(&cli, &mut ctx).unwrap();
 
     let prompt = Arc::new(TestPrompt::default());
@@ -1544,26 +2065,28 @@ fn run_self_update_confirm_true() {
     run_self_update(&ctx, false).unwrap();
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn clean_tool_empty_bins_and_symlink_skip() {
     let dir = tempdir().unwrap();
     let home = dir.path().join("home");
     let bindir = dir.path().join("bin");
-    fs::create_dir_all(&home).unwrap();
-    fs::create_dir_all(&bindir).unwrap();
     let prompt = Arc::new(TestPrompt::default());
     let ctx = base_ctx(home.clone(), bindir.clone(), prompt);
 
-    let tool_root = home.join("rust");
-    fs::create_dir_all(&tool_root).unwrap();
-    clean_tool(&ctx, ToolKind::Rust).unwrap();
-    assert!(!tool_root.exists());
+    let tool_root = sealed_tool_root_fixture(&home, &bindir, ToolKind::Go);
+    let active_target = fs::read_link(tool_root.join("active")).unwrap();
+    assert_eq!(fs::read_dir(active_target.join("bin")).unwrap().count(), 0);
+    installation_identity::record_active_link(&tool_root, &bindir, ToolKind::Go).unwrap();
+    reviewed_clean_tool(&ctx, ToolKind::Go).unwrap();
+    assert!(!tool_root.join("active").exists());
+    assert!(!active_target.exists());
 
     let outside = dir.path().join("outside");
     fs::create_dir_all(&outside).unwrap();
     let link_path = bindir.join("go");
     atomic_symlink(&outside, &link_path).unwrap();
-    clean_tool(&ctx, ToolKind::Go).unwrap();
+    assert!(reviewed_clean_tool(&ctx, ToolKind::Go).is_err());
     assert!(link_path.exists());
 }
 
@@ -1583,6 +2106,8 @@ fn run_doctor_metadata_ok() {
     set_which("python3", Some(std::path::PathBuf::from("/bin/python3")));
     set_which("flutter", Some(std::path::PathBuf::from("/bin/flutter")));
     set_which("mojo", Some(std::path::PathBuf::from("/bin/mojo")));
+    set_which("javac", Some(std::path::PathBuf::from("/bin/javac")));
+    set_which("dotnet", Some(std::path::PathBuf::from("/bin/dotnet")));
     let prompt = Arc::new(TestPrompt::default());
     let mut ctx = base_ctx(home, bindir, prompt);
     ctx.offline = true;
@@ -1659,6 +2184,8 @@ fn run_doctor_writable_paths_coverage() {
     set_which("python3", Some(std::path::PathBuf::from("/bin/python3")));
     set_which("flutter", Some(std::path::PathBuf::from("/bin/flutter")));
     set_which("mojo", Some(std::path::PathBuf::from("/bin/mojo")));
+    set_which("javac", Some(std::path::PathBuf::from("/bin/javac")));
+    set_which("dotnet", Some(std::path::PathBuf::from("/bin/dotnet")));
     let prompt = Arc::new(TestPrompt::default());
     let mut ctx = base_ctx(home, bindir, prompt);
     ctx.offline = true;

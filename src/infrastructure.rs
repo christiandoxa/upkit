@@ -117,7 +117,7 @@ impl Prompt for DialoguerPrompt {
         }
         let mut chosen = Vec::new();
         let mut seen = HashSet::new();
-        for raw in trimmed.split(|c: char| c == ',' || c == ' ' || c == ';' || c == '\t') {
+        for raw in trimmed.split([',', ' ', ';', '\t']) {
             let token = raw.trim().to_lowercase();
             if token.is_empty() {
                 continue;
@@ -238,7 +238,7 @@ pub fn maybe_path_hint(ctx: &Ctx) {
 }
 
 pub fn maybe_path_hint_for_dir(ctx: &Ctx, dir: &Path, label: &str) {
-    if ctx.quiet {
+    if ctx.quiet || ctx.dry_run {
         return;
     }
     let shell = get_env_var("SHELL").unwrap_or_default();
@@ -327,13 +327,14 @@ pub(crate) fn ensure_required_paths(ctx: &Ctx) -> Vec<PathCheckEntry> {
     let rc_paths = resolve_shell_rc_paths(&shell);
     let primary_rc = primary_shell_rc_path(&rc_paths);
     let home = home_dir();
-    if let Some(dir) = upkit_exe_dir() {
-        if is_dev_exe_dir(&dir) && !ctx.dry_run {
-            if let Some(rc_path) = primary_rc.as_ref() {
-                update_path_hint_in_rc(ctx, rc_path, &shell, &ctx.bindir, "upkit bin");
-            } else {
-                warn(ctx, "Could not resolve shell rc file to update PATH.");
-            }
+    if let Some(dir) = upkit_exe_dir()
+        && is_dev_exe_dir(&dir)
+        && !ctx.dry_run
+    {
+        if let Some(rc_path) = primary_rc.as_ref() {
+            update_path_hint_in_rc(ctx, rc_path, &shell, &ctx.bindir, "upkit bin");
+        } else {
+            warn(ctx, "Could not resolve shell rc file to update PATH.");
         }
     }
     let mut warned_missing_rc = false;
@@ -411,10 +412,17 @@ pub fn remove_path_hint_for_label(ctx: &Ctx, label: &str) {
 }
 
 fn path_hint_line(shell: &str, dir: &Path) -> String {
+    let path = dir.to_string_lossy();
     if shell.ends_with("fish") {
-        format!("set -gx PATH {} $PATH", dir.display())
+        let escaped = path.replace('\\', "\\\\").replace('\'', "\\'");
+        format!("set -gx PATH '{escaped}' $PATH")
     } else {
-        format!("export PATH=\"{}:$PATH\"", dir.display())
+        let escaped = path
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('$', "\\$")
+            .replace('`', "\\`");
+        format!("export PATH=\"{escaped}:$PATH\"")
     }
 }
 
@@ -430,20 +438,20 @@ fn required_path_targets(ctx: &Ctx) -> Vec<PathTarget> {
         label: "upkit bin",
         dir: ctx.bindir.clone(),
     });
-    if !upkit_installed_via_npm() {
-        if let Some(dir) = upkit_exe_dir() {
-            let matches_cargo = cargo_dir.as_ref().map_or(false, |cargo| cargo == &dir);
-            let upkit_dir = if is_dev_exe_dir(&dir) {
-                ctx.bindir.clone()
-            } else {
-                dir
-            };
-            if !matches_cargo
-                && !path_contains_dir(&upkit_dir)
-                && !targets.iter().any(|target| target.dir == upkit_dir)
-            {
-                push_target(&mut targets, "upkit exe", upkit_dir);
-            }
+    if !upkit_installed_via_npm()
+        && let Some(dir) = upkit_exe_dir()
+    {
+        let matches_cargo = cargo_dir.as_ref() == Some(&dir);
+        let upkit_dir = if is_dev_exe_dir(&dir) {
+            ctx.bindir.clone()
+        } else {
+            dir
+        };
+        if !matches_cargo
+            && !path_contains_dir(&upkit_dir)
+            && !targets.iter().any(|target| target.dir == upkit_dir)
+        {
+            push_target(&mut targets, "upkit exe", upkit_dir);
         }
     }
     if let Some(dir) = cargo_dir {
@@ -456,7 +464,12 @@ fn required_path_targets(ctx: &Ctx) -> Vec<PathTarget> {
         push_target(&mut targets, "local bin", home.join(".local").join("bin"));
     }
     if let Some(base) = python_user_base_dir() {
-        push_target(&mut targets, "python user base bin", base.join("bin"));
+        let (label, child) = if ctx.os == "windows" {
+            ("python user base scripts", "Scripts")
+        } else {
+            ("python user base bin", "bin")
+        };
+        push_target(&mut targets, label, base.join(child));
     }
     if let Some(dir) = flutter_bin_dir(ctx) {
         push_target(&mut targets, "flutter bin", dir);
@@ -604,10 +617,10 @@ fn line_contains_dir(line: &str, dir: &Path, home: Option<&Path>) -> bool {
 fn find_existing_path_line(lines: &[String], dir: &Path, home: Option<&Path>) -> Option<usize> {
     for (index, line) in lines.iter().enumerate() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("export PATH=") || trimmed.starts_with("set -gx PATH") {
-            if line_contains_dir(trimmed, dir, home) {
-                return Some(index);
-            }
+        if (trimmed.starts_with("export PATH=") || trimmed.starts_with("set -gx PATH"))
+            && line_contains_dir(trimmed, dir, home)
+        {
+            return Some(index);
         }
     }
     None
@@ -754,15 +767,15 @@ fn python_user_base_dir() -> Option<PathBuf> {
     if let Some(base) = get_env_var("PYTHONUSERBASE").filter(|value| !value.trim().is_empty()) {
         return Some(PathBuf::from(base));
     }
-    if which_or_none("python3").is_some() {
-        if let Some(base) = python_user_base_from("python3") {
-            return Some(base);
-        }
+    if which_or_none("python3").is_some()
+        && let Some(base) = python_user_base_from("python3")
+    {
+        return Some(base);
     }
-    if which_or_none("python").is_some() {
-        if let Some(base) = python_user_base_from("python") {
-            return Some(base);
-        }
+    if which_or_none("python").is_some()
+        && let Some(base) = python_user_base_from("python")
+    {
+        return Some(base);
     }
     home_dir().map(|home| home.join(".local"))
 }
@@ -783,9 +796,7 @@ fn go_env_value(key: &str) -> Option<String> {
             return Some(value);
         }
     }
-    if which_or_none("go").is_none() {
-        return None;
-    }
+    which_or_none("go")?;
     run_capture("go", &["env", key])
         .ok()
         .map(|value| value.trim().to_string())
@@ -828,7 +839,7 @@ fn pub_cache_dir() -> Option<PathBuf> {
 
 pub fn write_all_checked(writer: &mut dyn Write, bytes: &[u8]) -> io::Result<()> {
     if test_support::force_write_error() {
-        return Err(io::Error::new(io::ErrorKind::Other, "forced write error"));
+        return Err(io::Error::other("forced write error"));
     }
     writer.write_all(bytes)
 }
@@ -1010,12 +1021,12 @@ pub fn run_output<S: AsRef<OsStr>>(program: S, args: &[S]) -> Result<std::proces
         }
     }
 
-    Ok(Command::new(&program)
+    Command::new(&program)
         .args(args.iter().map(|s| s.as_ref()))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .with_context(|| format!("failed to run {:?}", program.as_ref()))?)
+        .with_context(|| format!("failed to run {:?}", program.as_ref()))
 }
 
 pub fn run_status<S: AsRef<OsStr>>(program: S, args: &[S]) -> Result<std::process::ExitStatus> {
@@ -1318,21 +1329,70 @@ pub fn download_to_temp(ctx: &Ctx, url: &str) -> Result<NamedTempFile> {
             Some(io::copy(&mut resp, &mut tmp)?)
         };
 
-        if let (Some(total), Some(downloaded)) = (total, downloaded_total) {
-            if downloaded < total {
-                bail!("download incomplete for {url}: expected {total} bytes, got {downloaded}");
-            }
+        if let (Some(total), Some(downloaded)) = (total, downloaded_total)
+            && downloaded < total
+        {
+            bail!("download incomplete for {url}: expected {total} bytes, got {downloaded}");
         }
         Ok(tmp)
     })
 }
 
 pub fn ensure_clean_dir(dir: &Path) -> Result<()> {
-    if dir.exists() {
-        fs::remove_dir_all(dir).with_context(|| format!("remove {}", dir.display()))?;
+    match fs::symlink_metadata(dir) {
+        Ok(_) => bail!(
+            "refusing to replace existing installation path: {}",
+            dir.display()
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err).with_context(|| format!("inspect {}", dir.display())),
     }
-    fs::create_dir_all(dir)?;
+    fs::create_dir(dir).with_context(|| format!("create {}", dir.display()))?;
     Ok(())
+}
+
+pub(crate) fn ensure_tool_root(tool_root: &Path) -> Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o755);
+    }
+    builder
+        .create(tool_root)
+        .with_context(|| format!("create tool root {}", tool_root.display()))
+}
+
+#[cfg(all(test, unix))]
+mod tool_root_tests {
+    use super::ensure_tool_root;
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    #[test]
+    fn new_tool_root_is_not_group_writable_and_existing_mode_is_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("new/tool");
+        ensure_tool_root(&root).unwrap();
+        assert_eq!(fs::metadata(&root).unwrap().permissions().mode() & 0o022, 0);
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o775)).unwrap();
+        ensure_tool_root(&root).unwrap();
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o775
+        );
+    }
+}
+
+pub(crate) fn new_install_stage(tool_root: &Path) -> Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("install-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(fs::Permissions::from_mode(0o700));
+    }
+    Ok(builder.tempdir_in(tool_root)?)
 }
 
 pub fn prune_tool_versions(tool_root: &Path, keep_dir: &Path, keep_names: &[&str]) -> Result<()> {
@@ -1361,57 +1421,336 @@ pub fn prune_tool_versions(tool_root: &Path, keep_dir: &Path, keep_names: &[&str
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             continue;
         }
-        fs::remove_dir_all(&path).with_context(|| format!("remove {}", path.display()))?;
+        // shortcut: old versions lack verified identity, restore pruning after safe migration and confirmation.
+        bail!(
+            "automatic removal of old directories is unavailable until installation identity and cleanup safeguards are verified: {}",
+            path.display()
+        );
     }
     Ok(())
 }
 
 pub fn atomic_symlink(target: &Path, link: &Path) -> Result<()> {
-    // Create tmp symlink then rename (best-effort, cross-platform-ish).
-    // On Windows this will likely require privileges; we keep Linux/macOS as primary.
-    let tmp_link = link.with_extension("tmp");
+    let replacing = match fs::symlink_metadata(link) {
+        Ok(meta) if !meta.file_type().is_symlink() => {
+            bail!("refusing to replace non-symlink path: {}", link.display());
+        }
+        Ok(_) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => return Err(err).with_context(|| format!("inspect {}", link.display())),
+    };
+    let parent = link
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let temp = tempfile::Builder::new()
+        .prefix(".upkit-link-")
+        .tempdir_in(parent)?;
+    let tmp_link = temp.path().join("link");
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::symlink;
-        let _ = fs::remove_file(&tmp_link);
         symlink(target, &tmp_link)?;
-        fs::rename(&tmp_link, link)?;
-        return Ok(());
+        install_link(&tmp_link, link, replacing)?;
+        Ok(())
     }
 
     #[cfg(windows)]
     {
-        use std::os::windows::fs::symlink_dir;
-        let _ = fs::remove_file(&tmp_link);
-        // If target is a file, you may want symlink_file. Here we only symlink dirs.
-        symlink_dir(target, &tmp_link)?;
-        fs::rename(&tmp_link, link)?;
-        return Ok(());
+        use std::os::windows::fs::{symlink_dir, symlink_file};
+        let metadata = fs::metadata(target)
+            .with_context(|| format!("inspect symlink target {}", target.display()))?;
+        if metadata.is_dir() {
+            symlink_dir(target, &tmp_link).context("create temporary directory symlink")?;
+        } else if metadata.is_file() {
+            symlink_file(target, &tmp_link).context("create temporary file symlink")?;
+        } else {
+            bail!(
+                "symlink target is not a regular file or directory: {}",
+                target.display()
+            );
+        }
+        install_link(&tmp_link, link, replacing).context("install Windows symlink")?;
+        Ok(())
     }
 }
 
-pub fn link_dir_bins(bin_dir: &Path, bindir: &Path, names: &[&str]) -> Result<()> {
-    for &name in names {
-        let src = bin_dir.join(name);
-        if !src.exists() {
-            continue; // best effort
+#[cfg(all(test, windows))]
+mod windows_link_tests {
+    use super::*;
+
+    #[test]
+    fn windows_links_preserve_file_and_directory_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("tool.exe");
+        let folder = dir.path().join("tool");
+        let file_link = dir.path().join("tool-link.exe");
+        let folder_link = dir.path().join("tool-link");
+        fs::write(&file, b"fixture").unwrap();
+        fs::create_dir(&folder).unwrap();
+        if let Err(err) = atomic_symlink(&file, &file_link) {
+            if err.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.raw_os_error() == Some(1314))
+            }) {
+                eprintln!("symlink privilege unavailable; Windows link test skipped");
+                return;
+            }
+            panic!("create file symlink: {err:#}");
         }
-        let dst = bindir.join(name);
-        atomic_symlink(&src, &dst)
-            .with_context(|| format!("symlink {} -> {}", dst.display(), src.display()))?;
+        atomic_symlink(&folder, &folder_link).unwrap();
+        assert!(fs::metadata(&file_link).unwrap().is_file());
+        assert_eq!(fs::read(&file_link).unwrap(), b"fixture");
+        assert!(fs::metadata(&folder_link).unwrap().is_dir());
+        assert_eq!(fs::read_link(&file_link).unwrap(), file);
+        assert_eq!(fs::read_link(&folder_link).unwrap(), folder);
+    }
+}
+
+fn install_link(source: &Path, destination: &Path, replacing: bool) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if !replacing {
+        rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            source,
+            rustix::fs::CWD,
+            destination,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .context("install new link without replacing an existing path")?;
+        return Ok(());
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = replacing;
+    fs::rename(source, destination)?;
+    Ok(())
+}
+
+pub(crate) fn validate_active_install(tool_root: &Path) -> Result<()> {
+    match fs::symlink_metadata(tool_root) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("inspect {}", tool_root.display())),
+        Ok(meta) => {
+            if !meta.is_dir() || meta.file_type().is_symlink() {
+                bail!(
+                    "refusing linked or non-directory tool root: {}",
+                    tool_root.display()
+                );
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                if meta.file_attributes() & 0x400 != 0 {
+                    bail!("refusing reparse-point tool root: {}", tool_root.display());
+                }
+            }
+        }
+    }
+    let active = tool_root.join("active");
+    match fs::symlink_metadata(&active) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("inspect {}", active.display())),
+        Ok(meta) if !meta.file_type().is_symlink() => bail!(
+            "refusing to replace non-symlink active path: {}",
+            active.display()
+        ),
+        Ok(_) => {}
+    }
+    let root = tool_root.canonicalize().context("resolve tool root")?;
+    let resolved = active
+        .canonicalize()
+        .context("resolve existing active installation")?;
+    if resolved == root || !resolved.starts_with(&root) || !resolved.is_dir() {
+        bail!(
+            "refusing to replace active link outside the tool root: {}",
+            active.display()
+        );
     }
     Ok(())
 }
 
+pub(crate) fn activate_install(tool_root: &Path, target: &Path) -> Result<()> {
+    validate_active_install(tool_root)?;
+    let root = tool_root.canonicalize().context("resolve tool root")?;
+    let target = target
+        .canonicalize()
+        .context("resolve staged installation")?;
+    if target == root || !target.starts_with(&root) || !target.is_dir() {
+        bail!("staged installation is outside the tool root");
+    }
+    atomic_symlink(&target, &tool_root.join("active"))
+}
+
+pub(crate) fn activate_managed_install(
+    ctx: &Ctx,
+    tool_root: &Path,
+    target: &Path,
+    tool: ToolKind,
+) -> Result<()> {
+    activate_install(tool_root, target)?;
+    #[cfg(unix)]
+    {
+        // A receipt failure must not turn a successful activation into a failed update.
+        if let Err(err) =
+            crate::installation_identity::record_active_link(tool_root, &ctx.bindir, tool)
+        {
+            warn(
+                ctx,
+                format!(
+                    "Managed cleanup will preserve the active {} link because its identity could not be recorded: {err}",
+                    tool.as_str()
+                ),
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (ctx, tool);
+    Ok(())
+}
+
+pub(crate) fn seal_managed_install(
+    ctx: &Ctx,
+    tool_root: &Path,
+    stage: &tempfile::TempDir,
+    tool: ToolKind,
+    version: &str,
+) {
+    #[cfg(unix)]
+    if let Err(err) = crate::installation_identity::seal(tool_root, stage, tool, version) {
+        warn(
+            ctx,
+            format!(
+                "This {} install is not eligible for managed cleanup: {err}",
+                tool.as_str()
+            ),
+        );
+    }
+    #[cfg(not(unix))]
+    let _ = (ctx, tool_root, stage, tool, version);
+}
+
+pub(crate) fn preflight_bin_links(
+    source: Option<&Path>,
+    target: &Path,
+    bindir: &Path,
+    names: &[&str],
+) -> Result<()> {
+    if !fs::metadata(bindir).is_ok_and(|meta| meta.is_dir()) {
+        bail!(
+            "symlink destination is not an accessible directory: {}",
+            bindir.display()
+        );
+    }
+    for &name in names {
+        if source.is_some_and(|source| !source.join(name).exists()) {
+            continue;
+        }
+        let dst = bindir.join(name);
+        match fs::symlink_metadata(&dst) {
+            Ok(meta)
+                if meta.file_type().is_symlink()
+                    && fs::read_link(&dst).is_ok_and(|existing| existing == target.join(name)) => {}
+            Ok(_) => bail!(
+                "refusing to replace an unrelated binary path: {}",
+                dst.display()
+            ),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err).with_context(|| format!("inspect {}", dst.display())),
+        }
+    }
+    Ok(())
+}
+
+pub fn link_dir_bins(bin_dir: &Path, bindir: &Path, names: &[&str]) -> Result<()> {
+    link_dir_bins_created(bin_dir, bindir, names).map(|_| ())
+}
+
+pub(crate) fn link_managed_tool_bins(
+    ctx: &Ctx,
+    tool_root: &Path,
+    tool: ToolKind,
+    bin_dir: &Path,
+    bindir: &Path,
+    names: &[&str],
+) -> Result<()> {
+    let created = link_dir_bins_created(bin_dir, bindir, names)?;
+    #[cfg(unix)]
+    {
+        // Matching pre-existing symlinks are not recorded or adopted.
+        if let Err(err) =
+            crate::installation_identity::record_created_links(tool_root, bindir, tool, &created)
+        {
+            warn(
+                ctx,
+                format!(
+                    "Managed cleanup will preserve unrecorded {} binary links: {err}",
+                    tool.as_str()
+                ),
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (ctx, tool_root, tool, created);
+    Ok(())
+}
+
+fn link_dir_bins_created(
+    bin_dir: &Path,
+    bindir: &Path,
+    names: &[&str],
+) -> Result<Vec<(PathBuf, PathBuf)>> {
+    preflight_bin_links(Some(bin_dir), bin_dir, bindir, names)?;
+    let mut created = Vec::new();
+    for &name in names {
+        let src = bin_dir.join(name);
+        if !src.exists() {
+            continue;
+        }
+        let dst = bindir.join(name);
+        if fs::read_link(&dst).is_ok_and(|existing| existing == src) {
+            continue;
+        }
+        atomic_symlink(&src, &dst)
+            .with_context(|| format!("symlink {} -> {}", dst.display(), src.display()))?;
+        created.push((dst, src));
+    }
+    Ok(created)
+}
+
 pub fn tool_bin_names(tool: ToolKind) -> &'static [&'static str] {
+    tool_bin_names_for_os(tool, std::env::consts::OS)
+}
+
+pub(crate) fn tool_bin_names_for_os(tool: ToolKind, os: &str) -> &'static [&'static str] {
     match tool {
+        ToolKind::Go if os == "windows" => &["go.exe", "gofmt.exe"],
         ToolKind::Go => &["go", "gofmt"],
         ToolKind::Node => &["node", "npm", "npx", "corepack"],
+        ToolKind::Python if os == "windows" => &["python.exe"],
         ToolKind::Python => &["python", "python3", "pip", "pip3"],
         ToolKind::Flutter => &["flutter", "dart", "pub"],
         ToolKind::Rust => &[],
         ToolKind::Mojo => &["mojo"],
+        ToolKind::Java if os == "windows" => &[
+            "java.exe",
+            "javac.exe",
+            "jar.exe",
+            "javadoc.exe",
+            "javap.exe",
+            "jlink.exe",
+            "jmod.exe",
+            "jpackage.exe",
+            "jshell.exe",
+            "keytool.exe",
+        ],
+        ToolKind::Java => &[
+            "java", "javac", "jar", "javadoc", "javap", "jlink", "jmod", "jpackage", "jshell",
+            "keytool",
+        ],
+        ToolKind::Dotnet if os == "windows" => &["dotnet.exe"],
+        ToolKind::Dotnet => &["dotnet"],
     }
 }
 
@@ -1423,6 +1762,8 @@ pub fn tool_path_hint_labels(tool: ToolKind) -> &'static [&'static str] {
         ToolKind::Flutter => &["flutter bin", "pub cache bin"],
         ToolKind::Rust => &["cargo bin"],
         ToolKind::Mojo => &[],
+        ToolKind::Java => &[],
+        ToolKind::Dotnet => &[],
     }
 }
 
@@ -1449,4 +1790,68 @@ pub fn print_json_error(command: &str, err: &anyhow::Error) {
         "{}",
         json_to_string_pretty(&payload).unwrap_or_else(|_| "{}".into())
     );
+}
+
+#[cfg(all(test, unix))]
+mod activation_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn new_link_does_not_replace_path_created_after_inspection() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("staged-link");
+        let destination = dir.path().join("destination");
+        symlink("target", &source).unwrap();
+        fs::write(&destination, "keep").unwrap();
+        assert!(install_link(&source, &destination, false).is_err());
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "keep");
+        assert_eq!(fs::read_link(&source).unwrap(), Path::new("target"));
+    }
+
+    #[test]
+    fn activation_rejects_external_targets_and_accepts_managed_relative_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("tool");
+        let old = root.join("old");
+        let new = root.join("new");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&old).unwrap();
+        fs::create_dir(&new).unwrap();
+        fs::create_dir(&outside).unwrap();
+        symlink("old", root.join("active")).unwrap();
+        assert!(activate_install(&root, &outside).is_err());
+        assert_eq!(
+            fs::read_link(root.join("active")).unwrap(),
+            Path::new("old")
+        );
+        activate_install(&root, &new).unwrap();
+        assert_eq!(
+            fs::read_link(root.join("active")).unwrap(),
+            new.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn linked_tool_root_is_rejected_even_without_active_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let external = dir.path().join("external");
+        let root = dir.path().join("tool");
+        fs::create_dir(&external).unwrap();
+        fs::write(external.join("keep"), "fixture").unwrap();
+        symlink(&external, &root).unwrap();
+        assert!(
+            validate_active_install(&root)
+                .unwrap_err()
+                .to_string()
+                .contains("linked")
+        );
+        assert!(activate_install(&root, &external).is_err());
+        assert_eq!(
+            fs::read_to_string(external.join("keep")).unwrap(),
+            "fixture"
+        );
+        assert!(!external.join("active").exists());
+    }
 }

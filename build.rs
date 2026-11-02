@@ -36,12 +36,11 @@ fn build_date() -> Option<String> {
     if let Ok(output) = Command::new("date")
         .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
         .output()
+        && output.status.success()
     {
-        if output.status.success() {
-            let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !s.is_empty() {
-                return Some(s);
-            }
+        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !s.is_empty() {
+            return Some(s);
         }
     }
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
