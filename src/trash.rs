@@ -3953,10 +3953,9 @@ pub fn status(cancel: &AtomicBool) -> TrashReport {
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod macos_home_trash_tests {
     use super::*;
-    use std::{
-        fs,
-        os::unix::{ffi::OsStringExt, fs::symlink},
-    };
+    #[cfg(target_os = "linux")]
+    use std::os::unix::ffi::OsStringExt;
+    use std::{fs, os::unix::fs::symlink};
 
     #[test]
     fn macos_status_includes_only_verified_volume_trash_without_following_links() {
@@ -3969,7 +3968,10 @@ mod macos_home_trash_tests {
         fs::write(home_trash.join("home-item"), b"home fixture").unwrap();
 
         let volumes = tempfile::tempdir().unwrap();
+        #[cfg(target_os = "linux")]
         let mounted_name = std::ffi::OsString::from_vec(b"Disk-\xff".to_vec());
+        #[cfg(target_os = "macos")]
+        let mounted_name = std::ffi::OsString::from("Disk-%\n");
         let mounted = volumes.path().join(&mounted_name);
         let mounted_shared_trash = mounted.join(".Trashes");
         let mounted_trash = mounted_shared_trash.join(uid.to_string());
@@ -4167,7 +4169,14 @@ mod macos_home_trash_tests {
         fs::write(trash.join("file"), b"fixture").unwrap();
         fs::create_dir(trash.join("directory")).unwrap();
         fs::write(trash.join("directory/nested"), b"fixture").unwrap();
+        #[cfg(target_os = "linux")]
         let escaped_name = std::ffi::OsString::from_vec(b"name%\n\xff".to_vec());
+        #[cfg(target_os = "macos")]
+        let escaped_name = std::ffi::OsString::from("name%\n");
+        #[cfg(target_os = "linux")]
+        let escaped_label = "name%25%0A%FF";
+        #[cfg(target_os = "macos")]
+        let escaped_label = "name%25%0A";
         fs::write(trash.join(escaped_name), b"").unwrap();
         let outside = tempfile::tempdir().unwrap();
         fs::write(outside.path().join("keep"), b"outside").unwrap();
@@ -4182,12 +4191,7 @@ mod macos_home_trash_tests {
         assert!(location.items.iter().any(|item| item.name == "file"));
         assert!(location.items.iter().any(|item| item.name == "directory"));
         assert!(location.items.iter().any(|item| item.name == "link"));
-        assert!(
-            location
-                .items
-                .iter()
-                .any(|item| item.name == "name%25%0A%FF")
-        );
+        assert!(location.items.iter().any(|item| item.name == escaped_label));
         assert!(
             location
                 .items
@@ -4222,7 +4226,7 @@ mod macos_home_trash_tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|item| item["name"] == "name%25%0A%FF")
+                .any(|item| item["name"] == escaped_label)
         );
     }
 

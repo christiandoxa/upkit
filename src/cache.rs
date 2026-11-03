@@ -1055,6 +1055,15 @@ fn bun_config_cache_path(
     if value.is_empty() || value.contains(['\0', '$', '%']) {
         return Err("Bun cache config path is unresolved");
     }
+    #[cfg(not(target_os = "linux"))]
+    if value
+        .split(['/', '\\'])
+        .any(|segment| matches!(segment, "." | ".."))
+    {
+        // Verbatim Windows paths do not normalize forward slashes. Validate
+        // the untrusted Bun config text *before* joining it to a prefix.
+        return Err("Bun cache config path has unresolved parent components");
+    }
     let path = if let Some(rest) = value.strip_prefix("~/") {
         home.join(rest)
     } else {
@@ -1273,10 +1282,16 @@ fn npm_prefix_global_config(prefix: &Path) -> Result<PathBuf, &'static str> {
         return Err("npm prefix is not a safe absolute path");
     }
     let global_config = prefix.join("etc/npmrc");
-    let mut current = PathBuf::new();
-    for component in global_config.components() {
-        current.push(component.as_os_str());
-        match std::fs::symlink_metadata(&current) {
+    // Use complete ancestor paths, rather than rebuilding a Windows verbatim
+    // prefix one component at a time: a bare `\\?\C:` is not a valid
+    // filesystem path, whereas `\\?\C:\` is.
+    for current in global_config
+        .ancestors()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        match std::fs::symlink_metadata(current) {
             Ok(metadata) => {
                 #[cfg(windows)]
                 let is_link = {
