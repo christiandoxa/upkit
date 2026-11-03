@@ -3393,11 +3393,15 @@ fn windows_go_environment_requires_known_gopath_and_follows_localappdata() {
                 .unwrap()
                 .contains("LOCALAPPDATA is unset or relative")
         }));
+        // The Windows Known Folder API may still provide a verified profile
+        // directory even if USERPROFILE is removed from this child process.
+        // The critical invariant is that the unspecified GOPATH cannot be
+        // inferred and must not produce a Go modules removal candidate.
         assert!(warnings.iter().any(|warning| {
             warning
                 .as_str()
                 .unwrap()
-                .contains("USERPROFILE is unset or relative")
+                .contains("default module cache cannot be inferred safely")
         }));
     }
 }
