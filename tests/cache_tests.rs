@@ -3105,9 +3105,17 @@ fn windows_go_environment_reads_default_and_override_with_process_precedence() {
                     .into_iter()
                     .flatten()
                     .filter_map(|warning| warning.as_str())
-                    .filter(|warning| warning.contains("Go"))
+                    .filter(|warning| {
+                        warning.contains("Go")
+                            || warning.contains("cannot determine the user home directory")
+                            || warning.contains("cannot determine the user cache or local data directory")
+                    })
                     .map(|warning| {
-                        if warning.contains("location is unsafe or unavailable") {
+                        if warning.contains("cannot determine the user home directory") {
+                            "home_unavailable"
+                        } else if warning.contains("cannot determine the user cache or local data directory") {
+                            "base_directories_unavailable"
+                        } else if warning.contains("location is unsafe or unavailable") {
                             "goenv_location_unsafe"
                         } else if warning.contains("is unreadable, unsafe") {
                             "goenv_read_unverified"
@@ -3282,9 +3290,17 @@ fn windows_go_environment_requires_known_gopath_and_follows_localappdata() {
                     .into_iter()
                     .flatten()
                     .filter_map(|warning| warning.as_str())
-                    .filter(|warning| warning.contains("Go"))
+                    .filter(|warning| {
+                        warning.contains("Go")
+                            || warning.contains("cannot determine the user home directory")
+                            || warning.contains("cannot determine the user cache or local data directory")
+                    })
                     .map(|warning| {
-                        if warning.contains("location is unsafe or unavailable") {
+                        if warning.contains("cannot determine the user home directory") {
+                            "home_unavailable"
+                        } else if warning.contains("cannot determine the user cache or local data directory") {
+                            "base_directories_unavailable"
+                        } else if warning.contains("location is unsafe or unavailable") {
                             "goenv_location_unsafe"
                         } else if warning.contains("is unreadable, unsafe") {
                             "goenv_read_unverified"

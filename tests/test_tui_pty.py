@@ -3541,9 +3541,12 @@ esac
                 if b"cancels." in terminal_text(output):
                     break
             assert b"cancels." in terminal_text(output), "timer enable review after resize did not reach the end"
+            # On a slower ARM64 runner the final resize and page events may
+            # still be queued. Wait for the fully drawn review before approval.
+            time.sleep(0.3)
             output.clear()
             os.write(master, b"y")
-            deadline = time.monotonic() + 15
+            deadline = time.monotonic() + 25
             verified = False
             while not verified and time.monotonic() < deadline:
                 if select.select([master], [], [], 0.2)[0]:
@@ -3554,7 +3557,12 @@ esac
                     except (OSError, ValueError):
                         continue
                     verified |= entry.get("operation") == "schedule_enable" and entry.get("outcome") == "completed"
-            assert verified, "timer enable was not verified and recorded"
+            assert verified, (
+                "timer enable was not verified and recorded: "
+                + terminal_text(output)[-1600:]
+                    .decode(errors="replace")
+                    .replace(str(home), "<fixture-home>")
+            )
             assert (home / "enabled_again").read_text() == "enabled"
             assert (unit_dir / "upkit-scan.service").read_text() == expected_service
             assert (unit_dir / "upkit-scan.timer").read_text() == plan["timer_unit"]
