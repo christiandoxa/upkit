@@ -658,7 +658,10 @@ fn windows_node_zip_preserves_layout_and_prior_installation() {
         #[cfg(windows)]
         std::os::windows::fs::symlink_dir(&old, root.join("active")).unwrap();
         set_run_output(
-            root.join("active/node.exe").to_string_lossy().as_ref(),
+            root.join("active")
+                .join("node.exe")
+                .to_string_lossy()
+                .as_ref(),
             &["--version"],
             output_with_status(0, b"v0.0.1", b""),
         );
@@ -688,7 +691,10 @@ fn windows_node_zip_preserves_layout_and_prior_installation() {
                 fs::canonicalize(&old).unwrap()
             );
             set_run_output(
-                root.join("active/node.exe").to_string_lossy().as_ref(),
+                root.join("active")
+                    .join("node.exe")
+                    .to_string_lossy()
+                    .as_ref(),
                 &["--version"],
                 output_with_status(0, b"v1.2.3", b""),
             );
@@ -760,7 +766,10 @@ fn windows_node_check_rejects_active_link_outside_tool_root() {
     std::os::windows::fs::symlink_dir(&outside, root.join("active")).unwrap();
     set_which("node", None);
     set_run_output(
-        root.join("active/node.exe").to_string_lossy().as_ref(),
+        root.join("active")
+            .join("node.exe")
+            .to_string_lossy()
+            .as_ref(),
         &["--version"],
         output_with_status(0, b"v1.2.3", b""),
     );
