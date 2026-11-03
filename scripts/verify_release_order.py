@@ -9,19 +9,25 @@ import urllib.request
 
 
 VERSION_TAG = re.compile(
-    r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\Z"
+    r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-rc\.([1-9][0-9]*))?\Z"
 )
 
 
 def parse_version(tag):
     if not isinstance(tag, str):
-        raise ValueError(f"Unsupported release tag {tag!r}; expected stable vMAJOR.MINOR.PATCH")
+        raise ValueError(f"Unsupported release tag {tag!r}; expected vMAJOR.MINOR.PATCH[-rc.N]")
     match = VERSION_TAG.fullmatch(tag)
     if match is None:
         raise ValueError(
-            f"Unsupported release tag {tag!r}; expected stable vMAJOR.MINOR.PATCH"
+            f"Unsupported release tag {tag!r}; expected vMAJOR.MINOR.PATCH[-rc.N]"
         )
-    return tuple(map(int, match.groups()))
+    major, minor, patch, rc_number = match.groups()
+    # Stable vX.Y.Z sorts strictly after every release candidate of vX.Y.Z.
+    return (
+        int(major), int(minor), int(patch),
+        0 if rc_number is not None else 1,
+        int(rc_number) if rc_number is not None else 0,
+    )
 
 
 def is_newer(candidate, latest):

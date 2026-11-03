@@ -2,7 +2,15 @@
 
 ## Unreleased (0.5.0)
 
-This work is in progress and has not been published as a standalone release.
+The stable release remains gated on 90% line coverage and final review.
+
+## 0.5.0-rc.1 (2026-11-03) — prerelease
+
+Release candidate for cross-platform evaluation. All six primary CI jobs
+passed on 2026-11-03, but line coverage was **83.42%**, short of the 90%
+stable-release target. High-risk maintenance commands remain opt-in and
+fail-closed; validate backups and review target paths before using them.
+This prerelease is **not** the latest stable release.
 
 ### Added
 

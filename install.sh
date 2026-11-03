@@ -22,7 +22,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 if [ "$release" != latest ]; then
-  printf '%s\n' "$release" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+$' || {
+  printf '%s\n' "$release" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+(-rc\.[1-9][0-9]*)?$' || {
     echo "Invalid release: $release" >&2; exit 1;
   }
   case "$release" in v*) ;; *) release="v$release" ;; esac
@@ -95,7 +95,7 @@ staged=$(mktemp "$install_dir/.upkit.XXXXXX")
 cp "$tmp_dir/$asset" "$staged"
 chmod 755 "$staged"
 version=$("$staged" --version)
-printf '%s\n' "$version" | grep -Eq '^upkit [0-9]+\.[0-9]+\.[0-9]+$' || {
+printf '%s\n' "$version" | grep -Eq '^upkit [0-9]+\.[0-9]+\.[0-9]+(-rc\.[1-9][0-9]*)?$' || {
   echo 'Downloaded binary did not report a valid upkit version' >&2; exit 1;
 }
 if [ "$release" != latest ] && [ "$version" != "upkit ${release#v}" ]; then

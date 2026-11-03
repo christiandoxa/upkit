@@ -957,8 +957,20 @@ def temp_cleanup_review_pty_test(binary):
             history = managed_home / "history"
             assert not history.exists() or not list(history.iterdir()), "cancelled preview wrote operation history"
             output.clear()
-            os.write(master, b"\x1b")
-            assert read_until(b"l: inspect Upkit temp links"), "temporary link subview did not close"
+            # Under coverage instrumentation the terminal may still be
+            # handling the previous PageDown/Esc sequence. Retry only the
+            # safe cancel key until the maintenance subview has closed.
+            deadline = time.monotonic() + 20
+            next_cancel = 0.0
+            while b"l: inspect Upkit temp links" not in terminal_text(output) and time.monotonic() < deadline:
+                if time.monotonic() >= next_cancel:
+                    os.write(master, b"\x1b")
+                    next_cancel = time.monotonic() + 1.5
+                if select.select([master], [], [], 0.2)[0]:
+                    output.extend(os.read(master, 65536))
+            assert b"l: inspect Upkit temp links" in terminal_text(output), (
+                "temporary link subview did not close"
+            )
             os.write(master, b"q")
             assert child.wait(timeout=10) == 0
             assert termios.tcgetattr(slave) == before, "terminal attributes were not restored"

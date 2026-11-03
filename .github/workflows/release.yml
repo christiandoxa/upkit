@@ -287,5 +287,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          release_flags=(--latest)
+          if [[ "$GITHUB_REF_NAME" == *-rc.* ]]; then
+            # Release candidates must not replace the last stable release.
+            release_flags=(--prerelease --latest=false)
+          fi
           gh release create "$GITHUB_REF_NAME" dist/* \
-            --verify-tag --title "upkit $VERSION" --generate-notes --latest
+            --verify-tag --title "upkit $VERSION" --generate-notes "${release_flags[@]}"

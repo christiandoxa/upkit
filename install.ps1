@@ -10,7 +10,7 @@ $ProgressPreference = 'SilentlyContinue'
 
 if ([string]::IsNullOrWhiteSpace($Release)) { $Release = 'latest' }
 if ($Release -cne 'latest') {
-    if ($Release -cnotmatch '^v?[0-9]+\.[0-9]+\.[0-9]+$') { throw "Invalid release: $Release" }
+    if ($Release -cnotmatch '^v?[0-9]+\.[0-9]+\.[0-9]+(-rc\.[1-9][0-9]*)?$') { throw "Invalid release: $Release" }
     if (-not $Release.StartsWith('v')) { $Release = "v$Release" }
 }
 if ([string]::IsNullOrWhiteSpace($InstallDir)) {
@@ -84,7 +84,7 @@ try {
         throw "SHA256 mismatch for $asset"
     }
     $version = (& $download --version | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0 -or $version -cnotmatch '^upkit [0-9]+\.[0-9]+\.[0-9]+$') {
+    if ($LASTEXITCODE -ne 0 -or $version -cnotmatch '^upkit [0-9]+\.[0-9]+\.[0-9]+(-rc\.[1-9][0-9]*)?$') {
         throw 'Downloaded binary did not report a valid upkit version'
     }
     if ($Release -cne 'latest' -and $version -cne "upkit $($Release.TrimStart('v'))") {

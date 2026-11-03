@@ -19,6 +19,13 @@ class ReleaseOrderTests(unittest.TestCase):
         self.assertTrue(release_order.is_newer("v1.3.0", "v1.2.99"))
         self.assertTrue(release_order.is_newer("v1.2.4", "v1.2.3"))
 
+    def test_release_candidate_order_and_stable_promotion(self):
+        self.assertTrue(release_order.is_newer("v0.5.0-rc.1", "v0.4.15"))
+        self.assertTrue(release_order.is_newer("v0.5.0-rc.2", "v0.5.0-rc.1"))
+        self.assertTrue(release_order.is_newer("v0.5.0", "v0.5.0-rc.7"))
+        self.assertFalse(release_order.is_newer("v0.5.0-rc.1", "v0.5.0"))
+        self.assertFalse(release_order.is_newer("v0.5.0-rc.1", "v0.5.0-rc.2"))
+
     def test_same_or_older_release_is_rejected(self):
         for candidate in ("v1.2.3", "v1.2.2"):
             with self.subTest(candidate=candidate):
@@ -85,10 +92,12 @@ class ReleaseOrderTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 release_order.verify_release_order("owner/repo", "v1.2.3", "token")
 
-    def test_only_stable_tags_are_supported(self):
+    def test_only_stable_or_numbered_rc_tags_are_supported(self):
         for tag in (
             "v01.2.3",
-            "v1.2.3-rc.1",
+            "v1.2.3-rc.0",
+            "v1.2.3-rc.01",
+            "v1.2.3-rc.fake",
             "v1.2.3+build",
             "v1.2.3+build-rc",
             "latest",
@@ -102,6 +111,17 @@ class ReleaseOrderTests(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError) as raised:
                 release_order.verify_repository_access("owner/repo", "token")
             raised.exception.close()
+
+    def test_release_candidate_newer_than_latest_stable_passes(self):
+        with patch.object(
+            release_order, "fetch_release", side_effect=[None, {"tag_name": "v0.4.15"}],
+        ), patch.object(release_order, "verify_repository_access"):
+            self.assertEqual(
+                release_order.verify_release_order(
+                    "owner/repo", "v0.5.0-rc.1", "token", expected_latest="v0.4.15"
+                ),
+                "v0.4.15",
+            )
 
     def test_newer_candidate_passes_with_mocked_api(self):
         with patch.object(
