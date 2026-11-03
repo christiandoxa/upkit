@@ -2423,6 +2423,19 @@ mod tests {
             grant.status.success(),
             "could not grant the private Task Scheduler ACL fixture permissions"
         );
+        // The temporary parent may be owned by a Windows service or the
+        // Administrators group even when the current user has full access.
+        // Production requires the actual owner to match the current SID.
+        let owner = std::process::Command::new(&icacls)
+            .arg(&directory_path)
+            .arg("/setowner")
+            .arg(format!("*{sid}"))
+            .output()
+            .unwrap();
+        assert!(
+            owner.status.success(),
+            "could not set the Task Scheduler ACL fixture owner to the current user"
+        );
         let restrict = std::process::Command::new(&icacls)
             .arg(&directory_path)
             .arg("/inheritance:r")
@@ -2466,9 +2479,51 @@ mod tests {
             .and_then(|line| line.split_once(':'))
             .map(|(_, id)| id.trim().chars().take(96).collect::<String>())
             .unwrap_or_else(|| "unavailable".into());
+        let acl_diagnosis = if check.status.code() == Some(4) {
+            // Classify fixture ACL failures without exposing principal names,
+            // SIDs, the complete security descriptor, or local file paths.
+            let script = r#"
+$ErrorActionPreference = 'Stop'
+try {
+    $acl = [System.IO.Directory]::GetAccessControl($env:UPKIT_TASK_ACL_PATH)
+    $sections = [System.Security.AccessControl.AccessControlSections]::Access -bor [System.Security.AccessControl.AccessControlSections]::Owner
+    $descriptor = [System.Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorSddlForm($sections))
+    $trusted = @($env:UPKIT_TASK_SID, 'S-1-5-18', 'S-1-5-32-544')
+    $untrusted = 0
+    $unsupported = 0
+    foreach ($ace in $descriptor.DiscretionaryAcl) {
+        if (($ace -isnot [System.Security.AccessControl.CommonAce]) -or $ace.IsCallback) { $unsupported++ }
+        if (($ace.AceQualifier -eq [System.Security.AccessControl.AceQualifier]::AccessAllowed) -and
+            ($ace.SecurityIdentifier.Value -notin $trusted) -and $ace.AccessMask -ne 0) { $untrusted++ }
+    }
+    $ownerMatch = $descriptor.Owner.Value -eq $env:UPKIT_TASK_SID
+    [Console]::Out.Write("owner_match=$ownerMatch;untrusted_allowed=$untrusted;unsupported_ace=$unsupported")
+} catch {
+    [Console]::Out.Write('acl_inspection_failed')
+}
+"#;
+            let diagnostic = std::process::Command::new(&powershell)
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    script,
+                ])
+                .env("UPKIT_TASK_ACL_PATH", &directory_path)
+                .env("UPKIT_TASK_SID", &sid)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&diagnostic.stdout)
+                .chars()
+                .take(96)
+                .collect::<String>()
+        } else {
+            "not_needed".to_owned()
+        };
         assert!(
             check.status.success() && check.stdout == b"OK",
-            "private ACL fixture verification failed: code={:?}, category={category}, error_id={error_id}",
+            "private ACL fixture verification failed: code={:?}, category={category}, error_id={error_id}, acl_diagnosis={acl_diagnosis}",
             check.status.code()
         );
         verify_private_acl(&directory_path, &sid, &powershell).unwrap();
