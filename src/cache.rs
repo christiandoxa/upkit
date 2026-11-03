@@ -5422,11 +5422,14 @@ mod tests {
     #[test]
     fn npm_prefix_adds_default_global_config_as_a_possible_location() {
         let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().join("home");
-        let cwd = dir.path().join("project");
-        let prefix = dir.path().join("npm-prefix");
+        // macOS can expose /var as a symlink to /private/var. Build
+        // fixtures from the verified real root, never an aliased ancestor.
+        let root = dir.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let cwd = root.join("project");
+        let prefix = root.join("npm-prefix");
         let global = prefix.join("etc/npmrc");
-        let cache = dir.path().join("npm-cache");
+        let cache = root.join("npm-cache");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&cwd).unwrap();
         std::fs::create_dir_all(global.parent().unwrap()).unwrap();
@@ -5468,11 +5471,14 @@ mod tests {
     #[test]
     fn npm_config_prefix_adds_default_global_config_as_a_possible_location() {
         let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().join("home");
-        let cwd = dir.path().join("project");
-        let prefix = dir.path().join("configured-prefix");
+        // macOS can expose /var as a symlink to /private/var. Build
+        // fixtures from the verified real root, never an aliased ancestor.
+        let root = dir.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let cwd = root.join("project");
+        let prefix = root.join("configured-prefix");
         let global = prefix.join("etc/npmrc");
-        let cache = dir.path().join("npm-cache");
+        let cache = root.join("npm-cache");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&cwd).unwrap();
         std::fs::create_dir_all(global.parent().unwrap()).unwrap();
@@ -6347,17 +6353,20 @@ mod tests {
     #[test]
     fn nuget_solution_config_paths_keep_the_union_across_ancestor_clears_and_removes() {
         let dir = tempfile::tempdir().unwrap();
-        let project = dir.path().join("solution/member");
+        // macOS can expose /var as a symlink to /private/var. Build
+        // fixtures from the verified real root, never an aliased ancestor.
+        let root = dir.path().canonicalize().unwrap();
+        let project = root.join("solution/member");
         std::fs::create_dir_all(&project).unwrap();
-        let solution = dir.path().join("solution");
-        let old_global = dir.path().join("old-global");
-        let new_global = dir.path().join("new-global");
-        let old_fallback = dir.path().join("old-fallback");
-        let new_fallback = dir.path().join("new-fallback");
-        let old_source = dir.path().join("old-source");
-        let new_source = dir.path().join("new-source");
-        let old_repository = dir.path().join("old-repository");
-        let new_repository = dir.path().join("new-repository");
+        let solution = root.join("solution");
+        let old_global = root.join("old-global");
+        let new_global = root.join("new-global");
+        let old_fallback = root.join("old-fallback");
+        let new_fallback = root.join("new-fallback");
+        let old_source = root.join("old-source");
+        let new_source = root.join("new-source");
+        let old_repository = root.join("old-repository");
+        let new_repository = root.join("new-repository");
         std::fs::write(
             solution.join("NuGet.config"),
             format!(
@@ -6375,7 +6384,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            nuget_solution_config_paths(Platform::Linux, &project).unwrap(),
+            nuget_solution_config_paths(
+                if cfg!(target_os = "macos") {
+                    Platform::Macos
+                } else {
+                    Platform::Linux
+                },
+                &project,
+            )
+            .unwrap(),
             NugetSolutionConfigPaths {
                 global_packages: vec![new_global, old_global],
                 fallback_package_folders: vec![new_fallback, old_fallback],
@@ -6408,7 +6425,10 @@ mod tests {
     #[test]
     fn nuget_solution_config_deduplicates_only_same_macos_case_aliases() {
         let dir = tempfile::tempdir().unwrap();
-        let project = dir.path().join("project");
+        // macOS can expose /var as a symlink to /private/var. Build
+        // fixtures from the verified real root, never an aliased ancestor.
+        let root = dir.path().canonicalize().unwrap();
+        let project = root.join("project");
         std::fs::create_dir(&project).unwrap();
         let content =
             b"<configuration><packageSources><add key=\"local\" value=\"/tmp/feed\"/></packageSources></configuration>";
@@ -6442,11 +6462,24 @@ mod tests {
             &changed_content
         ));
 
-        let distinct_dir = dir.path().join("distinct");
+        let distinct_dir = root.join("distinct");
         std::fs::create_dir(&distinct_dir).unwrap();
         std::fs::write(distinct_dir.join("NuGet.Config"), content).unwrap();
         std::fs::write(distinct_dir.join("nuget.config"), content).unwrap();
-        assert!(nuget_solution_config_paths(Platform::Macos, &distinct_dir).is_err());
+        // On case-insensitive APFS these spellings are the *same file*.
+        // On case-sensitive volumes they can be two distinct files and must
+        // fail closed. Exercise the behavior that the host can represent.
+        let first = read_maven_settings(&distinct_dir.join("NuGet.Config"))
+            .unwrap()
+            .unwrap();
+        let second = read_maven_settings(&distinct_dir.join("nuget.config"))
+            .unwrap()
+            .unwrap();
+        if same_nuget_config_case_alias(Platform::Macos, &first, &second) {
+            assert!(nuget_solution_config_paths(Platform::Macos, &distinct_dir).is_ok());
+        } else {
+            assert!(nuget_solution_config_paths(Platform::Macos, &distinct_dir).is_err());
+        }
     }
 
     #[test]
@@ -6751,8 +6784,11 @@ mod tests {
     #[test]
     fn bun_config_cache_paths_resolve_relative_and_home_values() {
         let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().join("home");
-        let workspace = dir.path().join("workspace");
+        // macOS can expose /var as a symlink to /private/var. Build
+        // fixtures from the verified real root, never an aliased ancestor.
+        let root = dir.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let workspace = root.join("workspace");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&workspace).unwrap();
 
@@ -6765,7 +6801,7 @@ dir = "../cache/bun"
                 &workspace
             )
             .unwrap(),
-            Some(dir.path().join("cache/bun"))
+            Some(root.join("cache/bun"))
         );
         assert_eq!(
             parse_bun_cache_config(
@@ -6785,9 +6821,12 @@ dir = "~/bun-cache"
         use std::ffi::OsStr;
 
         let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().join("home");
-        let xdg_config = dir.path().join("xdg-config");
-        let workspace = dir.path().join("workspace");
+        // macOS can expose /var as a symlink to /private/var. Build
+        // fixtures from the verified real root, never an aliased ancestor.
+        let root = dir.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let xdg_config = root.join("xdg-config");
+        let workspace = root.join("workspace");
         let nested = workspace.join("packages/app");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&xdg_config).unwrap();
@@ -6810,7 +6849,7 @@ dir = "../cache/bun-workspace"
         let paths = bun_config_cache_paths(&home, &nested, Some(xdg_config.as_os_str())).unwrap();
         assert_eq!(paths.len(), 2);
         assert!(paths.contains(&home.join("bun-global")));
-        assert!(paths.contains(&dir.path().join("cache/bun-workspace")));
+        assert!(paths.contains(&root.join("cache/bun-workspace")));
         assert!(bun_config_cache_paths(&home, &nested, Some(OsStr::new("relative"))).is_err());
     }
 

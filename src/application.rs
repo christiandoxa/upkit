@@ -7199,7 +7199,9 @@ mod windows_node_doctor_tests {
         fs::write(bin.join("flutter.bat"), b"fixture launcher").unwrap();
         fs::write(bin.join("dart.bat"), b"fixture launcher").unwrap();
         symlink_dir(&version, flutter_root.join("active")).unwrap();
-        flutter_root.join("active/bin")
+        // Construct each component separately: Windows PathBuf preserves a
+        // literal '/' in a joined string, while the Doctor builds '\' paths.
+        flutter_root.join("active").join("bin")
     }
 
     #[test]
@@ -7383,6 +7385,10 @@ mod windows_node_doctor_tests {
         }
         let (ctx, config) = fixture_ctx(dir.path());
         let flutter_bin = install_flutter_fixture(&ctx);
+        assert_eq!(
+            managed_windows_flutter_bin(&ctx).as_deref(),
+            Some(flutter_bin.as_path())
+        );
         set_path(std::slice::from_ref(&ctx.bindir));
         set_env_var("PATHEXT", Some(".EXE;.BAT".into()));
 
