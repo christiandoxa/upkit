@@ -1710,6 +1710,48 @@ fn verify_private_acl(path: &Path, sid: &str, powershell: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
+fn set_private_task_xml_acl(path: &Path, sid: &str) -> Result<()> {
+    if !valid_sid(sid) {
+        bail!("Task Scheduler XML owner SID is invalid");
+    }
+    // A newly created Windows file does not necessarily have the same owner
+    // or explicit DACL as its private parent (notably with elevated tokens).
+    // Only touch this freshly created, randomly named XML file. Every step
+    // fails closed and the independent .NET ACL verifier runs afterwards.
+    let icacls = system_binary("icacls.exe")?;
+    let path = path
+        .to_str()
+        .context("Task Scheduler XML path must be UTF-8")?;
+    let user_access = format!("*{sid}:F");
+    let user_owner = format!("*{sid}");
+    for (args, step) in [
+        (&[path, "/reset"][..], "restore private parent ACL"),
+        (
+            &[
+                path,
+                "/grant:r",
+                &user_access,
+                "*S-1-5-18:F",
+                "*S-1-5-32-544:F",
+            ][..],
+            "grant only trusted principals",
+        ),
+        (
+            &[path, "/inheritance:r"][..],
+            "remove inherited ACL entries",
+        ),
+        (
+            &[path, "/setowner", &user_owner][..],
+            "set current user owner",
+        ),
+    ] {
+        command_output(&icacls, args, 4096)
+            .with_context(|| format!("Task Scheduler XML ACL setup failed: {step}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
 fn with_safe_task_xml<T>(
     directory: &Path,
     xml: &str,
@@ -1737,6 +1779,12 @@ fn with_safe_task_xml<T>(
     }
     let original_identity = handle_identity(temp.as_file(), false)?;
     let temp_path = temp.into_temp_path();
+    // Reject replacement before changing the ACL; then recheck the file's
+    // identity and its final private ACL before Task Scheduler sees it.
+    if file_identity(&temp_path, false)? != original_identity {
+        bail!("Task Scheduler XML file changed before its ACL was secured");
+    }
+    set_private_task_xml_acl(&temp_path, sid)?;
     let mut lock = std::fs::OpenOptions::new()
         .read(true)
         .share_mode(SHARE_READ)
@@ -2538,6 +2586,8 @@ try {
             let diagnostic = format!("{error:#}");
             let category = if diagnostic.contains("canonical absolute Windows paths") {
                 "path_noncanonical"
+            } else if diagnostic.contains("XML ACL setup failed") {
+                "temp_file_acl_setup"
             } else if diagnostic.contains("temporary-file ACL") {
                 "temp_file_acl"
             } else if diagnostic.contains("parent-directory ACL") {
