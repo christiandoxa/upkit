@@ -4700,6 +4700,14 @@ pub(crate) fn selected_cache(path: &Path) -> anyhow::Result<Spec> {
     Ok(first)
 }
 
+#[cfg(windows)]
+fn validated_windows_inventory_root(value: &std::ffi::OsStr) -> Option<PathBuf> {
+    // Read-only inventory fallback for restricted environments where the
+    // Windows Known Folder API cannot resolve a location. Never infer a root
+    // from a relative, parent-traversing, or filesystem-root-only override.
+    nuget_safe_absolute_path(PathBuf::from(value)).ok()
+}
+
 pub fn inventory(cancel: &AtomicBool) -> CacheReport {
     if cancel.load(Ordering::Relaxed) {
         return CacheReport {
@@ -4720,14 +4728,32 @@ pub fn inventory(cancel: &AtomicBool) -> CacheReport {
             };
         }
     };
-    let Some(home) = dirs::home_dir() else {
+    #[cfg(windows)]
+    let home = dirs::home_dir().or_else(|| {
+        env::var_os("USERPROFILE")
+            .as_deref()
+            .and_then(validated_windows_inventory_root)
+    });
+    #[cfg(not(windows))]
+    let home = dirs::home_dir();
+    let Some(home) = home else {
         return CacheReport {
             entries: vec![],
             warnings: vec!["cannot determine the user home directory".into()],
             cancelled: false,
         };
     };
+    #[cfg(windows)]
+    let local_app_data = env::var_os("LOCALAPPDATA")
+        .as_deref()
+        .and_then(validated_windows_inventory_root);
+    #[cfg(windows)]
+    let cache = dirs::cache_dir().or_else(|| local_app_data.clone());
+    #[cfg(windows)]
+    let data = dirs::data_local_dir().or(local_app_data);
+    #[cfg(not(windows))]
     let cache = dirs::cache_dir();
+    #[cfg(not(windows))]
     let data = dirs::data_local_dir();
     let (Some(cache), Some(data)) = (cache, data) else {
         return CacheReport {
@@ -7085,6 +7111,24 @@ dir = "~/bun-global"
         let oversized = root.join("oversized-env");
         fs::write(&oversized, vec![b'x'; 256 * 1024 + 1]).unwrap();
         assert!(read_go_environment_file(&oversized).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_readonly_inventory_fallback_needs_safe_absolute_location() {
+        use std::ffi::OsStr;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let canonical = temporary.path().canonicalize().unwrap();
+        assert_eq!(
+            validated_windows_inventory_root(canonical.as_os_str()),
+            Some(canonical.clone())
+        );
+        assert!(validated_windows_inventory_root(OsStr::new("relative/cache")).is_none());
+        assert!(validated_windows_inventory_root(OsStr::new("../private")).is_none());
+        assert!(
+            validated_windows_inventory_root(canonical.join("../outside").as_os_str()).is_none()
+        );
     }
 
     #[cfg(windows)]
