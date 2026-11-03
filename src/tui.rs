@@ -673,6 +673,7 @@ struct App {
     cache_scroll: u16,
     cache_filter: String,
     cache_sort: CacheSort,
+    cache_details: bool,
     cache_search: Option<String>,
     cache_choosing: bool,
     cache_selected: Option<PathBuf>,
@@ -5683,6 +5684,11 @@ impl App {
                 }
                 Action::None
             }
+            KeyCode::Char('w') if self.page == Start::Cache && self.cache.is_some() => {
+                self.cache_details = !self.cache_details;
+                self.cache_scroll = 0;
+                Action::None
+            }
             KeyCode::Char('s') if self.page == Start::Cache && !self.cache_running => {
                 self.cache_sort = self.cache_sort.next();
                 self.normalize_cache_selection();
@@ -6591,6 +6597,58 @@ fn cache_content(app: &App) -> String {
                     .into(),
                 );
             }
+            if !app.cache_details {
+                lines.extend(visible.iter().map(|entry| {
+                    let selected = if Some(&entry.path) == app.cache_selected.as_ref() {
+                        "›"
+                    } else {
+                        " "
+                    };
+                    let size = entry.logical_bytes.map_or_else(
+                        || "size unknown".to_owned(),
+                        |bytes| {
+                            if bytes >= 1_048_576 {
+                                format!("{:.1} MiB snapshot", bytes as f64 / 1_048_576.0)
+                            } else if bytes >= 1024 {
+                                format!("{:.1} KiB snapshot", bytes as f64 / 1024.0)
+                            } else {
+                                format!("{bytes} B snapshot")
+                            }
+                        },
+                    );
+                    format!(
+                        "{selected} {}: {size}  |  {}\n    {}",
+                        entry.name,
+                        entry.status,
+                        crate::shared_cache_cleanup::display_path(&entry.path),
+                    )
+                }));
+                let warning_count = report.warnings.len()
+                    + visible
+                        .iter()
+                        .map(|entry| entry.warnings.len())
+                        .sum::<usize>();
+                if warning_count > 0 {
+                    lines.push(format!(
+                        "⚠ {warning_count} diagnostic warning(s). Press w to read details."
+                    ));
+                    lines.push(
+                        "Unverified and unsafe cache paths are never eligible for deletion.".into(),
+                    );
+                }
+                if report.cancelled {
+                    lines.push("Inventory cancelled; results are partial.".into());
+                    lines.extend(
+                        report
+                            .warnings
+                            .iter()
+                            .take(2)
+                            .map(|warning| format!("Warning: {warning}")),
+                    );
+                }
+                lines.push("s: sort  /: filter  d: review removal  w: diagnostics".into());
+                return lines.join("\n");
+            }
             lines.extend(visible.iter().map(|entry| {
                 let selected = if Some(&entry.path) == app.cache_selected.as_ref() {
                     "›"
@@ -6805,6 +6863,22 @@ fn application_status(app: &App) -> &'static str {
     }
 }
 
+fn expire_toolchain_refresh_notice(
+    message: &mut String,
+    first_seen: &mut Option<std::time::Instant>,
+    now: std::time::Instant,
+) {
+    if message == "Toolchain inventory refreshed." {
+        let start = first_seen.get_or_insert(now);
+        if now.duration_since(*start) >= Duration::from_secs(4) {
+            message.clear();
+            *first_seen = None;
+        }
+    } else {
+        *first_seen = None;
+    }
+}
+
 fn draw_for_platform(frame: &mut Frame<'_>, app: &App, platform: SchedulePlatform) {
     let areas = Layout::vertical([
         Constraint::Length(3),
@@ -6864,26 +6938,38 @@ fn draw_for_platform(frame: &mut Frame<'_>, app: &App, platform: SchedulePlatfor
         (Start::Reports, "Reports"),
         (Start::Settings, "Settings"),
     ];
-    let nav = if frame.area().width < 60 {
+    let nav: Vec<ratatui::text::Line<'_>> = if frame.area().width < 60 {
         let name = pages
             .iter()
             .find(|(page, _)| *page == app.page)
             .map_or("", |(_, name)| *name);
-        if app.cli_preview_read_only {
+        vec![ratatui::text::Line::from(if app.cli_preview_read_only {
             format!("› {name}  (read-only)")
         } else {
-            format!("› {name}  (Tab: next)")
-        }
+            format!("←/→ {name}  Tab: next")
+        })]
     } else {
         pages
             .iter()
-            .map(|(page, name)| format!("{} {name}", if *page == app.page { "›" } else { " " }))
-            .collect::<Vec<_>>()
-            .join("\n")
+            .map(|(page, name)| {
+                if *page == app.page {
+                    ratatui::text::Line::from(ratatui::text::Span::styled(
+                        format!("› {name}"),
+                        Style::default().fg(Color::Black).bg(Color::Cyan),
+                    ))
+                } else {
+                    ratatui::text::Line::raw(format!("  {name}"))
+                }
+            })
+            .collect()
     };
     frame.render_widget(
         Paragraph::new(nav)
-            .block(Block::default().borders(Borders::ALL).title(" Navigate "))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Pages ←/→ Tab "),
+            )
             .style(Style::default().fg(Color::Cyan)),
         body[0],
     );
@@ -7257,7 +7343,7 @@ fn draw_for_platform(frame: &mut Frame<'_>, app: &App, platform: SchedulePlatfor
                         " "
                     };
                     format!(
-                        "{marker}[{}] {:<8} installed: {:<13} latest: {:<13} {:?}",
+                        "{marker}[{}] {:<8} installed: {:<13} latest: {:<13} {}",
                         if app.marked.contains(&r.tool) {
                             "x"
                         } else {
@@ -7268,7 +7354,12 @@ fn draw_for_platform(frame: &mut Frame<'_>, app: &App, platform: SchedulePlatfor
                             .as_ref()
                             .map_or("-".to_owned(), |v| v.to_string()),
                         r.latest.as_ref().map_or("-".to_owned(), |v| v.to_string()),
-                        r.status
+                        match r.status {
+                            crate::Status::UpToDate => "Up to date",
+                            crate::Status::Outdated => "Update available",
+                            crate::Status::NotInstalled => "Not installed",
+                            crate::Status::Unknown => "Unknown",
+                        }
                     )
                 }));
                 if visible.is_empty() {
@@ -7502,11 +7593,11 @@ fn draw_for_platform(frame: &mut Frame<'_>, app: &App, platform: SchedulePlatfor
         .map(|search| format!("Filter: {search}  (Enter: apply  Esc: cancel)"));
     let footer = if let Some(search) = &search_footer {
         search.as_str()
-    } else if app.message.is_empty() && app.settings_form.is_some() {
+    } else if app.settings_form.is_some() {
         "↑/↓: select  Enter: edit/toggle  d: remove path  ←/→: profile  n: add profile  Ctrl+S: save  t: TOML  Esc: back"
-    } else if app.message.is_empty() && app.settings_editor.is_some() {
+    } else if app.settings_editor.is_some() {
         "Ctrl+S: review save  Esc: exit  Tab: indent"
-    } else if app.message.is_empty() {
+    } else {
         match app.page {
             Start::Toolchains if app.managed_mode => {
                 if app
@@ -7567,7 +7658,7 @@ fn draw_for_platform(frame: &mut Frame<'_>, app: &App, platform: SchedulePlatfor
             }
             Start::Cache if app.cache_running => "Tab: page  Esc: cancel inventory  q: quit",
             Start::Cache => {
-                "/: filter  s: sort  Enter/r: inventory  d: removal  e: Go test  ↑/↓: scroll  q: quit"
+                "/: filter  s: sort  Enter/r: refresh  d: preview removal  w: warnings  ↑/↓: scroll  q: quit"
             }
             Start::Trash if app.trash_running => "Tab: page  Esc: cancel inventory  q: quit",
             Start::Trash => {
@@ -7592,11 +7683,8 @@ fn draw_for_platform(frame: &mut Frame<'_>, app: &App, platform: SchedulePlatfor
                 "e: structured edit  t: edit TOML  r: reload  ↑/↓: scroll  Tab: page  q: quit"
             }
         }
-    } else {
-        &app.message
     };
     let footer = if app.page == Start::Toolchains
-        && app.message.is_empty()
         && search_footer.is_none()
         && ratatui::text::Line::from(footer).width() > frame.area().width.saturating_sub(2) as usize
     {
@@ -7604,10 +7692,20 @@ fn draw_for_platform(frame: &mut Frame<'_>, app: &App, platform: SchedulePlatfor
     } else {
         footer
     };
-    frame.render_widget(
-        Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
-        areas[2],
-    );
+    // Keep the original three-row footer so terminal height and safety
+    // disclosures do not shrink. Navigation is always visible in the top
+    // border, page actions stay on the content row, and status is independent
+    // in the bottom border—even after an asynchronous refresh completes.
+    let mut footer_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" ←/→: sections  Tab: next  ?: help ");
+    if !app.message.is_empty() {
+        footer_block = footer_block.title_bottom(ratatui::text::Line::from(format!(
+            " Status: {} ",
+            schedule_escape_controls(&app.message).replace('\n', " ")
+        )));
+    }
+    frame.render_widget(Paragraph::new(footer).block(footer_block), areas[2]);
     if let Some(message) = &app.managed_result {
         let area = centered(
             frame.area(),
@@ -8692,7 +8790,7 @@ fn draw_for_platform(frame: &mut Frame<'_>, app: &App, platform: SchedulePlatfor
                 "Maintenance: ↑/↓ selects a mount; Enter previews TRIM; l reviews stale Upkit link staging directories."
             }
             Start::Cache => {
-                "Caches: / filters name or escaped path; Enter or r inventories; d selects a visible cache for removal review; e previews Go test expiration; ↑/↓ scrolls."
+                "Caches: start with a concise summary. w toggles full diagnostic warnings and ownership details; / filters names and escaped paths; s sorts; Enter or r refreshes; d opens a separate removal review (never removes immediately); ↑/↓ scrolls."
             }
             Start::Trash => {
                 "Trash: 7, 1, or 3 previews 7, 14, or 30 days; Space marks; A selects eligible items in the highlighted location; Enter reviews; 0 shows status."
@@ -12370,6 +12468,7 @@ pub(crate) fn run_with_config(
             cache_scroll: 0,
             cache_filter: String::new(),
             cache_sort: CacheSort::default(),
+            cache_details: false,
             cache_search: None,
             cache_choosing: false,
             cache_selected: None,
@@ -12469,6 +12568,7 @@ pub(crate) fn run_with_config(
         };
         let mut visible_confirmations = confirmation_surfaces(&app);
         let mut pending_safe_input = VecDeque::new();
+        let mut toolchain_refresh_notice_started = None;
         loop {
             if app.scan_running {
                 app.scan_visited = scan_progress.load(Ordering::Relaxed);
@@ -13580,6 +13680,11 @@ pub(crate) fn run_with_config(
                     }
                 }
             }
+            expire_toolchain_refresh_notice(
+                &mut app.message,
+                &mut toolchain_refresh_notice_started,
+                std::time::Instant::now(),
+            );
             let size = terminal.size()?;
             let area = Rect::new(0, 0, size.width, size.height);
             app.update_artifact_review(area);
@@ -15174,6 +15279,7 @@ mod tests {
             cache_scroll: 0,
             cache_filter: String::new(),
             cache_sort: CacheSort::default(),
+            cache_details: false,
             cache_search: None,
             cache_choosing: false,
             cache_selected: None,
@@ -16172,6 +16278,52 @@ mod tests {
         let output = format!("{:?}", terminal.backend().buffer());
         assert!(output.contains("Scanning workspace… 17 directories inspected."));
         assert!(output.contains("Esc: cancel scan"));
+    }
+
+    #[test]
+    fn navigation_and_shortcuts_remain_visible_after_refresh_and_status_expires() {
+        let mut app = app();
+        app.message = "Toolchain inventory refreshed.".into();
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let output = format!("{:?}", terminal.backend().buffer());
+        assert!(output.contains("Pages ←/→ Tab"));
+        assert!(output.contains("←/→: sections"));
+        assert!(output.contains("r: refresh"));
+        assert!(output.contains("Enter: update"));
+        assert!(output.contains("Status: Toolchain inventory refreshed."));
+        let cell = terminal.backend().buffer().cell((1, 5)).unwrap();
+        assert_eq!(
+            cell.bg,
+            Color::Cyan,
+            "selected sidebar page should stand out"
+        );
+
+        let first = std::time::Instant::now();
+        let mut seen = None;
+        expire_toolchain_refresh_notice(&mut app.message, &mut seen, first);
+        assert_eq!(app.message, "Toolchain inventory refreshed.");
+        expire_toolchain_refresh_notice(
+            &mut app.message,
+            &mut seen,
+            first + Duration::from_secs(5),
+        );
+        assert!(app.message.is_empty());
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let output = format!("{:?}", terminal.backend().buffer());
+        assert!(output.contains("r: refresh"));
+        assert!(!output.contains("Toolchain inventory refreshed."));
+
+        app.message = "Shared-cache preview failed: unsafe path".into();
+        expire_toolchain_refresh_notice(
+            &mut app.message,
+            &mut seen,
+            first + Duration::from_secs(20),
+        );
+        assert!(
+            app.message.contains("unsafe path"),
+            "errors must not auto-dismiss"
+        );
     }
 
     #[test]
@@ -18708,7 +18860,15 @@ mod tests {
         assert!(output.contains("2 of 3 caches"));
         assert!(output.contains("Cargo registry") && output.contains("Cargo git"));
         assert!(!output.contains("Go build"));
-        assert!(output.contains("global warning"));
+        assert!(output.contains("1 diagnostic warning(s)"));
+        assert!(!output.contains("global warning"));
+        app.key(key(KeyCode::Char('w')));
+        assert!(app.cache_details);
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let details = format!("{:?}", terminal.backend().buffer());
+        assert!(details.contains("global warning"));
+        app.key(key(KeyCode::Char('w')));
+        assert!(!app.cache_details);
         assert!(matches!(app.key(key(KeyCode::Char('e'))), Action::None));
         app.key(key(KeyCode::Char('d')));
         assert!(app.cache_choosing);
@@ -18783,6 +18943,9 @@ mod tests {
         });
         app.cache_selected = Some(active_path.clone());
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert!(!cache_content(&app).contains("Directory owner (snapshot)"));
+        app.key(key(KeyCode::Char('w')));
+        assert!(app.cache_details);
         app.key(key(KeyCode::Char('/')));
         for character in "cache".chars() {
             app.key(key(KeyCode::Char(character)));
@@ -18993,6 +19156,8 @@ mod tests {
             visible_cache_entries(app.cache.as_ref().unwrap(), "", app.cache_sort).len(),
             5
         );
+        assert!(!cache_content(&app).contains("Directory owner (snapshot)"));
+        app.key(key(KeyCode::Char('w')));
         let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let output = format!("{:?}", terminal.backend().buffer());
@@ -20984,6 +21149,8 @@ mod tests {
             cancelled: false,
         });
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert!(!cache_content(&app).contains("Directory owner (snapshot)"));
+        app.key(key(KeyCode::Char('w')));
         let mut inventory = Terminal::new(TestBackend::new(110, 24)).unwrap();
         inventory.draw(|frame| draw(frame, &app)).unwrap();
         assert!(

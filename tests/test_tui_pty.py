@@ -1730,13 +1730,13 @@ def cache_tui_pty_smoke_test(binary, unshare, mount, namespace_args):
         try:
             deadline = time.monotonic() + 10
             size = 24
-            redraw_at = 0
+            redraw_at = time.monotonic() + 0.8
             while b"Cargo registry:" not in terminal_text(output) and time.monotonic() < deadline:
                 if time.monotonic() >= redraw_at:
                     size = 25 if size == 24 else 24
                     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", size, 100, 0, 0))
                     resize_child()
-                    redraw_at = time.monotonic() + 0.25
+                    redraw_at = time.monotonic() + 1.25
                 if select.select([master], [], [], 0.2)[0]:
                     output.extend(os.read(master, 65536))
             assert b"Cargo registry:" in terminal_text(output), "cache inventory did not render"
@@ -1744,32 +1744,41 @@ def cache_tui_pty_smoke_test(binary, unshare, mount, namespace_args):
             os.write(master, b"/registry")
             deadline = time.monotonic() + 10
             size = 24
-            redraw_at = 0
+            redraw_at = time.monotonic() + 0.8
             while (b"Filter: registry" not in terminal_text(output)
                    or b"Enter: apply" not in terminal_text(output)) and time.monotonic() < deadline:
                 if time.monotonic() >= redraw_at:
                     size = 25 if size == 24 else 24
                     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", size, 100, 0, 0))
                     resize_child()
-                    redraw_at = time.monotonic() + 0.25
+                    redraw_at = time.monotonic() + 1.25
                 if select.select([master], [], [], 0.2)[0]:
                     output.extend(os.read(master, 65536))
             assert b"Filter: registry" in terminal_text(output), terminal_text(output).decode(errors="replace")
             assert b"Enter: apply" in terminal_text(output), terminal_text(output).decode(errors="replace")
             output.clear()
+            # Let the filter frame settle before Enter. Aggressive SIGWINCH
+            # loops can starve the Enter event on loaded runners.
+            time.sleep(0.2)
             os.write(master, b"\r")
-            deadline = time.monotonic() + 10
-            redraw_at = 0
+            deadline = time.monotonic() + 15
+            retry_at = time.monotonic() + 2
+            redraw_at = time.monotonic() + 1
             while (b"1 of 2 caches" not in terminal_text(output)
-                   or b"d: removal" not in terminal_text(output)) and time.monotonic() < deadline:
+                   or b"d: preview removal" not in terminal_text(output)) and time.monotonic() < deadline:
+                if time.monotonic() >= retry_at:
+                    # Extra Enter is read-only here and safely re-inventories
+                    # if the previous one was discarded during resize.
+                    os.write(master, b"\r")
+                    retry_at = time.monotonic() + 2
                 if time.monotonic() >= redraw_at:
                     size = 25 if size == 24 else 24
                     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", size, 100, 0, 0))
                     resize_child()
-                    redraw_at = time.monotonic() + 0.25
+                    redraw_at = time.monotonic() + 2
                 if select.select([master], [], [], 0.2)[0]:
                     output.extend(os.read(master, 65536))
-            assert b"d: removal" in terminal_text(output), terminal_text(output).decode(errors="replace")
+            assert b"d: preview removal" in terminal_text(output), terminal_text(output).decode(errors="replace")
             assert b"1 of 2 caches" in terminal_text(output), terminal_text(output).decode(errors="replace")
             output.clear()
             os.write(master, b"d")
@@ -1798,7 +1807,7 @@ def cache_tui_pty_smoke_test(binary, unshare, mount, namespace_args):
             output.clear()
             os.write(master, b"sj")
             deadline = time.monotonic() + 10
-            redraw_at = 0
+            redraw_at = time.monotonic() + 0.8
             while (b"Sort: logical size" not in terminal_text(output)
                    or b"Enter: review" not in terminal_text(output)
                    or b"\xe2\x80\xba Cargo registry" not in terminal_text(output)
@@ -1807,17 +1816,20 @@ def cache_tui_pty_smoke_test(binary, unshare, mount, namespace_args):
                     size = 25 if size == 24 else 24
                     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", size, 100, 0, 0))
                     resize_child()
-                    redraw_at = time.monotonic() + 0.25
+                    redraw_at = time.monotonic() + 1.25
                 if select.select([master], [], [], 0.2)[0]:
                     output.extend(os.read(master, 65536))
             chooser = terminal_text(output)
             assert b"Sort: logical size" in chooser, chooser.decode(errors="replace")
             assert b"Enter: review" in chooser, chooser.decode(errors="replace")
             assert b"\xe2\x80\xba Cargo registry" in chooser and str(cache).encode() in chooser, f"sorting changed the selected cache: {chooser[-3000:]}"
+            # Ensure the sorted chooser frame is fully processed before Enter.
+            # Otherwise a queued resize can discard the navigation key.
+            time.sleep(0.35)
             output.clear()
             os.write(master, b"\r")
-            deadline = time.monotonic() + 10
-            redraw_at = 0
+            deadline = time.monotonic() + 18
+            redraw_at = time.monotonic() + 2
             activity_error = b"Shared-cache preview failed: cache process activity"
             while (b"Review shared-cache entries" not in terminal_text(output)
                    and activity_error not in terminal_text(output)
@@ -1826,7 +1838,7 @@ def cache_tui_pty_smoke_test(binary, unshare, mount, namespace_args):
                     size = 25 if size == 24 else 24
                     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", size, 100, 0, 0))
                     resize_child()
-                    redraw_at = time.monotonic() + 0.25
+                    redraw_at = time.monotonic() + 3
                 if select.select([master], [], [], 0.2)[0]:
                     output.extend(os.read(master, 65536))
             preview = terminal_text(output)
@@ -1839,7 +1851,7 @@ def cache_tui_pty_smoke_test(binary, unshare, mount, namespace_args):
                 output.clear()
                 os.write(master, b"\r")
                 deadline = time.monotonic() + 10
-                redraw_at = 0
+                redraw_at = time.monotonic() + 0.8
                 while (b"Confirm permanent shared-cache removal" not in terminal_text(output)
                        or str(cache).encode() not in terminal_text(output)
                        or b"reclaimed space is unknown" not in terminal_text(output)) and time.monotonic() < deadline:
@@ -1847,7 +1859,7 @@ def cache_tui_pty_smoke_test(binary, unshare, mount, namespace_args):
                         size = 25 if size == 24 else 24
                         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", size, 100, 0, 0))
                         resize_child()
-                        redraw_at = time.monotonic() + 0.25
+                        redraw_at = time.monotonic() + 1.25
                     if select.select([master], [], [], 0.2)[0]:
                         output.extend(os.read(master, 65536))
                 preview = terminal_text(output)
@@ -1868,8 +1880,14 @@ def cache_tui_pty_smoke_test(binary, unshare, mount, namespace_args):
             assert (cache / "keep").read_text() == "fixture"
             assert (git_cache / "fixture").read_text() == "larger than registry"
         finally:
+            # unshare --fork can outlive its launcher. Kill the dedicated
+            # test process group even if the launcher has already exited;
+            # otherwise orphaned fixture binaries can spin on a closed PTY.
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             if child.poll() is None:
-                child.kill()
                 child.wait()
             os.close(master)
             os.close(slave)
@@ -2409,17 +2427,29 @@ def dashboard_recent_activity_pty_test(binary):
             os.write(master, b"c")
             deadline = time.monotonic() + 15
             rendered = b""
-            while b"Cargo registry: logical snapshot 13 bytes" not in rendered and time.monotonic() < deadline:
+            while b"Cargo registry: 13 B snapshot" not in rendered and time.monotonic() < deadline:
                 if select.select([master], [], [], 0.2)[0]:
                     output.extend(os.read(master, 65536))
                 rendered = terminal_screen_text(output, 30, 120)
-            assert b"Cargo registry: logical snapshot 13 bytes" in rendered, (
+            assert b"Cargo registry: 13 B snapshot" in rendered, (
                 "Dashboard c shortcut did not start cache inventory: "
                 + rendered.decode(errors="replace")
             )
             assert b"(1 of 1 caches)" in rendered
             assert b"Shared caches" in rendered
+            assert b"diagnostic warning(s)" in rendered
+            assert b"w: warnings" in rendered, "cache warnings toggle is not discoverable"
+            assert b"Directory owner (snapshot)" not in rendered
             assert b"Recent activity" not in rendered
+            os.write(master, b"w")
+            deadline = time.monotonic() + 10
+            while b"Directory owner (snapshot):" not in rendered and time.monotonic() < deadline:
+                if select.select([master], [], [], 0.2)[0]:
+                    output.extend(os.read(master, 65536))
+                rendered = terminal_screen_text(output, 30, 120)
+            assert b"Directory owner (snapshot):" in rendered, (
+                "cache diagnostics did not expand with w: " + rendered.decode(errors="replace")
+            )
             os.write(master, b"q")
             assert child.wait(timeout=10) == 0
             assert termios.tcgetattr(slave) == before
