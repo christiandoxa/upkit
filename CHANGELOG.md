@@ -1,8 +1,16 @@
 # Changelog
 
-## Unreleased (0.5.0)
+## 0.5.0 (2026-11-03) — stable release
 
-The stable release remains gated on 90% line coverage and final review.
+This release is being published as the stable channel by project-owner
+request after all six native cross-platform CI jobs and the six-platform
+prerelease release pipeline succeeded. **The 90% line-coverage target remains
+unmet:** the last measured coverage was **83.42%**. The coverage workflow
+keeps its 90% threshold and will remain red until further tests are added.
+The interactive dashboard PTY smoke on macOS release runners also remains
+unverified because its fixture stalled; other native macOS tests and binary
+smoke checks passed. Treat destructive maintenance features cautiously:
+review previews, authorization tokens, and backups before use.
 
 ## 0.5.0-rc.2 (2026-11-03) — prerelease
 

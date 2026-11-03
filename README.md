@@ -6,11 +6,11 @@ Upkit is a standalone developer environment manager with a keyboard-first
 terminal dashboard, toolchain management, workspace artifact discovery, and
 selected maintenance operations.
 
-This document describes the current source tree. The `v0.5.0-rc.2`
-release candidate is intended for evaluation and is **not** the stable channel.
-Line coverage remains below the 90% stable-release requirement. The install
-examples below use the latest published stable release (`v0.4.15`), not the
-release candidate; consult each release's notes for supported features.
+The stable `v0.5.0` standalone release includes the developer-environment
+manager and Ratatui dashboard. Known quality limitations are documented in
+[CHANGELOG.md](CHANGELOG.md): measured line coverage is still **83.42%**
+against the 90% target, and interactive macOS dashboard PTY smoke remains
+unverified. Review every maintenance action before approving deletion.
 
 ## Features
 
@@ -60,7 +60,7 @@ To install a specific release or choose a different directory:
 
 ```bash
 curl -fsSL https://github.com/christiandoxa/upkit/releases/latest/download/install.sh |
-  sh -s -- --release v0.4.15 --install-dir "$HOME/.local/bin"
+  sh -s -- --release v0.5.0 --install-dir "$HOME/.local/bin"
 ```
 
 ### Windows
