@@ -2395,6 +2395,49 @@ mod tests {
         .unwrap();
         let sid = current_user_sid().unwrap();
         let powershell = system_binary("WindowsPowerShell\\v1.0\\powershell.exe").unwrap();
+        // The runner's temp directory can inherit permissions for unrelated
+        // users. This security test must provision the *private* directory
+        // that the production Task Scheduler workflow requires, not weaken
+        // ACL verification to accept the runner's inherited ACL.
+        let restrict_acl = r#"
+$ErrorActionPreference = 'Stop'
+$identity = [System.Security.Principal.SecurityIdentifier]::new($env:UPKIT_TASK_SID)
+$acl = Get-Acl -LiteralPath $env:UPKIT_TASK_ACL_PATH
+$acl.SetAccessRuleProtection($true, $false)
+foreach ($rule in @($acl.Access)) {
+    [void]$acl.RemoveAccessRuleSpecific($rule)
+}
+foreach ($trusted in @($env:UPKIT_TASK_SID, 'S-1-5-18', 'S-1-5-32-544')) {
+    $principal = [System.Security.Principal.SecurityIdentifier]::new($trusted)
+    $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+        $principal,
+        [System.Security.AccessControl.FileSystemRights]::FullControl,
+        [System.Security.AccessControl.InheritanceFlags]3,
+        [System.Security.AccessControl.PropagationFlags]::None,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    )
+    $acl.AddAccessRule($rule)
+}
+$acl.SetOwner($identity)
+Set-Acl -LiteralPath $env:UPKIT_TASK_ACL_PATH -AclObject $acl
+"#;
+        let configured = std::process::Command::new(&powershell)
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                restrict_acl,
+            ])
+            .env("UPKIT_TASK_SID", &sid)
+            .env("UPKIT_TASK_ACL_PATH", &directory_path)
+            .output()
+            .unwrap();
+        assert!(
+            configured.status.success(),
+            "could not create a private Task Scheduler ACL test fixture"
+        );
+        verify_private_acl(&directory_path, &sid, &powershell).unwrap();
         let (path, stored) = with_safe_task_xml(&directory_path, &xml, &sid, &powershell, |path| {
             Ok((path.to_path_buf(), std::fs::read_to_string(path)?))
         })
