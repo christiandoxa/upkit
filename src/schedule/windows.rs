@@ -2424,6 +2424,35 @@ mod tests {
             restrict.status.success(),
             "could not remove inherited Task Scheduler ACL fixture permissions"
         );
+        // The utility wrapper deliberately redacts Windows command errors.
+        // For the isolated ACL fixture report only a status and static error
+        // category, never an SDDL, SID, username, or filesystem path.
+        let check = std::process::Command::new(&powershell)
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &task_powershell_script(TASK_ACL_SCRIPT),
+            ])
+            .env("UPKIT_TASK_ACL_PATH", &directory_path)
+            .env("UPKIT_TASK_SID", &sid)
+            .output()
+            .unwrap();
+        let category = if check.status.code() == Some(4) {
+            "untrusted_acl_or_owner"
+        } else if !check.status.success() {
+            "powershell_command_failed"
+        } else if check.stdout != b"OK" {
+            "unexpected_acl_output"
+        } else {
+            "verified"
+        };
+        assert!(
+            check.status.success() && check.stdout == b"OK",
+            "private ACL fixture verification failed: code={:?}, category={category}",
+            check.status.code()
+        );
         verify_private_acl(&directory_path, &sid, &powershell).unwrap();
         let (path, stored) = with_safe_task_xml(&directory_path, &xml, &sid, &powershell, |path| {
             Ok((path.to_path_buf(), std::fs::read_to_string(path)?))
