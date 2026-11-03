@@ -28,9 +28,15 @@ pub fn mojo_latest(ctx: &Ctx) -> Result<Version> {
 }
 
 pub fn check_mojo(ctx: &Ctx) -> Result<ToolReport> {
-    let installed = which_or_none("mojo")
-        .and_then(|_| run_capture("mojo", &["--version"]).ok())
-        .and_then(|out| Version::parse_loose(&out));
+    let executable = which_or_none("mojo");
+    let installed = if ctx.dry_run {
+        None
+    } else {
+        executable
+            .as_ref()
+            .and_then(|_| run_capture("mojo", &["--version"]).ok())
+            .and_then(|out| Version::parse_loose(&out))
+    };
 
     let mut notes =
         vec!["Uses the official mojolang.org stable release page; updates via pixi or uv.".into()];
@@ -41,7 +47,17 @@ pub fn check_mojo(ctx: &Ctx) -> Result<ToolReport> {
             None
         }
     };
-    let status = Status::from_versions(installed.as_ref(), latest.as_ref());
+    let version_unverified = executable.is_some() && installed.is_none();
+    if ctx.dry_run && executable.is_some() {
+        notes.push("Installed Mojo version was not verified during dry-run.".into());
+    } else if version_unverified {
+        notes.push("A Mojo executable was found, but its version could not be verified.".into());
+    }
+    let status = if version_unverified {
+        Status::Unknown
+    } else {
+        Status::from_versions(installed.as_ref(), latest.as_ref())
+    };
 
     Ok(ToolReport {
         tool: ToolKind::Mojo,
@@ -64,7 +80,20 @@ pub fn update_mojo(ctx: &Ctx) -> Result<()> {
         .ok_or_else(|| anyhow!("latest unknown"))?;
 
     if matches!(report.status, Status::UpToDate) && !ctx.force {
-        info(ctx, format!("mojo is up-to-date ({})", latest.to_string()));
+        info(ctx, format!("mojo is up-to-date ({})", latest));
+        return Ok(());
+    }
+
+    if ctx.dry_run
+        && matches!(report.status, Status::Unknown)
+        && which_or_none("mojo").is_some()
+        && which_or_none("pixi").is_some()
+        && pixi_project_dir().is_some()
+    {
+        info(
+            ctx,
+            "[dry-run] would verify Mojo before choosing pixi add or update",
+        );
         return Ok(());
     }
 

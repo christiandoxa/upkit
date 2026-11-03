@@ -48,18 +48,32 @@ function Download-Asset([string]$Name, [string]$Destination) {
 }
 
 $temp = Join-Path ([System.IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
+$tempCreated = $false
+$ownedTempFiles = [System.Collections.Generic.List[string]]::new()
 $staged = $null
+$stagedCreated = $false
 $backup = $null
 try {
     New-Item -ItemType Directory -Path $temp | Out-Null
-    Download-Asset 'SHA256SUMS' (Join-Path $temp 'SHA256SUMS')
+    $tempCreated = $true
+    $checksums = Join-Path $temp 'SHA256SUMS'
+    $ownedTempFiles.Add($checksums)
+    Download-Asset 'SHA256SUMS' $checksums
     $download = Join-Path $temp $asset
+    $ownedTempFiles.Add($download)
     Download-Asset $asset $download
-    $pattern = '^([0-9a-fA-F]{64})\s+' + [regex]::Escape($asset) + '$'
-    $digests = @(Get-Content -LiteralPath (Join-Path $temp 'SHA256SUMS') | ForEach-Object {
-        if ($_ -cmatch $pattern) { $Matches[1].ToLowerInvariant() }
-    })
-    if ($digests.Count -ne 1) { throw "Missing or invalid SHA256SUMS entry for $asset" }
+    $digests = @()
+    $invalidEntry = $false
+    foreach ($line in Get-Content -LiteralPath $checksums) {
+        $fields = @($line.Trim() -split '\s+')
+        if ($fields.Count -ge 2 -and ($fields[1] -creplace '^\*', '') -ceq $asset) {
+            if ($fields.Count -ne 2 -or $fields[0] -cnotmatch '^[0-9a-fA-F]{64}$') {
+                $invalidEntry = $true
+            }
+            $digests += $fields[0].ToLowerInvariant()
+        }
+    }
+    if ($invalidEntry -or $digests.Count -ne 1) { throw "Missing or invalid SHA256SUMS entry for $asset" }
     $sha256 = [System.Security.Cryptography.SHA256]::Create()
     try {
         $actualDigest = [BitConverter]::ToString($sha256.ComputeHash([System.IO.File]::ReadAllBytes($download))).Replace('-', '').ToLowerInvariant()
@@ -80,20 +94,45 @@ try {
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     $destination = Join-Path $InstallDir 'upkit.exe'
     $staged = Join-Path $InstallDir ('.upkit-' + [guid]::NewGuid().ToString() + '.exe')
-    Copy-Item -LiteralPath $download -Destination $staged
-    if (Test-Path -LiteralPath $destination) {
-        $backup = Join-Path $InstallDir 'upkit.old.exe'
-        if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Force }
-        Move-Item -LiteralPath $destination -Destination $backup
+    $inputStream = [System.IO.File]::OpenRead($download)
+    try {
+        $output = [System.IO.File]::Open($staged, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $stagedCreated = $true
+        try { $inputStream.CopyTo($output) } finally { $output.Dispose() }
+    } finally { $inputStream.Dispose() }
+
+    $destinationItem = Get-Item -Force -LiteralPath $destination -ErrorAction SilentlyContinue
+    if ($destinationItem -and $destinationItem.PSIsContainer) {
+        throw 'Refusing to replace a directory named upkit.exe'
+    }
+    if ($destinationItem -and ($destinationItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        throw 'Refusing to replace a reparse point named upkit.exe'
+    }
+    if ($destinationItem) {
+        $backup = Join-Path $InstallDir ('.upkit-old-' + [guid]::NewGuid().ToString() + '.exe')
+        [System.IO.File]::Move($destination, $backup)
     }
     try {
-        Move-Item -LiteralPath $staged -Destination $destination
+        $stagedItem = Get-Item -Force -LiteralPath $staged -ErrorAction Stop
+        if ($stagedItem.PSIsContainer -or ($stagedItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            throw 'Staged executable changed into a reparse point'
+        }
+        [System.IO.File]::Move($staged, $destination)
         $staged = $null
+        $stagedCreated = $false
     } catch {
-        if ($backup) { Move-Item -LiteralPath $backup -Destination $destination }
-        throw
+        $installError = $_
+        if ($backup) {
+            try {
+                [System.IO.File]::Move($backup, $destination)
+                $backup = $null
+            } catch {
+                throw "Install failed and the previous binary remains at '$backup'; the destination changed or cannot be restored: $($_.Exception.Message)"
+            }
+        }
+        throw $installError
     }
-    # shortcut: a running Windows binary can retain upkit.old.exe until the next update; use deferred deletion if needed.
+    # shortcut: a locked running binary can leave its unique backup; remove it after the process exits.
     if ($backup) { Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue }
 
     if ($env:UPKIT_NO_PATH_UPDATE -ne '1') {
@@ -105,6 +144,24 @@ try {
     }
     Write-Host "Installed $version to $destination"
 } finally {
-    if ($staged -and (Test-Path -LiteralPath $staged)) { Remove-Item -LiteralPath $staged -Force }
-    if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Recurse -Force }
+    if ($stagedCreated -and (Test-Path -LiteralPath $staged -PathType Leaf)) {
+        $stagedItem = Get-Item -Force -LiteralPath $staged -ErrorAction SilentlyContinue
+        if ($stagedItem -and -not ($stagedItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if ($tempCreated) {
+        foreach ($path in $ownedTempFiles) {
+            if (Test-Path -LiteralPath $path -PathType Leaf) {
+                $item = Get-Item -Force -LiteralPath $path -ErrorAction SilentlyContinue
+                if ($item -and -not ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                    Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+        $tempItem = Get-Item -Force -LiteralPath $temp -ErrorAction SilentlyContinue
+        if ($tempItem -and -not ($tempItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+        }
+    }
 }

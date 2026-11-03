@@ -1,4 +1,6 @@
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use tempfile::tempdir;
 use upkit::Prompt;
@@ -10,10 +12,17 @@ use upkit::infrastructure::{
     maybe_path_hint_for_dir, mock_http_attempt, prune_tool_versions, remove_path_hint_for_label,
     start_spinner, tool_path_hint_labels,
 };
+#[cfg(target_os = "linux")]
+use upkit::test_support::set_write_error;
 use upkit::test_support::{
     MockResponse, TestPrompt, base_ctx, reset_guard, set_env_var, set_home_dir, set_http_plan,
     set_prompt_confirm, set_prompt_input,
 };
+
+#[cfg(target_os = "linux")]
+fn set_private_path_directory(path: &std::path::Path) {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
 
 #[test]
 fn index_code_roundtrip() {
@@ -139,7 +148,7 @@ fn dialoguer_multi_select_out_of_range() {
 }
 
 #[test]
-fn prune_tool_versions_removes_old_dirs() {
+fn prune_tool_versions_preserves_unverified_old_dirs() {
     let dir = tempdir().unwrap();
     let tool_root = dir.path().join("tool");
     let keep_dir = tool_root.join("1.2.3");
@@ -149,6 +158,7 @@ fn prune_tool_versions_removes_old_dirs() {
 
     fs::create_dir_all(&keep_dir).unwrap();
     fs::create_dir_all(&old_dir).unwrap();
+    fs::write(old_dir.join("source.txt"), "keep").unwrap();
     fs::create_dir_all(&wrappers).unwrap();
     fs::write(&cache_file, b"cache").unwrap();
 
@@ -159,12 +169,30 @@ fn prune_tool_versions_removes_old_dirs() {
         symlink(&keep_dir, &active).unwrap();
     }
 
-    prune_tool_versions(&tool_root, &keep_dir, &["active", "wrappers"]).unwrap();
+    assert!(prune_tool_versions(&tool_root, &keep_dir, &["active", "wrappers"]).is_err());
 
     assert!(keep_dir.exists());
-    assert!(!old_dir.exists());
+    assert!(old_dir.exists());
+    assert_eq!(
+        fs::read_to_string(old_dir.join("source.txt")).unwrap(),
+        "keep"
+    );
     assert!(wrappers.exists());
     assert!(cache_file.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn pruning_review_does_not_mistake_link_receipts_for_an_old_version() {
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let keep = dir.path().join("installed");
+    let receipts = dir.path().join(".upkit-managed-links");
+    fs::create_dir(&keep).unwrap();
+    fs::create_dir(&receipts).unwrap();
+    fs::write(receipts.join("fixture"), b"keep").unwrap();
+    prune_tool_versions(dir.path(), &keep, &[]).unwrap();
+    assert_eq!(fs::read(receipts.join("fixture")).unwrap(), b"keep");
 }
 
 #[test]
@@ -174,6 +202,8 @@ fn maybe_path_hint_updates_missing_path_line() {
     let home = dir.path().join("home");
     let bindir = dir.path().join("bin");
     fs::create_dir_all(&home).unwrap();
+    #[cfg(target_os = "linux")]
+    set_private_path_directory(&home);
     fs::create_dir_all(&bindir).unwrap();
     set_env_var("SHELL", Some("bash".to_string()));
     set_env_var("PATH", Some("/usr/bin".to_string()));
@@ -188,12 +218,232 @@ fn maybe_path_hint_updates_missing_path_line() {
 }
 
 #[test]
+fn path_hint_respects_explicit_no_path_update() {
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let rc = home.join(".bashrc");
+    fs::write(&rc, "# existing configuration\n").unwrap();
+    set_env_var("SHELL", Some("bash".into()));
+    set_env_var("PATH", Some("/usr/bin".into()));
+    set_env_var("UPKIT_NO_PATH_UPDATE", Some("1".into()));
+    set_home_dir(Some(home.clone()));
+    let ctx = base_ctx(
+        home,
+        dir.path().join("bin"),
+        Arc::new(TestPrompt::default()),
+    );
+    maybe_path_hint_for_dir(&ctx, &ctx.bindir, "upkit bin");
+    assert_eq!(
+        fs::read_to_string(rc).unwrap(),
+        "# existing configuration\n"
+    );
+}
+
+#[test]
+fn path_hint_preserves_unrecognized_line_after_label() {
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("home");
+    fs::create_dir(&home).unwrap();
+    #[cfg(target_os = "linux")]
+    set_private_path_directory(&home);
+    let rc = home.join(".bashrc");
+    let original = "# upkit (upkit bin)\nalias fixture='keep this'\n";
+    fs::write(&rc, original).unwrap();
+    set_env_var("SHELL", Some("bash".into()));
+    set_env_var("PATH", Some("/usr/bin".into()));
+    set_home_dir(Some(home.clone()));
+    let ctx = base_ctx(
+        home,
+        dir.path().join("bin"),
+        Arc::new(TestPrompt::default()),
+    );
+    maybe_path_hint_for_dir(&ctx, &ctx.bindir, "upkit bin");
+    let updated = fs::read_to_string(&rc).unwrap();
+    assert!(updated.contains("alias fixture='keep this'\n"));
+    assert!(updated.contains("export PATH="));
+    maybe_path_hint_for_dir(&ctx, &ctx.bindir, "upkit bin");
+    assert_eq!(fs::read_to_string(rc).unwrap(), updated);
+}
+
+#[cfg(unix)]
+#[test]
+fn path_hint_does_not_write_a_lossy_non_unicode_path() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("home");
+    fs::create_dir(&home).unwrap();
+    #[cfg(target_os = "linux")]
+    set_private_path_directory(&home);
+    let rc = home.join(".bashrc");
+    fs::write(&rc, "# preserve\n").unwrap();
+    set_env_var("SHELL", Some("bash".into()));
+    set_env_var("PATH", Some("/usr/bin".into()));
+    set_home_dir(Some(home.clone()));
+    let bindir = dir
+        .path()
+        .join(std::ffi::OsString::from_vec(b"bin-\xff".to_vec()));
+    let ctx = base_ctx(home, bindir, Arc::new(TestPrompt::default()));
+    maybe_path_hint_for_dir(&ctx, &ctx.bindir, "upkit bin");
+    assert_eq!(fs::read_to_string(rc).unwrap(), "# preserve\n");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn path_hint_preserves_existing_file_on_write_failure_or_invalid_text() {
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("home");
+    fs::create_dir(&home).unwrap();
+    set_private_path_directory(&home);
+    let rc = home.join(".bashrc");
+    set_env_var("SHELL", Some("bash".into()));
+    set_env_var("PATH", Some("/usr/bin".into()));
+    set_home_dir(Some(home.clone()));
+    let ctx = base_ctx(
+        home,
+        dir.path().join("bin"),
+        Arc::new(TestPrompt::default()),
+    );
+
+    fs::write(&rc, b"# preserve\n").unwrap();
+    set_write_error(true);
+    maybe_path_hint_for_dir(&ctx, &ctx.bindir, "upkit bin");
+    set_write_error(false);
+    assert_eq!(fs::read(&rc).unwrap(), b"# preserve\n");
+
+    fs::write(&rc, b"\xff\xfe").unwrap();
+    maybe_path_hint_for_dir(&ctx, &ctx.bindir, "upkit bin");
+    assert_eq!(fs::read(rc).unwrap(), b"\xff\xfe");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn path_hint_refuses_symlink_and_preserves_existing_permissions() {
+    use std::os::unix::fs::symlink;
+
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("home");
+    fs::create_dir(&home).unwrap();
+    set_private_path_directory(&home);
+    let rc = home.join(".bashrc");
+    let target = dir.path().join("target");
+    fs::write(&target, b"# preserve\n").unwrap();
+    symlink(&target, &rc).unwrap();
+    set_env_var("SHELL", Some("bash".into()));
+    set_env_var("PATH", Some("/usr/bin".into()));
+    set_home_dir(Some(home.clone()));
+    let ctx = base_ctx(
+        home,
+        dir.path().join("bin"),
+        Arc::new(TestPrompt::default()),
+    );
+    maybe_path_hint_for_dir(&ctx, &ctx.bindir, "upkit bin");
+    assert!(fs::symlink_metadata(&rc).unwrap().file_type().is_symlink());
+    assert_eq!(fs::read(&target).unwrap(), b"# preserve\n");
+
+    fs::remove_file(&rc).unwrap();
+    fs::hard_link(&target, &rc).unwrap();
+    maybe_path_hint_for_dir(&ctx, &ctx.bindir, "upkit bin");
+    assert_eq!(fs::read(&target).unwrap(), b"# preserve\n");
+    assert_eq!(fs::read(&rc).unwrap(), b"# preserve\n");
+
+    fs::remove_file(&rc).unwrap();
+    fs::write(&rc, b"# preserve\n").unwrap();
+    fs::set_permissions(&rc, fs::Permissions::from_mode(0o640)).unwrap();
+    if rustix::fs::setxattr(
+        &rc,
+        "user.upkit_fixture",
+        b"fixture",
+        rustix::fs::XattrFlags::empty(),
+    )
+    .is_ok()
+    {
+        maybe_path_hint_for_dir(&ctx, &ctx.bindir, "upkit bin");
+        assert_eq!(fs::read(&rc).unwrap(), b"# preserve\n");
+        rustix::fs::removexattr(&rc, "user.upkit_fixture").unwrap();
+    }
+    maybe_path_hint_for_dir(&ctx, &ctx.bindir, "upkit bin");
+    assert_eq!(
+        fs::metadata(&rc).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+    assert!(fs::read_to_string(rc).unwrap().contains("export PATH="));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn path_hint_rejects_group_writable_profile_parent_without_changing_profile() {
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("home");
+    fs::create_dir(&home).unwrap();
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o775)).unwrap();
+    let rc = home.join(".bashrc");
+    let original = b"# preserve this profile\n";
+    fs::write(&rc, original).unwrap();
+    set_env_var("SHELL", Some("bash".into()));
+    set_env_var("PATH", Some("/usr/bin".into()));
+    set_home_dir(Some(home.clone()));
+    let ctx = base_ctx(
+        home,
+        dir.path().join("bin"),
+        Arc::new(TestPrompt::default()),
+    );
+
+    maybe_path_hint_for_dir(&ctx, &ctx.bindir, "upkit bin");
+
+    assert_eq!(fs::read(&rc).unwrap(), original);
+}
+
+#[cfg(unix)]
+#[test]
+fn path_hint_does_not_execute_path_contents() {
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    #[cfg(target_os = "linux")]
+    set_private_path_directory(&home);
+    let bindir = dir.path().join("bin$(touch INJECTED)\"'\\path");
+    set_env_var("SHELL", Some("bash".to_owned()));
+    set_env_var("PATH", Some("/usr/bin:/bin".to_owned()));
+    set_home_dir(Some(home.clone()));
+    let ctx = base_ctx(
+        home.clone(),
+        bindir.clone(),
+        Arc::new(TestPrompt::default()),
+    );
+    maybe_path_hint_for_dir(&ctx, &bindir, "upkit bin");
+    let output = std::process::Command::new("/bin/sh")
+        .args(["-c", ". \"$1\"; printf '%s' \"$PATH\"", "sh"])
+        .arg(home.join(".bashrc"))
+        .env("PATH", "/usr/bin:/bin")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("{}:/usr/bin:/bin", bindir.display())
+    );
+    assert!(!dir.path().join("INJECTED").exists());
+}
+
+#[test]
 fn maybe_path_hint_adds_blank_line_when_existing_content() {
     let _guard = reset_guard();
     let dir = tempdir().unwrap();
     let home = dir.path().join("home");
     let bindir = dir.path().join("bin");
     fs::create_dir_all(&home).unwrap();
+    #[cfg(target_os = "linux")]
+    set_private_path_directory(&home);
     fs::create_dir_all(&bindir).unwrap();
     set_env_var("SHELL", Some("bash".to_string()));
     set_env_var("PATH", Some("/usr/bin".to_string()));
@@ -232,6 +482,8 @@ fn remove_path_hint_handles_unresolvable_and_removes_path_line() {
     let home = dir.path().join("home");
     let bindir = dir.path().join("bin");
     fs::create_dir_all(&home).unwrap();
+    #[cfg(target_os = "linux")]
+    set_private_path_directory(&home);
     fs::create_dir_all(&bindir).unwrap();
     set_env_var("SHELL", Some("bash".to_string()));
     set_home_dir(None);
@@ -258,16 +510,18 @@ fn remove_path_hint_skips_non_path_line() {
     let home = dir.path().join("home");
     let bindir = dir.path().join("bin");
     fs::create_dir_all(&home).unwrap();
+    #[cfg(target_os = "linux")]
+    set_private_path_directory(&home);
     fs::create_dir_all(&bindir).unwrap();
     set_env_var("SHELL", Some("bash".to_string()));
     set_home_dir(Some(home.clone()));
     let prompt = Arc::new(TestPrompt::default());
     let ctx = base_ctx(home.clone(), bindir, prompt);
     let rc = home.join(".bashrc");
-    fs::write(&rc, "# upkit (upkit bin)\nnot a path\n").unwrap();
+    fs::write(&rc, "# keep\r\n# upkit (upkit bin)\r\nnot a path").unwrap();
     remove_path_hint_for_label(&ctx, "upkit bin");
     let updated = fs::read_to_string(&rc).unwrap();
-    assert!(!updated.contains("upkit"));
+    assert_eq!(updated, "# keep\r\nnot a path");
 }
 
 #[test]
@@ -349,8 +603,8 @@ fn prune_tool_versions_coverage_name_branch() {
     let extra_dir = tool_root.join("extra");
     fs::create_dir_all(&keep_dir).unwrap();
     fs::create_dir_all(&extra_dir).unwrap();
-    prune_tool_versions(&tool_root, &keep_dir, &[]).unwrap();
-    assert!(!extra_dir.exists());
+    assert!(prune_tool_versions(&tool_root, &keep_dir, &[]).is_err());
+    assert!(extra_dir.exists());
 }
 
 #[test]

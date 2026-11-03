@@ -1,9 +1,9 @@
 [package]
 name = "upkit"
-version = "0.4.15"
+version = "0.5.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "One CLI to check & update Go/Rust/Node/Python/Flutter/Mojo (hybrid built-in + direct-download)."
+description = "Standalone developer environment manager for toolchains, artifacts, and maintenance."
 readme = "README.md"
 repository = "https://github.com/christiandoxa/upkit"
 keywords = ["cli", "updater", "toolchain", "devtools"]
@@ -11,6 +11,8 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1.0.104"
+# Reports need UTC formatting on every platform; Linux-only clock use stays below.
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 clap = { version = "4.6.7", features = ["derive"] }
 clap_complete = "4.6.11"
 dialoguer = "0.12.0"
@@ -29,6 +31,22 @@ zstd = "0.14.3"
 tempfile = "3.27.0"
 toml = "1.1.8"
 which = "8.0.6"
+# Paragraph::line_count is unstable; pin Ratatui until the API stabilizes.
+ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm", "crossterm_0_29", "unstable-rendered-line-info"] }
+crossterm = "0.29"
+globset = "0.4.21"
+quick-xml = { version = "0.42", default-features = false }
+# ZipIterable is unstable; keep this version exact when updating its API.
+zip = { version = "=9.2.1", default-features = false, features = ["deflate-flate2"] }
 
-[dev-dependencies]
-jmpln = "0.1.0"
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+rustix = { version = "1.1.5", features = ["fs", "process"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+siphasher = "1.0.4"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+known-folders = "1.4.2"
+winapi-util = "=0.1.11"
+winsafe = { version = "0.0.29", default-features = false, features = ["kernel"] }
