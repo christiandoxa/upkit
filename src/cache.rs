@@ -4705,6 +4705,17 @@ fn validated_windows_inventory_root(value: &std::ffi::OsStr) -> Option<PathBuf> 
     // Read-only inventory fallback for restricted environments where the
     // Windows Known Folder API cannot resolve a location. Never infer a root
     // from a relative, parent-traversing, or filesystem-root-only override.
+    // On Windows, Path::components may normalize lexical `.` and `..` away.
+    // Reject those raw segments *before* using PathBuf or any normalization.
+    let raw = value.to_str()?;
+    if raw.is_empty()
+        || raw.contains('\0')
+        || raw
+            .split(['/', '\\'])
+            .any(|segment| matches!(segment, "." | ".."))
+    {
+        return None;
+    }
     nuget_safe_absolute_path(PathBuf::from(value)).ok()
 }
 
