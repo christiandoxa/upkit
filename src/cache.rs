@@ -5347,6 +5347,12 @@ fn inventory_specs(
 mod tests {
     use super::*;
 
+    fn npm_test_literal(path: &Path) -> String {
+        // JSON string literals are also valid npmrc quoted values and retain
+        // Windows backslashes. Unquoted backslashes are rejected by design.
+        serde_json::to_string(&path.to_string_lossy()).unwrap()
+    }
+
     #[test]
     fn cargo_build_output_paths_are_inventory_candidates_only_when_resolved() {
         let dir = tempfile::tempdir().unwrap();
@@ -5433,7 +5439,7 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&cwd).unwrap();
         std::fs::create_dir_all(global.parent().unwrap()).unwrap();
-        std::fs::write(&global, format!("cache={}\n", cache.display())).unwrap();
+        std::fs::write(&global, format!("cache={}\n", npm_test_literal(&cache))).unwrap();
 
         let config = npm_config_sources(
             &home,
@@ -5484,10 +5490,10 @@ mod tests {
         std::fs::create_dir_all(global.parent().unwrap()).unwrap();
         std::fs::write(
             home.join(".npmrc"),
-            format!("prefix={}\n", prefix.display()),
+            format!("prefix={}\n", npm_test_literal(&prefix)),
         )
         .unwrap();
-        std::fs::write(&global, format!("cache={}\n", cache.display())).unwrap();
+        std::fs::write(&global, format!("cache={}\n", npm_test_literal(&cache))).unwrap();
 
         let config =
             npm_config_sources(&home, &cwd, Some(home.as_os_str()), &[], None, &[], &[]).unwrap();
@@ -5573,8 +5579,8 @@ mod tests {
             home.join(".npmrc"),
             format!(
                 "//registry.example.invalid/:_authToken=synthetic-user-secret\nglobalconfig={}\ncache={}\n",
-                redirected_user.display(),
-                user_global_cache.display(),
+                npm_test_literal(&redirected_user),
+                npm_test_literal(&user_global_cache),
             ),
         )
         .unwrap();
@@ -5582,24 +5588,24 @@ mod tests {
             project.join(".npmrc"),
             format!(
                 "userconfig={}\ncache={}\nlogs-dir={}\n//registry.example.invalid/:_authToken=synthetic-project-secret\n",
-                redirected_user.display(),
-                project_cache.display(),
-                project_logs.display(),
+                npm_test_literal(&redirected_user),
+                npm_test_literal(&project_cache),
+                npm_test_literal(&project_logs),
             ),
         )
         .unwrap();
         std::fs::write(
             workspace.join(".npmrc"),
-            format!("cache={}\n", workspace_cache.display()),
+            format!("cache={}\n", npm_test_literal(&workspace_cache)),
         )
         .unwrap();
         std::fs::write(
             &redirected_user,
             format!(
                 "cache={}\nuserconfig={}\nglobalconfig={}\n",
-                user_cache.display(),
-                home.join(".npmrc").display(),
-                user_global.display(),
+                npm_test_literal(&user_cache),
+                npm_test_literal(&home.join(".npmrc")),
+                npm_test_literal(&user_global),
             ),
         )
         .unwrap();
@@ -5607,14 +5613,14 @@ mod tests {
             &user_global,
             format!(
                 "cache={}\nlogs-dir={}\n",
-                user_global_cache.display(),
-                global_logs.display()
+                npm_test_literal(&user_global_cache),
+                npm_test_literal(&global_logs)
             ),
         )
         .unwrap();
         std::fs::write(
             &env_global,
-            format!("cache={}\n", env_global_cache.display()),
+            format!("cache={}\n", npm_test_literal(&env_global_cache)),
         )
         .unwrap();
 
@@ -5684,7 +5690,7 @@ mod tests {
         std::fs::create_dir_all(&plain_cwd).unwrap();
         std::fs::write(
             plain_cwd.join(".npmrc"),
-            format!("cache={}\n", plain_cache.display()),
+            format!("cache={}\n", npm_test_literal(&plain_cache)),
         )
         .unwrap();
         assert_eq!(
@@ -5711,12 +5717,12 @@ mod tests {
         std::fs::write(lock_parent.join("package-lock.json"), b"{}").unwrap();
         std::fs::write(
             lock_parent.join(".npmrc"),
-            format!("cache={}\n", lock_parent_cache.display()),
+            format!("cache={}\n", npm_test_literal(&lock_parent_cache)),
         )
         .unwrap();
         std::fs::write(
             lock_cwd.join(".npmrc"),
-            format!("cache={}\n", lock_cwd_cache.display()),
+            format!("cache={}\n", npm_test_literal(&lock_cwd_cache)),
         )
         .unwrap();
         assert_eq!(
@@ -6302,11 +6308,15 @@ mod tests {
         let machine_common = dir.path().join("machine-common");
         let machine_config_directories =
             test_nuget_machine_config_directories(dir.path(), Some(machine_common.as_os_str()));
+        let repository = dir.path().join("packages");
         let config = home.join(".nuget/NuGet/NuGet.Config");
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
         std::fs::write(
             &config,
-            "<configuration><config><add key=\"RepositoryPATH\" value=\"/tmp/packages\"/></config></configuration>",
+            format!(
+                "<configuration><config><add key=\"RepositoryPATH\" value=\"{}\"/></config></configuration>",
+                repository.display()
+            ),
         )
         .unwrap();
         let parsed = nuget_user_package_folders(
@@ -6318,10 +6328,7 @@ mod tests {
             &machine_config_directories,
         )
         .unwrap();
-        assert_eq!(
-            parsed.repository_paths,
-            vec![PathBuf::from("/tmp/packages")]
-        );
+        assert_eq!(parsed.repository_paths, vec![repository]);
         for value in [
             "relative/packages",
             "$HOME/packages",
@@ -6504,7 +6511,12 @@ mod tests {
         std::fs::remove_file(&config).unwrap();
         std::fs::write(&config, "<configuration />").unwrap();
         std::fs::write(project.join("nuget.config"), "<configuration />").unwrap();
+        #[cfg(not(windows))]
         assert!(nuget_solution_config_paths(Platform::Linux, &project).is_err());
+        #[cfg(windows)]
+        assert!(nuget_solution_config_paths(Platform::Windows, &project).is_ok());
+        // Typical NTFS cannot hold distinct names that differ only in case;
+        // native Windows enumeration inspects its canonical NuGet.Config.
     }
 
     #[test]
@@ -6585,9 +6597,11 @@ mod tests {
     #[test]
     fn nuget_config_parser_uses_clear_then_add_and_rejects_unsafe_locations() {
         let dir = tempfile::tempdir().unwrap();
+        let old_packages = dir.path().join("old-packages");
         let configured = dir.path().join("packages&cache");
         let bytes = format!(
-            "<configuration><config><add key=\"globalPackagesFolder\" value=\"/tmp/old\"/><clear/><add key=\"globalPackagesFolder\" value=\"{}\"/></config></configuration>",
+            "<configuration><config><add key=\"globalPackagesFolder\" value=\"{}\"/><clear/><add key=\"globalPackagesFolder\" value=\"{}\"/></config></configuration>",
+            old_packages.display(),
             configured.display().to_string().replace('&', "&amp;")
         );
         let parsed = parse_nuget_config(bytes.as_bytes()).unwrap();
@@ -6636,6 +6650,10 @@ mod tests {
     #[test]
     fn nuget_solution_config_allows_remote_sources_and_rejects_unsafe_or_unsupported_values() {
         let secret = "synthetic-user:synthetic-token";
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = fixture.path().join("packages");
+        let first_feed = fixture.path().join("first-feed");
+        let second_feed = fixture.path().join("second-feed");
         let remote = format!(
             "<configuration><packageSources><add key=\"private\" value=\"https://{secret}@example.test/v3/index.json\" protocolVersion=\"3\" allowInsecureConnections=\"false\" disableTLSCertificateValidation=\"false\"/></packageSources></configuration>"
         );
@@ -6674,17 +6692,21 @@ mod tests {
                 assert!(parse_nuget_solution_config(config.as_bytes()).is_err());
             }
         }
-        assert!(parse_nuget_solution_config(
-            b"<configuration><packageSources><add key=\"same\" value=\"/tmp/one\"/><add key=\"same\" value=\"/tmp/two\"/></packageSources></configuration>"
-        )
-        .is_err());
+        let duplicates = format!(
+            "<configuration><packageSources><add key=\"same\" value=\"{}\"/><add key=\"same\" value=\"{}\"/></packageSources></configuration>",
+            first_feed.display(),
+            second_feed.display()
+        );
+        assert!(parse_nuget_solution_config(duplicates.as_bytes()).is_err());
+        let repository_config = format!(
+            "<configuration><config><add key=\"repositoryPath\" value=\"{}\"/></config></configuration>",
+            repository.display(),
+        );
         assert_eq!(
-            parse_nuget_solution_config(
-                b"<configuration><config><add key=\"repositoryPath\" value=\"/tmp/packages\"/></config></configuration>"
-            )
-            .unwrap()
-            .repository_paths,
-            vec![PathBuf::from("/tmp/packages")]
+            parse_nuget_solution_config(repository_config.as_bytes())
+                .unwrap()
+                .repository_paths,
+            vec![repository]
         );
         assert!(parse_nuget_solution_config(
             b"<configuration><packageSourceCredentials><foo><add key=\"Password\" value=\"secret\"/></foo></packageSourceCredentials></configuration>"
@@ -6792,16 +6814,28 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&workspace).unwrap();
 
-        assert_eq!(
-            parse_bun_cache_config(
-                br#"[install.cache]
+        let parent_relative = parse_bun_cache_config(
+            br#"[install.cache]
 dir = "../cache/bun"
 "#,
-                &home,
-                &workspace
-            )
-            .unwrap(),
-            Some(root.join("cache/bun"))
+            &home,
+            &workspace,
+        );
+        if cfg!(target_os = "linux") {
+            assert_eq!(parent_relative.unwrap(), Some(root.join("cache/bun")));
+        } else {
+            // Non-Linux platforms intentionally reject `..`: they lack the
+            // descriptor-bound resolver that verifies its path components.
+            assert!(parent_relative.is_err());
+        }
+        let absolute = root.join("cache/bun");
+        let absolute_config = format!(
+            "[install.cache]\ndir = {}\n",
+            serde_json::to_string(&absolute.to_string_lossy()).unwrap(),
+        );
+        assert_eq!(
+            parse_bun_cache_config(absolute_config.as_bytes(), &home, &workspace).unwrap(),
+            Some(absolute)
         );
         assert_eq!(
             parse_bun_cache_config(
@@ -6838,11 +6872,15 @@ dir = "~/bun-global"
 "#,
         )
         .unwrap();
+        // Global/home and workspace configurations must union correctly on
+        // every platform, using a path the platform can resolve safely.
+        let workspace_cache = root.join("cache/bun-workspace");
         std::fs::write(
             workspace.join("bunfig.toml"),
-            r#"[install.cache]
-dir = "../cache/bun-workspace"
-"#,
+            format!(
+                "[install.cache]\ndir = {}\n",
+                serde_json::to_string(&workspace_cache.to_string_lossy()).unwrap(),
+            ),
         )
         .unwrap();
 

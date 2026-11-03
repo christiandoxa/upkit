@@ -195,8 +195,16 @@ fn trusted_executable_parents(path: &Path) -> anyhow::Result<Vec<(PathBuf, Vec<u
         identity.extend_from_slice(&metadata.ino().to_be_bytes());
         identity.extend_from_slice(&metadata.uid().to_be_bytes());
         identity.extend_from_slice(&metadata.mode().to_be_bytes());
-        identity.extend_from_slice(&metadata.ctime().to_be_bytes());
-        identity.extend_from_slice(&metadata.ctime_nsec().to_be_bytes());
+        // Root-owned sticky shared ancestors (notably /tmp) can change
+        // ctime when an *unrelated* user creates a sibling entry. Their
+        // device/inode/owner/mode remain the security-relevant identity;
+        // comparing their ctime makes independent maintenance and coverage
+        // processes spuriously invalidate a trusted executable path.
+        // Private ancestors retain the stricter ctime fingerprint.
+        if !trusted_sticky_directory {
+            identity.extend_from_slice(&metadata.ctime().to_be_bytes());
+            identity.extend_from_slice(&metadata.ctime_nsec().to_be_bytes());
+        }
         directories.push((parent.to_owned(), identity));
     }
     Ok(directories)
@@ -860,6 +868,37 @@ mod tests {
         let fifo = dir.path().join("fifo");
         mkfifoat(rustix::fs::CWD, &fifo, Mode::RUSR | Mode::WUSR | Mode::XUSR).unwrap();
         assert!(executable_identity(&fifo).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn executable_identity_ignores_unrelated_changes_in_shared_sticky_tmp() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::Builder::new()
+            .prefix("upkit-scheduled-executable-identity-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        fs::set_permissions(fixture.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let bin = fixture.path().join("bin");
+        secure_directory(&bin);
+        let executable = bin.join("upkit");
+        fs::write(&executable, b"fixture executable").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let expected = executable_identity(&executable).unwrap();
+        for _ in 0..3 {
+            let unrelated = tempfile::Builder::new()
+                .prefix("upkit-unrelated-sticky-sibling-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            assert_eq!(
+                executable_identity(&executable).unwrap(),
+                expected,
+                "a sibling entry under root-owned sticky /tmp changed the executable identity"
+            );
+            drop(unrelated);
+        }
     }
 
     #[cfg(target_os = "linux")]

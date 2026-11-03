@@ -2926,18 +2926,18 @@ def main():
             assert b"2 eligible; 1 newer/unknown; 0 unsupported" in terminal_text(output), f"age-based selection did not finish: {terminal_text(output)[-3000:].decode(errors='replace')}"
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 120, 0, 0))
             os.kill(child.pid, signal.SIGWINCH)
-            os.write(master, b"\r")
-            deadline = time.monotonic() + 10
-            size = 24
-            redraw_at = 0
-            while b"Review marked Trash" not in terminal_text(output) and time.monotonic() < deadline:
-                if time.monotonic() >= redraw_at:
-                    size = 25 if size == 24 else 24
-                    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", size, 120, 0, 0))
-                    os.kill(child.pid, signal.SIGWINCH)
-                    redraw_at = time.monotonic() + 0.25
-                if select.select([master], [], [], 0.2)[0]:
-                    output.extend(os.read(master, 65536))
+            # The selected-count message is asynchronous. Let the resized
+            # frame settle before attempting Enter: continuous SIGWINCH and an
+            # immediate Enter can be consumed before the review is ready.
+            time.sleep(0.2)
+            for attempt in range(4):
+                if b"Review marked Trash" in terminal_text(output):
+                    break
+                os.write(master, b"\r")
+                deadline = time.monotonic() + 2.5
+                while b"Review marked Trash" not in terminal_text(output) and time.monotonic() < deadline:
+                    if select.select([master], [], [], 0.2)[0]:
+                        output.extend(os.read(master, 65536))
             reviewed = terminal_text(output)
             assert b"Review marked Trash" in reviewed, (
                 "Trash review did not render: "
