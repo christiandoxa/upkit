@@ -1113,9 +1113,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     use super::clear_for_removal;
     use super::supported_version;
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     use super::{Query, query};
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     use std::sync::atomic::AtomicBool;
 
     #[cfg(unix)]

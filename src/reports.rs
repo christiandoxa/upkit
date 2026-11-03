@@ -3974,7 +3974,7 @@ pub(crate) fn perform_trash_retention_remove(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     use std::path::PathBuf;
 
     #[test]

@@ -1481,6 +1481,20 @@ def managed_cleanup_pty_test(binary):
                     time.sleep(0.2)
                     os.write(master, b"d")
                     activity_status = read_activity_status()
+                if activity_status in (activity_statuses[3], activity_statuses[4]):
+                    # A hosted runner may hide other processes or deny complete
+                    # /proc inspection. In that environment cleanup must fail
+                    # closed; it would be unsafe to demand a successful delete.
+                    os.write(master, b"y")
+                    time.sleep(0.3)
+                    assert install.exists(), "incomplete process inspection allowed deletion"
+                    assert (root / "user-data").read_text() == "keep root fixture"
+                    assert (bindir / "go").is_symlink(), "recorded link changed on rejected cleanup"
+                    os.write(master, b"nq")
+                    assert child.wait(timeout=10) == 0
+                    assert termios.tcgetattr(slave) == before
+                    print("Managed cleanup PTY fail-closed check passed: process inspection unavailable")
+                    return
                 assert activity_status == activity_statuses[0], (
                     "managed cleanup never reached a no-activity preview: "
                     + terminal_text(output).decode(errors="replace")

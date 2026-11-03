@@ -6,9 +6,11 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::Ordering;
 use std::{
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::AtomicBool,
 };
 
 #[derive(Clone, Debug, Serialize)]

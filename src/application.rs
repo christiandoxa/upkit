@@ -7391,7 +7391,12 @@ mod windows_node_doctor_tests {
             .iter()
             .find(|issue| issue.contains("managed Windows Flutter install is not on PATH"))
             .expect("managed Flutter PATH issue");
-        assert!(issue.contains(&crate::sweep::display_path(&flutter_bin)));
+        assert!(
+            issue.contains(&crate::sweep::display_path(&flutter_bin)),
+            "Flutter PATH diagnosis did not contain the configured bin: issue={issue:?}, expected={:?}, detected={:?}",
+            crate::sweep::display_path(&flutter_bin),
+            managed_windows_flutter_bin(&ctx)
+        );
 
         set_path(&[ctx.bindir.clone(), flutter_bin.clone()]);
         let issues = diagnose(&ctx, &config);
