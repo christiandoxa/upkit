@@ -48,6 +48,8 @@ pub struct Settings {
     #[serde(skip_serializing_if = "is_false")]
     pub scheduled_bytecode_cleanup: bool,
     #[serde(skip_serializing_if = "is_false")]
+    pub scheduled_artifact_cleanup: bool,
+    #[serde(skip_serializing_if = "is_false")]
     pub scheduled_trash_retention: bool,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub profiles: BTreeMap<String, Profile>,
@@ -65,6 +67,8 @@ pub struct Profile {
     pub schedule_frequency: Option<ScheduleFrequency>,
     #[serde(skip_serializing_if = "is_false")]
     pub scheduled_bytecode_cleanup: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub scheduled_artifact_cleanup: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -86,6 +90,7 @@ impl Default for Settings {
             enabled_ecosystems: None,
             schedule_frequency: None,
             scheduled_bytecode_cleanup: false,
+            scheduled_artifact_cleanup: false,
             scheduled_trash_retention: false,
             profiles: BTreeMap::new(),
         }
@@ -170,8 +175,46 @@ pub fn config_path(override_path: Option<&Path>) -> Result<PathBuf> {
 
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
+#[cfg(unix)]
+fn permitted_unix_config(path: &Path, metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    metadata.is_file() || (path == Path::new("/dev/null") && metadata.file_type().is_char_device())
+}
+
 pub fn load(path: &Path, required: bool) -> Result<Settings> {
-    let file = match fs::File::open(path) {
+    #[cfg(unix)]
+    {
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound && !required => {
+                return Ok(Settings::default());
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("read configuration {}", crate::sweep::display_path(path))
+                });
+            }
+        };
+        if !permitted_unix_config(path, &metadata) {
+            bail!(
+                "configuration must be a regular file: {}",
+                crate::sweep::display_path(path)
+            );
+        }
+    }
+    #[cfg(unix)]
+    let open = || -> std::io::Result<fs::File> {
+        rustix::fs::open(
+            path,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map(fs::File::from)
+        .map_err(std::io::Error::from)
+    };
+    #[cfg(not(unix))]
+    let open = || fs::File::open(path);
+    let file = match open() {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound && !required => {
             return Ok(Settings::default());
@@ -182,6 +225,13 @@ pub fn load(path: &Path, required: bool) -> Result<Settings> {
             });
         }
     };
+    #[cfg(unix)]
+    if !permitted_unix_config(path, &file.metadata().context("inspect configuration")?) {
+        bail!(
+            "configuration must be a regular file: {}",
+            crate::sweep::display_path(path)
+        );
+    }
     let mut bytes = Vec::new();
     file.take(MAX_CONFIG_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -785,6 +835,19 @@ pub fn scheduled_bytecode_cleanup(settings: &Settings, name: Option<&str>) -> Re
             .profiles
             .get(name)
             .map(|profile| profile.scheduled_bytecode_cleanup)
+            .ok_or_else(|| anyhow::anyhow!("unknown workspace profile: {}", name.escape_default())),
+    }
+}
+
+/// A profile must opt in itself; the global policy does not opt profiles in.
+pub fn scheduled_artifact_cleanup(settings: &Settings, name: Option<&str>) -> Result<bool> {
+    settings.validate()?;
+    match name {
+        None => Ok(settings.scheduled_artifact_cleanup),
+        Some(name) => settings
+            .profiles
+            .get(name)
+            .map(|profile| profile.scheduled_artifact_cleanup)
             .ok_or_else(|| anyhow::anyhow!("unknown workspace profile: {}", name.escape_default())),
     }
 }

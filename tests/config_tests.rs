@@ -2,6 +2,75 @@ use std::fs;
 use tempfile::tempdir;
 use upkit::config::{Settings, create, load, scan_options};
 
+#[cfg(unix)]
+#[test]
+fn config_loading_rejects_a_fifo_without_waiting_for_a_writer() {
+    use std::{
+        process::{Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    let dir = tempdir().unwrap();
+    let fifo = dir.path().join("config.fifo");
+    rustix::fs::mkfifoat(
+        rustix::fs::CWD,
+        &fifo,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_upkit"))
+        .args(["--non-interactive", "--json", "--config"])
+        .arg(&fifo)
+        .args(["config", "show"])
+        .env("HOME", dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("configuration FIFO blocked the command");
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(!status.success());
+    let output = child.wait_with_output().unwrap();
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        diagnostic.contains("configuration must be a regular file"),
+        "{diagnostic}"
+    );
+    let error = load(&fifo, true).unwrap_err();
+    assert!(format!("{error:#}").contains("configuration must be a regular file"));
+    assert!(fifo.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn config_loading_preserves_null_device_and_regular_file_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    assert!(load(std::path::Path::new("/dev/null"), true).is_ok());
+    let dir = tempdir().unwrap();
+    let file = dir.path().join("settings.toml");
+    let link = dir.path().join("linked.toml");
+    fs::write(&file, "version = 1\n").unwrap();
+    symlink(&file, &link).unwrap();
+    assert_eq!(load(&link, true).unwrap().version, 1);
+}
+
 #[test]
 fn scheduled_trash_retention_is_separate_and_default_off() {
     let defaults = Settings::default();
@@ -20,6 +89,34 @@ fn scheduled_trash_retention_is_separate_and_default_off() {
     let bytecode_only: Settings =
         toml::from_str("version = 1\nscheduled_bytecode_cleanup = true\n").unwrap();
     assert!(!upkit::config::scheduled_trash_retention(&bytecode_only).unwrap());
+}
+
+#[test]
+fn scheduled_artifact_cleanup_is_off_by_default_and_profiles_must_opt_in() {
+    let defaults = Settings::default();
+    assert!(!upkit::config::scheduled_artifact_cleanup(&defaults, None).unwrap());
+    assert!(
+        !toml::to_string(&defaults)
+            .unwrap()
+            .contains("scheduled_artifact_cleanup")
+    );
+
+    let enabled: Settings = toml::from_str(
+        "version = 1\nscheduled_artifact_cleanup = true\n[profiles.work]\nscheduled_artifact_cleanup = true\n",
+    )
+    .unwrap();
+    assert!(upkit::config::scheduled_artifact_cleanup(&enabled, None).unwrap());
+    assert!(upkit::config::scheduled_artifact_cleanup(&enabled, Some("work")).unwrap());
+
+    let profile_default = enabled.profiles.get("work").unwrap().clone();
+    let mut settings = enabled;
+    settings
+        .profiles
+        .get_mut("work")
+        .unwrap()
+        .scheduled_artifact_cleanup = false;
+    assert!(!upkit::config::scheduled_artifact_cleanup(&settings, Some("work")).unwrap());
+    assert!(profile_default.scheduled_artifact_cleanup);
 }
 
 #[test]

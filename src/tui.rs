@@ -1,10 +1,11 @@
 //! Interactive terminal interface.
 use std::{
+    collections::VecDeque,
     io::{self, stdout},
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -566,14 +567,27 @@ fn trash_retention_action_available(app: &App, key: KeyEvent) -> bool {
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
 }
 
+fn toolchain_confirmation_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Enter | KeyCode::Char('y'))
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+}
+
 struct App {
     reports: Option<Vec<ToolReport>>,
+    startup_checks: StartupChecks,
+    toolchain_check_failed: bool,
+    maintenance_check_failed: bool,
     page: Start,
     help: bool,
     help_scroll: u16,
     selected: usize,
     confirmation: bool,
     updating: bool,
+    self_update_preparing: bool,
+    self_update_command: bool,
+    self_update_plan: Option<crate::application::SelfUpdatePlan>,
     message: String,
     issues: Option<Vec<String>>,
     doctor_available_bytes: Option<u64>,
@@ -767,10 +781,19 @@ struct App {
     settings_confirmation_area: Rect,
 }
 
+#[derive(Clone, Copy, Default)]
+struct StartupChecks {
+    toolchains: bool,
+    doctor: bool,
+    maintenance: bool,
+}
+
 enum Action {
     None,
     Quit,
     Update(Vec<ToolKind>),
+    PreviewSelfUpdate,
+    SelfUpdate(crate::application::SelfUpdatePlan),
     PreviewManaged(ToolKind),
     PreviewManagedBatch(Vec<ToolKind>),
     RemoveManaged(crate::managed_cleanup::CleanupPlan),
@@ -812,6 +835,7 @@ enum Action {
     RemoveNetwork(crate::containers::NetworkRemovalPlan),
     PreviewBuildCache(String, String),
     RemoveBuildCache(crate::containers::BuildCacheRemovalPlan),
+    RefreshToolchains,
     RefreshHistory,
     RefreshSchedule,
     PreviewScheduleEdit(crate::schedule::Frequency),
@@ -884,6 +908,7 @@ enum SettingsField {
     ArtifactRetention,
     EnabledEcosystems,
     ScheduledBytecodeCleanup,
+    ScheduledArtifactCleanup,
     ScheduledTrashRetention,
     ScheduleFrequency,
     Theme,
@@ -906,6 +931,7 @@ enum SettingsRow {
     Ecosystem(crate::sweep::Ecosystem),
     AllEcosystems,
     ScheduledCleanup,
+    ScheduledArtifactCleanup,
     ScheduledTrashRetention,
     ScheduleFrequency,
     Theme,
@@ -929,12 +955,13 @@ struct SettingsForm {
     input: Option<SettingsInput>,
 }
 
-const SETTINGS_ECOSYSTEMS: [crate::sweep::Ecosystem; 13] = [
+const SETTINGS_ECOSYSTEMS: [crate::sweep::Ecosystem; 14] = [
     crate::sweep::Ecosystem::Cargo,
     crate::sweep::Ecosystem::Go,
     crate::sweep::Ecosystem::Zig,
     crate::sweep::Ecosystem::Cmake,
     crate::sweep::Ecosystem::Meson,
+    crate::sweep::Ecosystem::Ninja,
     crate::sweep::Ecosystem::Gradle,
     crate::sweep::Ecosystem::Maven,
     crate::sweep::Ecosystem::Sbt,
@@ -1167,6 +1194,15 @@ impl SettingsForm {
                 ));
                 continue;
             }
+            if target.field == SettingsField::ScheduledArtifactCleanup
+                && !settings_field_equal(&self.settings, &original, target)
+            {
+                impacts.push(scheduled_artifact_cleanup_impact(
+                    target.profile.as_deref().unwrap_or("global defaults"),
+                    settings_artifact_cleanup_value(&self.settings, target.profile.as_deref()),
+                ));
+                continue;
+            }
             if target.field != SettingsField::ScheduledBytecodeCleanup
                 || settings_field_equal(&self.settings, &original, target)
             {
@@ -1206,6 +1242,18 @@ fn scheduled_cleanup_impact(scope: &str, enabled: bool) -> String {
     } else {
         format!(
             "Scheduled bytecode cleanup will be disabled for {scope}. Saving does not edit an installed timer; policy changes can make its next run stop for review."
+        )
+    }
+}
+
+fn scheduled_artifact_cleanup_impact(scope: &str, enabled: bool) -> String {
+    if enabled {
+        format!(
+            "Scheduled artifact cleanup policy will be enabled for {scope}. Cargo is excluded from scheduled cleanup; scheduled removal is limited to Maven targets, Zig cache, Dart generated state, and Python pytest/mypy caches. Installation still requires a separate preview and confirmation. Each removal reserves a local history attempt; a failed write can leave an incomplete record. Saving does not install or change a timer."
+        )
+    } else {
+        format!(
+            "Scheduled artifact cleanup policy will be disabled for {scope}. An existing timer can still trigger, but its policy is rechecked before cleanup. Saving does not disable or remove the timer."
         )
     }
 }
@@ -1254,6 +1302,14 @@ fn settings_cleanup_impacts_between(
         ));
     }
     if original.as_ref().is_none_or(|previous| {
+        previous.scheduled_artifact_cleanup != current.scheduled_artifact_cleanup
+    }) {
+        impacts.push(scheduled_artifact_cleanup_impact(
+            "global defaults",
+            current.scheduled_artifact_cleanup,
+        ));
+    }
+    if original.as_ref().is_none_or(|previous| {
         previous.scheduled_trash_retention != current.scheduled_trash_retention
     }) {
         impacts.push(scheduled_trash_retention_impact(
@@ -1266,6 +1322,20 @@ fn settings_cleanup_impacts_between(
         .chain(current.profiles.keys().cloned())
         .collect::<std::collections::BTreeSet<_>>();
     for name in profiles {
+        let previous_artifacts = original
+            .as_ref()
+            .and_then(|settings| settings.profiles.get(&name))
+            .is_some_and(|profile| profile.scheduled_artifact_cleanup);
+        let artifacts_enabled = current
+            .profiles
+            .get(&name)
+            .is_some_and(|profile| profile.scheduled_artifact_cleanup);
+        if original.is_none() || previous_artifacts != artifacts_enabled {
+            impacts.push(scheduled_artifact_cleanup_impact(
+                &format!("profile {name}"),
+                artifacts_enabled,
+            ));
+        }
         let previous = original
             .as_ref()
             .and_then(|settings| settings.profiles.get(&name))
@@ -1301,6 +1371,7 @@ fn settings_rows(form: &SettingsForm) -> Vec<SettingsRow> {
     rows.extend(SETTINGS_ECOSYSTEMS.into_iter().map(SettingsRow::Ecosystem));
     rows.push(SettingsRow::AllEcosystems);
     rows.push(SettingsRow::ScheduledCleanup);
+    rows.push(SettingsRow::ScheduledArtifactCleanup);
     rows.push(SettingsRow::ScheduleFrequency);
     if form.profile.is_none() {
         rows.push(SettingsRow::ScheduledTrashRetention);
@@ -1386,6 +1457,17 @@ fn settings_cleanup_value(settings: &crate::config::Settings, profile: Option<&s
         })
 }
 
+fn settings_artifact_cleanup_value(
+    settings: &crate::config::Settings,
+    profile: Option<&str>,
+) -> bool {
+    profile
+        .and_then(|name| settings.profiles.get(name))
+        .map_or(settings.scheduled_artifact_cleanup, |profile| {
+            profile.scheduled_artifact_cleanup
+        })
+}
+
 fn settings_frequency_value(
     settings: &crate::config::Settings,
     profile: Option<&str>,
@@ -1430,6 +1512,10 @@ fn settings_field_equal(
             settings_cleanup_value(current, target.profile.as_deref())
                 == settings_cleanup_value(original, target.profile.as_deref())
         }
+        SettingsField::ScheduledArtifactCleanup => {
+            settings_artifact_cleanup_value(current, target.profile.as_deref())
+                == settings_artifact_cleanup_value(original, target.profile.as_deref())
+        }
         SettingsField::ScheduledTrashRetention => {
             current.scheduled_trash_retention == original.scheduled_trash_retention
         }
@@ -1448,6 +1534,7 @@ fn settings_field_key(field: SettingsField) -> &'static str {
         SettingsField::ArtifactRetention => "artifact_retention",
         SettingsField::EnabledEcosystems => "enabled_ecosystems",
         SettingsField::ScheduledBytecodeCleanup => "scheduled_bytecode_cleanup",
+        SettingsField::ScheduledArtifactCleanup => "scheduled_artifact_cleanup",
         SettingsField::ScheduledTrashRetention => "scheduled_trash_retention",
         SettingsField::ScheduleFrequency => "schedule_frequency",
         SettingsField::Theme => "theme",
@@ -1523,6 +1610,9 @@ fn settings_field_toml_value(
         SettingsField::ScheduledBytecodeCleanup => {
             Some(settings_cleanup_value(settings, target.profile.as_deref()).to_string())
         }
+        SettingsField::ScheduledArtifactCleanup => {
+            Some(settings_artifact_cleanup_value(settings, target.profile.as_deref()).to_string())
+        }
         SettingsField::ScheduledTrashRetention => {
             Some(settings.scheduled_trash_retention.to_string())
         }
@@ -1581,6 +1671,7 @@ fn settings_change_lines(snapshot: &crate::config::ConfigDocument, text: &str) -
         SettingsField::ArtifactRetention,
         SettingsField::EnabledEcosystems,
         SettingsField::ScheduledBytecodeCleanup,
+        SettingsField::ScheduledArtifactCleanup,
         SettingsField::ScheduledTrashRetention,
         SettingsField::ScheduleFrequency,
         SettingsField::Theme,
@@ -1720,6 +1811,14 @@ fn settings_form_content(form: &SettingsForm) -> String {
                     "disabled"
                 }
             ),
+            SettingsRow::ScheduledArtifactCleanup => format!(
+                "Scheduled artifact cleanup: {} (Linux only; up to 8 Maven, Zig, Dart, or Python directories after 30+ days; Cargo is excluded from scheduled cleanup)",
+                if settings_artifact_cleanup_value(&form.settings, form.profile.as_deref()) {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            ),
             #[cfg(target_os = "linux")]
             SettingsRow::ScheduledTrashRetention => format!(
                 "Scheduled Trash retention opt-in: {} (an installed timer can permanently delete matching items at its bound location)",
@@ -1805,6 +1904,7 @@ fn settings_target_for_row(form: &SettingsForm, row: SettingsRow) -> Option<Sett
         SettingsRow::Retention => SettingsField::ArtifactRetention,
         SettingsRow::Ecosystem(_) | SettingsRow::AllEcosystems => SettingsField::EnabledEcosystems,
         SettingsRow::ScheduledCleanup => SettingsField::ScheduledBytecodeCleanup,
+        SettingsRow::ScheduledArtifactCleanup => SettingsField::ScheduledArtifactCleanup,
         #[cfg(target_os = "linux")]
         SettingsRow::ScheduledTrashRetention => SettingsField::ScheduledTrashRetention,
         #[cfg(not(target_os = "linux"))]
@@ -2201,6 +2301,19 @@ fn settings_form_toggle(form: &mut SettingsForm, row: SettingsRow) {
             } else {
                 form.settings.scheduled_bytecode_cleanup =
                     !form.settings.scheduled_bytecode_cleanup;
+            }
+            form.mark_dirty(target);
+        }
+        SettingsRow::ScheduledArtifactCleanup => {
+            let profile = target
+                .profile
+                .as_deref()
+                .and_then(|name| form.settings.profiles.get_mut(name));
+            if let Some(profile) = profile {
+                profile.scheduled_artifact_cleanup = !profile.scheduled_artifact_cleanup;
+            } else {
+                form.settings.scheduled_artifact_cleanup =
+                    !form.settings.scheduled_artifact_cleanup;
             }
             form.mark_dirty(target);
         }
@@ -2714,6 +2827,42 @@ fn visible_toolchain_indices(reports: &[ToolReport], filter: &str) -> Vec<usize>
         .collect()
 }
 
+fn compact_toolchain_footer(app: &App, content_width: u16) -> &'static str {
+    if app.managed_mode {
+        let batch = app
+            .managed_scope
+            .as_ref()
+            .is_some_and(|scope| scope.len() > 1);
+        if batch {
+            if content_width < 31 {
+                "Space D review q"
+            } else if content_width < 40 {
+                "Space: mark D: review q: quit"
+            } else if content_width < 59 {
+                "r refresh Space mark D review q quit"
+            } else {
+                "r: refresh  ↑/↓: select  Space: mark  D: review  q: quit"
+            }
+        } else if content_width < 24 {
+            "Enter/d clean q"
+        } else if content_width < 40 {
+            "Enter/d: clean q: quit"
+        } else if content_width < 57 {
+            "r: refresh  Enter/d: clean  q: quit"
+        } else {
+            "r: refresh  ↑/↓: select  Enter/d: clean  q: quit"
+        }
+    } else if content_width < 24 {
+        "Enter update q"
+    } else if content_width < 40 {
+        "Enter: update q: quit"
+    } else if content_width < 59 {
+        "r: refresh  Enter: update  q: quit"
+    } else {
+        "/: filter  r: refresh  ↑/↓: select  Enter: update  q: quit"
+    }
+}
+
 fn visible_plan_index(
     plan: &crate::sweep::CleanupPlan,
     filter: &str,
@@ -2733,6 +2882,8 @@ impl App {
         plan: crate::schedule::ScanSchedulePreview,
         frequency: crate::schedule::Frequency,
     ) {
+        self.schedule_read_only |=
+            !cfg!(target_os = "linux") && crate::schedule::schedules_artifact_cleanup(&plan);
         self.schedule_install_plan = Some((plan, frequency));
         self.message.clear();
     }
@@ -3053,8 +3204,19 @@ impl App {
     }
 
     fn key(&mut self, key: KeyEvent) -> Action {
-        if key.kind != KeyEventKind::Press {
+        if key.kind == KeyEventKind::Release
+            || (key.kind == KeyEventKind::Repeat
+                && !matches!(
+                    key.code,
+                    KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown
+                )
+                && !(key.modifiers == KeyModifiers::NONE
+                    && matches!(key.code, KeyCode::Char('j' | 'k'))))
+        {
             return Action::None;
+        }
+        if schedule_activation_is_preview_only(self) {
+            self.schedule_read_only = true;
         }
         if self.settings_saving {
             return Action::None;
@@ -3592,6 +3754,7 @@ impl App {
                         row @ (SettingsRow::Ecosystem(_)
                         | SettingsRow::AllEcosystems
                         | SettingsRow::ScheduledCleanup
+                        | SettingsRow::ScheduledArtifactCleanup
                         | SettingsRow::ScheduledTrashRetention
                         | SettingsRow::ScheduleFrequency
                         | SettingsRow::Theme) => {
@@ -3615,6 +3778,7 @@ impl App {
                             rows[form.selected],
                             SettingsRow::Ecosystem(_)
                                 | SettingsRow::ScheduledCleanup
+                                | SettingsRow::ScheduledArtifactCleanup
                                 | SettingsRow::ScheduledTrashRetention
                                 | SettingsRow::ScheduleFrequency
                                 | SettingsRow::Theme
@@ -4673,9 +4837,47 @@ impl App {
             }
             return Action::None;
         }
+        if self.self_update_preparing {
+            return match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => Action::Quit,
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
+                _ => Action::None,
+            };
+        }
+        if self.self_update_plan.is_some() {
+            return match key.code {
+                KeyCode::Enter | KeyCode::Char('y')
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    let plan = self.self_update_plan.take().expect("plan checked above");
+                    self.updating = true;
+                    self.message = "Updating Upkit…".into();
+                    Action::SelfUpdate(plan)
+                }
+                KeyCode::Esc | KeyCode::Char('n' | 'q') => {
+                    self.self_update_plan = None;
+                    if self.self_update_command {
+                        Action::Quit
+                    } else {
+                        Action::None
+                    }
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.self_update_plan = None;
+                    if self.self_update_command {
+                        Action::Quit
+                    } else {
+                        Action::None
+                    }
+                }
+                _ => Action::None,
+            };
+        }
         if self.confirmation {
             return match key.code {
-                KeyCode::Enter | KeyCode::Char('y') => {
+                KeyCode::Enter | KeyCode::Char('y') if toolchain_confirmation_key(key) => {
                     self.confirmation = false;
                     let targets = if self.marked.is_empty() {
                         self.selected_toolchain().into_iter().collect()
@@ -5187,6 +5389,13 @@ impl App {
                 self.history = None;
                 Action::RefreshHistory
             }
+            KeyCode::Char('c') if self.page == Start::Dashboard && !self.cache_running => {
+                self.page = Start::Cache;
+                self.cache_running = true;
+                self.cache = None;
+                self.cache_scroll = 0;
+                Action::StartCache
+            }
             KeyCode::Char('r') if self.page == Start::Settings && !self.settings_loading => {
                 self.settings_loading = true;
                 self.settings = None;
@@ -5229,17 +5438,21 @@ impl App {
                 self.settings_scroll = self.settings_scroll.saturating_sub(1);
                 Action::None
             }
-            KeyCode::Char('s') if self.page == Start::Dashboard && !self.scan_running => {
+            KeyCode::Char('s') if self.page == Start::Dashboard => {
                 self.page = Start::Artifacts;
-                self.scan_running = true;
-                self.scan = None;
-                self.plan = None;
-                self.preview_mode = false;
-                self.artifact_marks.clear();
-                self.scan_scroll = 0;
-                self.scan_visited = 0;
-                self.message.clear();
-                Action::StartArtifactScan { configured: true }
+                if self.scan_running {
+                    Action::None
+                } else {
+                    self.scan_running = true;
+                    self.scan = None;
+                    self.plan = None;
+                    self.preview_mode = false;
+                    self.artifact_marks.clear();
+                    self.scan_scroll = 0;
+                    self.scan_visited = 0;
+                    self.message.clear();
+                    Action::StartArtifactScan { configured: true }
+                }
             }
             KeyCode::Down | KeyCode::Char('j')
                 if self.page == Start::Maintenance && !self.trim_running =>
@@ -5270,6 +5483,17 @@ impl App {
                 self.message = "Inspecting Upkit link staging directories…".into();
                 Action::PreviewTempCleanup(Vec::new(), false)
             }
+            KeyCode::Char('U')
+                if self.page == Start::Toolchains
+                    && !self.managed_mode
+                    && !self.updating
+                    && !self.trim_running
+                    && !self.container_removing =>
+            {
+                self.self_update_preparing = true;
+                self.message = "Preparing Upkit self-update preview…".into();
+                Action::PreviewSelfUpdate
+            }
             KeyCode::Enter
                 if self.page == Start::Maintenance
                     && !self.trim_running
@@ -5285,7 +5509,15 @@ impl App {
                     self.message = "Preparing TRIM preview…".into();
                     Action::PreviewTrim(mount.mount_path.clone())
                 } else {
-                    self.message = "Select an available mount with fstrim installed.".into();
+                    self.message = if self
+                        .maintenance
+                        .as_ref()
+                        .is_some_and(|report| !report.fstrim_available)
+                    {
+                        "TRIM preview is unavailable on this system.".into()
+                    } else {
+                        "Select an available mount with fstrim installed.".into()
+                    };
                     Action::None
                 }
             }
@@ -5777,6 +6009,23 @@ impl App {
                 }
                 Action::None
             }
+            KeyCode::Char('r')
+                if self.page == Start::Toolchains
+                    && !self.startup_checks.toolchains
+                    && !self.updating =>
+            {
+                self.startup_checks.toolchains = true;
+                self.toolchain_check_failed = false;
+                self.reports = None;
+                self.message = "Refreshing toolchain inventory…".into();
+                Action::RefreshToolchains
+            }
+            KeyCode::Char('r')
+                if self.page == Start::Toolchains && self.startup_checks.toolchains =>
+            {
+                self.message = "Toolchain inventory is already loading.".into();
+                Action::None
+            }
             KeyCode::Down | KeyCode::Char('j') if self.page == Start::Toolchains => {
                 self.move_toolchain_selection(true);
                 Action::None
@@ -5916,6 +6165,12 @@ fn important_dashboard_warning(issues: &[String]) -> Option<String> {
 
 fn dashboard_cards(app: &App) -> [(&'static str, String); 4] {
     let toolchains = match &app.reports {
+        None if app.toolchain_check_failed => {
+            "Toolchain check failed; results are unavailable.".into()
+        }
+        None if app.self_update_command => {
+            "Toolchain inventory was not loaded for self-update.".into()
+        }
         None => "Checking toolchains…".into(),
         Some(reports) => format!(
             "Toolchains: {}/{} installed\nUpdates: {}\nUnknown: {}",
@@ -5935,6 +6190,10 @@ fn dashboard_cards(app: &App) -> [(&'static str, String); 4] {
         ),
     };
     let storage = match &app.maintenance {
+        None if app.maintenance_check_failed => "Maintenance status is unavailable.".into(),
+        None if app.self_update_command => {
+            "Maintenance status was not loaded for self-update.".into()
+        }
         None => "Checking maintenance status…".into(),
         Some(status) => {
             let mut lines = vec![format!(
@@ -6006,19 +6265,17 @@ fn dashboard_cards(app: &App) -> [(&'static str, String); 4] {
             activity.push("Recent operations: history unavailable; see Reports.".into())
         }
         Some(Ok(history)) => {
-            let latest = history
-                .records
-                .iter()
-                .max_by_key(|record| (record.started_unix, record.id));
-            activity.push(latest.map_or_else(
-                || "Recent operations: no records.".into(),
-                |record| {
-                    format!(
-                        "Latest operation: {} — {}",
-                        record.operation, record.outcome
-                    )
-                },
-            ));
+            if history.records.is_empty() {
+                activity.push("Recent operations: no records.".into());
+            } else {
+                activity.extend(
+                    history
+                        .records
+                        .iter()
+                        .take(3)
+                        .map(|record| format!("{} — {}", record.operation, record.outcome)),
+                );
+            }
             if !history.warnings.is_empty() {
                 activity.push("Operation history is incomplete; see Reports.".into());
             }
@@ -6226,8 +6483,12 @@ fn reports_content(app: &App) -> String {
             } else {
                 lines.extend(records.into_iter().map(|record| {
                     format!(
-                        "{}  {}  {}  {}\n  target={}\n  duration={}ms  {}\n  estimated={}  verified reclaimed={}",
-                        record.started_unix,
+                        "started={}  finished={}  {}  {}  {}\n  target={}\n  duration={}ms  {}\n  estimated={}  verified reclaimed={}",
+                        crate::reports::format_timestamp(record.started_unix),
+                        record
+                            .finished_unix
+                            .map(crate::reports::format_timestamp)
+                            .unwrap_or_else(|| "unfinished".into()),
                         record.id,
                         record.operation,
                         record.outcome,
@@ -6468,6 +6729,82 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
     draw_for_platform(frame, app, SchedulePlatform::current());
 }
 
+fn application_status(app: &App) -> &'static str {
+    let initial_checks_running = app.startup_checks.toolchains
+        || app.startup_checks.doctor
+        || app.startup_checks.maintenance;
+    let working = initial_checks_running
+        || [
+            app.updating,
+            app.self_update_preparing,
+            app.managed_preparing,
+            app.managed_running,
+            app.scan_running,
+            app.artifact_preparing,
+            app.artifact_running,
+            app.bytecode_preparing,
+            app.bytecode_running,
+            app.bytecode_listing_running,
+            app.trim_preparing,
+            app.trim_running,
+            app.temp_preparing,
+            app.temp_running,
+            app.cache_running,
+            app.go_test_preparing,
+            app.go_test_running,
+            app.trash_running,
+            app.trash_removal_preparing,
+            app.trash_marking,
+            app.trash_removing,
+            app.containers_running,
+            app.container_preparing,
+            app.container_removing,
+            app.network_preparing,
+            app.network_removing,
+            app.build_cache_preparing,
+            app.build_cache_removing,
+            app.schedule_running,
+            app.schedule_edit_preparing,
+            app.schedule_edit_running,
+            app.schedule_remove_preparing,
+            app.schedule_remove_running,
+            app.schedule_disable_preparing,
+            app.schedule_disable_running,
+            app.schedule_install_preparing,
+            app.schedule_install_running,
+            app.schedule_enable_preparing,
+            app.schedule_enable_running,
+            app.history_running,
+            app.history_purge_preparing,
+            app.history_purging,
+            app.settings_loading,
+            app.settings_saving,
+        ]
+        .into_iter()
+        .any(|active| active)
+        || {
+            #[cfg(target_os = "linux")]
+            {
+                app.trash_retention_status_loading
+                    || app.trash_retention_preparing
+                    || app.trash_retention_running
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                false
+            }
+        };
+    if working {
+        "Working"
+    } else if confirmation_surfaces(app).contains(&true) {
+        "Review"
+    } else if app.reports.is_none() || app.issues.is_none() || app.maintenance.is_none() {
+        "Idle"
+    } else {
+        "Ready"
+    }
+}
+
 fn draw_for_platform(frame: &mut Frame<'_>, app: &App, platform: SchedulePlatform) {
     let areas = Layout::vertical([
         Constraint::Length(3),
@@ -6475,15 +6812,38 @@ fn draw_for_platform(frame: &mut Frame<'_>, app: &App, platform: SchedulePlatfor
         Constraint::Length(3),
     ])
     .split(frame.area());
-    frame.render_widget(
-        Paragraph::new(format!(
-            " Upkit {}  •  {} / {}  •  ?: help",
+    let status = application_status(app);
+    let header = if frame.area().width < 24 {
+        status.to_owned()
+    } else if frame.area().width < 34 {
+        format!(" Upkit  •  {status}")
+    } else if frame.area().width < 40 {
+        format!(" Upkit {}  •  {status}", env!("CARGO_PKG_VERSION"))
+    } else if frame.area().width < 50 {
+        format!(
+            " Upkit {}  •  {}  •  {status}",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+        )
+    } else if frame.area().width < 72 {
+        format!(
+            " Upkit {}  •  {}/{}  •  {status}",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+        )
+    } else {
+        format!(
+            " Upkit {}  •  {} / {}  •  Status: {status}  •  ?: help",
             env!("CARGO_PKG_VERSION"),
             std::env::consts::OS,
             std::env::consts::ARCH
-        ))
-        .block(Block::default().borders(Borders::ALL))
-        .cyan(),
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(header)
+            .block(Block::default().borders(Borders::ALL))
+            .cyan(),
         areas[0],
     );
     let body = if frame.area().width >= 60 {
@@ -6669,7 +7029,7 @@ fn draw_for_platform(frame: &mut Frame<'_>, app: &App, platform: SchedulePlatfor
                                 "Names are a read-only snapshot; deletion dates and item actions are unavailable."
                             }
                             "windows" => {
-                                "Only the Recycle Bin item count is available; item-level actions are unsupported."
+                                "Recycle Bin sizes are estimates; item-level actions are unsupported."
                             }
                             _ => "Item-level Trash actions are unsupported on this platform.",
                         }
@@ -6683,6 +7043,10 @@ fn draw_for_platform(frame: &mut Frame<'_>, app: &App, platform: SchedulePlatfor
         cache_content(app)
     } else if app.page == Start::Maintenance {
         match &app.maintenance {
+            None if app.maintenance_check_failed => "Maintenance status is unavailable.".into(),
+            None if app.self_update_command => {
+                "Maintenance status was not loaded for self-update.".into()
+            }
             None => "Checking TRIM timer status…".into(),
             Some(report) => {
                 let mut lines = vec![
@@ -6697,17 +7061,23 @@ fn draw_for_platform(frame: &mut Frame<'_>, app: &App, platform: SchedulePlatfor
                         "Next trigger: {}",
                         report.timer.next_trigger.as_deref().unwrap_or("unknown")
                     ),
-                    "Select a mount and press Enter for a TRIM preview:".into(),
+                    if report.fstrim_available {
+                        "Select a mount and press Enter for a TRIM preview:"
+                    } else {
+                        "Volume inventory is read-only; TRIM preview is unavailable."
+                    }
+                    .into(),
                 ];
                 lines.extend(report.mounts.iter().enumerate().map(|(index, mount)| {
                     format!(
-                        "{} {}: device discard {}  available bytes {}\n  FITRIM: {}\n  online discard option: {}  fstab TRIM exclusion: {}",
+                        "{} {}: filesystem {}  device discard {}  available bytes {}\n  FITRIM: {}\n  online discard option: {}  fstab TRIM exclusion: {}",
                         if index == app.trim_selected {
                             "›"
                         } else {
                             " "
                         },
                         crate::maintenance::display_mount_path(&mount.mount_path),
+                        schedule_escape_controls(&mount.filesystem),
                         mount.device_discard,
                         mount
                             .available_bytes
@@ -6861,6 +7231,12 @@ fn draw_for_platform(frame: &mut Frame<'_>, app: &App, platform: SchedulePlatfor
         doctor_content(app)
     } else {
         match &app.reports {
+            None if app.toolchain_check_failed => {
+                "Toolchain check failed; results are unavailable.".to_owned()
+            }
+            None if app.self_update_command => {
+                "Toolchain inventory was not loaded for self-update.".to_owned()
+            }
             None => "Checking toolchains in the background…".to_owned(),
             Some(reports) => {
                 let visible = visible_toolchain_indices(reports, &app.toolchain_filter);
@@ -7138,13 +7514,13 @@ fn draw_for_platform(frame: &mut Frame<'_>, app: &App, platform: SchedulePlatfor
                     .as_ref()
                     .is_some_and(|scope| scope.len() > 1)
                 {
-                    "/: filter  ↑/↓: select  Space: mark  D: review marked cleanup  Enter/d: selected cleanup  q: quit"
+                    "/: filter  r: refresh  ↑/↓: select  Space: mark  D: review marked cleanup  Enter/d: selected cleanup  q: quit"
                 } else {
-                    "/: filter  ↑/↓: select tool  Enter/d: preview cleanup  Tab: page  q: quit"
+                    "/: filter  r: refresh  ↑/↓: select tool  Enter/d: preview cleanup  Tab: page  q: quit"
                 }
             }
             Start::Toolchains => {
-                "/: filter  ↑/↓: select  Space: mark  Enter: update  d: selected cleanup  D: marked cleanup  q: quit"
+                "/: filter  r: refresh  ↑/↓: select  Space: mark  Enter: update  U: self-update  d/D: cleanup  q: quit"
             }
             Start::Artifacts if app.cli_preview_read_only && app.scan_running => {
                 "Esc: cancel read-only preview scan  q: quit"
@@ -7162,7 +7538,15 @@ fn draw_for_platform(frame: &mut Frame<'_>, app: &App, platform: SchedulePlatfor
             Start::Doctor if app.issues.is_none() => "Esc: cancel Doctor checks  q: quit",
             Start::Doctor => "/: filter  r: refresh  ↑/↓: scroll  Tab: page  q: quit",
             Start::Dashboard => {
-                "s: scan configured roots  r: refresh history  ↑/↓: scroll  Tab: page  q: quit"
+                if frame.area().width < 42 {
+                    "s scan c cache q quit"
+                } else if frame.area().width < 65 {
+                    "s scan c cache r history Tab page q quit"
+                } else if frame.area().width < 81 {
+                    "s: scan  c: caches  r: history  ↑/↓: scroll  Tab: page  q: quit"
+                } else {
+                    "s: scan roots  c: inventory caches  r: history  ↑/↓: scroll  Tab: page  q: quit"
+                }
             }
             Start::Maintenance if app.temp_preparing => "Esc: cancel inventory  q: quit",
             Start::Maintenance if app.temp_running => {
@@ -7210,6 +7594,15 @@ fn draw_for_platform(frame: &mut Frame<'_>, app: &App, platform: SchedulePlatfor
         }
     } else {
         &app.message
+    };
+    let footer = if app.page == Start::Toolchains
+        && app.message.is_empty()
+        && search_footer.is_none()
+        && ratatui::text::Line::from(footer).width() > frame.area().width.saturating_sub(2) as usize
+    {
+        compact_toolchain_footer(app, frame.area().width.saturating_sub(2))
+    } else {
+        footer
     };
     frame.render_widget(
         Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
@@ -8134,6 +8527,27 @@ fn draw_for_platform(frame: &mut Frame<'_>, app: &App, platform: SchedulePlatfor
             area,
         );
     }
+    if let Some(plan) = &app.self_update_plan {
+        let lines = self_update_confirmation_lines(plan);
+        let area = centered(
+            frame.area(),
+            frame.area().width.saturating_sub(2),
+            u16::try_from(lines.len() + 2).unwrap_or(u16::MAX),
+        );
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(lines.join("\n"))
+                .block(Block::default().borders(Borders::ALL).title(
+                    if self_update_confirmation_fits(plan, frame.area()) {
+                        " Confirm Upkit self-update "
+                    } else {
+                        " Enlarge terminal to review self-update "
+                    },
+                ))
+                .yellow(),
+            area,
+        );
+    }
     if app.plan_detail
         && let Some(Ok(plan)) = &app.plan
         && let Some(index) =
@@ -8204,7 +8618,7 @@ fn draw_for_platform(frame: &mut Frame<'_>, app: &App, platform: SchedulePlatfor
                 .collect::<Vec<_>>()
                 .join("\n"),
             if item.candidate.cargo_workspace.is_some() {
-                "\n\nCargo workspace evidence is from the scan; dependency membership and Cargo configuration are unresolved."
+                "\n\nCargo workspace evidence inspects every ancestor manifest; package.workspace overrides and custom Cargo output settings remain ineligible for removal."
             } else {
                 ""
             }
@@ -8253,13 +8667,13 @@ fn draw_for_platform(frame: &mut Frame<'_>, app: &App, platform: SchedulePlatfor
         frame.render_widget(Clear, area);
         let context = match app.page {
             Start::Dashboard => {
-                "Dashboard: s scans configured roots; ↑/↓ scrolls dashboard details; r refreshes history; Tab opens the next page."
+                "Dashboard: s scans configured roots; c opens Caches and starts its read-only inventory; ↑/↓ scrolls details; r refreshes history; Tab opens the next page."
             }
             Start::Toolchains if app.managed_mode => {
                 "Toolchains: / filters tool names, versions, status, or notes; Space marks allowed cleanup targets. Enter or d previews the selected tool; D reviews marked targets together."
             }
             Start::Toolchains => {
-                "Toolchains: / filters tool names, versions, status, or notes; ↑/↓ selects visible tools; Space marks tools for update or cleanup. Marks persist while filtering. Enter previews update; d previews selected cleanup; D reviews marked cleanup together."
+                "Toolchains: / filters tool names, versions, status, or notes; r refreshes the inventory; ↑/↓ selects visible tools; Space marks tools for update or cleanup. Marks persist while filtering. Enter previews update; U previews Upkit self-update; d previews selected cleanup; D reviews marked cleanup together."
             }
             Start::Doctor => "Doctor: / filters diagnostic lines; r refreshes; ↑/↓ or j/k scrolls.",
             Start::Artifacts if app.cli_preview_read_only => {
@@ -8345,6 +8759,76 @@ fn apply_theme(frame: &mut Frame<'_>, theme: crate::config::Theme) {
             color => color,
         };
     }
+}
+
+fn self_update_confirmation_lines(plan: &crate::application::SelfUpdatePlan) -> Vec<String> {
+    let mut lines = vec![
+        format!("Method: {}", plan.via),
+        format!(
+            "Program: {}",
+            crate::sweep::display_path(&plan.program_path)
+        ),
+    ];
+    lines.extend(
+        plan.args
+            .iter()
+            .map(|arg| format!("Argument: {}", schedule_escape_controls(arg))),
+    );
+    if plan.via == "github" {
+        let source = plan.release_source.as_ref().map_or_else(
+            || format!("{}/releases/latest/download", env!("CARGO_PKG_REPOSITORY")),
+            |source| self_update_source_display(source),
+        );
+        lines.push(format!("Release source: {source}"));
+        lines.push(format!(
+            "Install directory: {}",
+            crate::sweep::display_path(&plan.destination)
+        ));
+    } else {
+        lines.push(format!(
+            "Install location is chosen by {}; it may differ from the current executable.",
+            plan.via
+        ));
+    }
+    lines.push("The update downloads and runs the selected installer.".into());
+    lines.push("The executable can change at the same path after preview.".into());
+    lines.push("Enter/y: confirm    Esc/n: cancel".into());
+    lines
+}
+
+fn self_update_source_display(source: &std::ffi::OsStr) -> String {
+    if let Some(mut url) = source
+        .to_str()
+        .and_then(|value| reqwest::Url::parse(value).ok())
+        .filter(|url| url.host_str().is_some())
+    {
+        let hidden = !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some();
+        let _ = url.set_password(None);
+        let _ = url.set_username("");
+        url.set_query(None);
+        url.set_fragment(None);
+        return format!(
+            "{url}{}",
+            if hidden {
+                " (credentials/query hidden)"
+            } else {
+                ""
+            }
+        );
+    }
+    crate::sweep::display_path(std::path::Path::new(source))
+}
+
+fn self_update_confirmation_fits(plan: &crate::application::SelfUpdatePlan, area: Rect) -> bool {
+    let lines = self_update_confirmation_lines(plan);
+    area.height as usize >= lines.len() + 2
+        && lines.iter().all(|line| {
+            ratatui::text::Line::from(line.as_str()).width()
+                <= area.width.saturating_sub(4) as usize
+        })
 }
 
 fn toolchain_confirmation_lines(app: &App) -> Option<Vec<String>> {
@@ -9509,6 +9993,25 @@ fn schedule_install_confirmation_lines_for(
     platform: SchedulePlatform,
 ) -> Vec<String> {
     let mut lines = schedule_scan_confirmation_lines_for(plan, platform);
+    let artifact_cleanup = crate::schedule::schedules_artifact_cleanup(plan);
+    let bytecode_cleanup = crate::schedule::schedules_bytecode_cleanup(plan);
+    let cleanup = artifact_cleanup || bytecode_cleanup;
+    if artifact_cleanup && platform != SchedulePlatform::Systemd {
+        append_schedule_cleanup_details(&mut lines, true, bytecode_cleanup);
+        lines
+            .push("Scheduled artifact cleanup can only be installed on Linux with systemd.".into());
+        lines.push(format!("Schedule warning: {}", plan.warning));
+        return lines;
+    }
+    if cleanup && platform != SchedulePlatform::Systemd {
+        append_schedule_cleanup_details(&mut lines, artifact_cleanup, bytecode_cleanup);
+        lines.push(
+            "Automatic scheduled cleanup can be installed only as a configured Linux systemd timer.".into(),
+        );
+        lines.push(format!("Schedule warning: {}", plan.warning));
+        lines.push("Press y to install; Esc/n cancels.".into());
+        return lines;
+    }
     if platform == SchedulePlatform::LaunchAgent {
         lines.extend([
             "Creates the verified LaunchAgent plist in the current user's LaunchAgents directory."
@@ -9545,30 +10048,19 @@ fn schedule_install_confirmation_lines_for(
         ]);
         return lines;
     }
-    let bytecode_cleanup = crate::schedule::schedules_bytecode_cleanup(plan);
     lines.extend([
         "Unit directory must exist, be user-owned, and not group/other writable.".into(),
         "Creates unit files and enables a user timer; failures may be partial.".into(),
     ]);
-    if bytecode_cleanup {
-        lines.extend([
-            "Automatic Python bytecode cleanup is enabled by this profile's explicit opt-in.".into(),
-            "Enabling may start automatic, permanent Python bytecode cleanup promptly.".into(),
-            "Configured retention is at least 7 days; at most 32 files are removed per run.".into(),
-            "Each file is revalidated against project, Git, process, path, source and configuration policy.".into(),
-            "Unchecked-hash bytecode is excluded; concurrent changes can still race.".into(),
-        ]);
+    if cleanup {
+        append_schedule_cleanup_details(&mut lines, artifact_cleanup, bytecode_cleanup);
     } else {
         lines.push("Scan may start promptly and writes JSON to the user journal; no workspace files are cleaned.".into());
     }
     lines.push(scheduled_scan_history_note().into());
     lines.push(format!(
         "{} warning: {}",
-        if bytecode_cleanup {
-            "Scheduled cleanup"
-        } else {
-            "Scan"
-        },
+        if cleanup { "Scheduled cleanup" } else { "Scan" },
         plan.warning
     ));
     lines.push("Press y to install; Esc/n cancels.".into());
@@ -9586,7 +10078,25 @@ fn schedule_enable_confirmation_lines_for(
     platform: SchedulePlatform,
 ) -> Vec<String> {
     let mut lines = schedule_scan_confirmation_lines_for(&plan.intended, platform);
+    let artifact_cleanup = crate::schedule::schedules_artifact_cleanup(&plan.intended);
     let bytecode_cleanup = crate::schedule::schedules_bytecode_cleanup(&plan.intended);
+    let cleanup = artifact_cleanup || bytecode_cleanup;
+    if artifact_cleanup && platform != SchedulePlatform::Systemd {
+        append_schedule_cleanup_details(&mut lines, true, bytecode_cleanup);
+        lines.push("Scheduled artifact cleanup can only be enabled on Linux with systemd.".into());
+        lines.push(format!("Enable warning: {}", plan.warning));
+        return lines;
+    }
+    if cleanup && platform != SchedulePlatform::Systemd {
+        append_schedule_cleanup_details(&mut lines, artifact_cleanup, bytecode_cleanup);
+        lines.push(
+            "Automatic scheduled cleanup can be enabled only for a configured Linux systemd timer."
+                .into(),
+        );
+        lines.push(format!("Enable warning: {}", plan.warning));
+        lines.push("Press y to enable; Esc/n cancels.".into());
+        return lines;
+    }
     if platform == SchedulePlatform::TaskScheduler {
         lines.extend([
             "Re-enables only the verified Task Scheduler task for the current Windows user.".into(),
@@ -9610,13 +10120,9 @@ fn schedule_enable_confirmation_lines_for(
             scheduled_scan_output_note(platform).into(),
             scheduled_scan_history_note().into(),
         ]);
-    } else if bytecode_cleanup {
-        lines.extend([
-            "Re-enabling may start automatic, permanent Python bytecode cleanup promptly.".into(),
-            "Configured retention is at least 7 days; at most 32 files are removed per run.".into(),
-            "Each file is revalidated against project, Git, process, path, source and configuration policy.".into(),
-            "Unchecked-hash bytecode is excluded; existing unit ownership is not independently proven.".into(),
-        ]);
+    } else if cleanup {
+        append_schedule_cleanup_details(&mut lines, artifact_cleanup, bytecode_cleanup);
+        lines.push("Existing unit ownership is not independently proven.".into());
     } else {
         lines.extend([
             "Scan may start promptly; its JSON is written to the user journal.".into(),
@@ -9629,7 +10135,7 @@ fn schedule_enable_confirmation_lines_for(
     }
     lines.push(format!(
         "Intended {} warning: {}",
-        if bytecode_cleanup { "cleanup" } else { "scan" },
+        if cleanup { "cleanup" } else { "scan" },
         plan.intended.warning
     ));
     if platform != SchedulePlatform::TaskScheduler {
@@ -9637,6 +10143,28 @@ fn schedule_enable_confirmation_lines_for(
     }
     lines.push("Press y to enable; Esc/n cancels.".into());
     lines
+}
+
+fn append_schedule_cleanup_details(lines: &mut Vec<String>, artifacts: bool, bytecode: bool) {
+    if artifacts {
+        lines.extend([
+            "This policy permanently removes explicitly scoped rebuildable project artifacts.".into(),
+            "Artifact retention is at least 30 days; at most 8 directories are attempted per run.".into(),
+            "Eligible targets are Maven target, Zig .zig-cache, Dart .dart_tool, and Python pytest/mypy caches; Cargo is excluded from scheduled cleanup until its target-directory configuration can be verified safely.".into(),
+            "Active or unknown process activity and failed project, Git, history, or identity checks stop cleanup.".into(),
+            "Each attempted removal reserves local history first; interruptions may leave an incomplete record.".into(),
+            "The scheduler output and local history omit workspace paths and raw error details.".into(),
+        ]);
+    }
+    if bytecode {
+        lines.extend([
+            "This policy automatically and permanently removes eligible Python bytecode.".into(),
+            "Scheduled bytecode cleanup requires explicit opt-in in the bound configuration.".into(),
+            "Bytecode retention is at least 7 days; at most 32 files are removed per run.".into(),
+            "Each file is revalidated against project, Git, process, path, source and configuration policy.".into(),
+            "Unchecked-hash bytecode is excluded; concurrent changes can still race.".into(),
+        ]);
+    }
 }
 
 fn schedule_escape_controls(line: &str) -> String {
@@ -9746,10 +10274,11 @@ fn history_purge_confirmation_lines(
             lines.push(format!(
                 "ID {} | started={} | finished={} | {} | {}",
                 candidate.id,
-                candidate.started_unix,
+                crate::reports::format_timestamp(candidate.started_unix),
                 candidate
                     .finished_unix
-                    .map_or("unknown".into(), |time| time.to_string()),
+                    .map(crate::reports::format_timestamp)
+                    .unwrap_or_else(|| "unfinished".into()),
                 candidate.operation,
                 candidate.outcome
             ));
@@ -10008,7 +10537,7 @@ fn schedule_confirmation_ready(app: &App, lines: &[String], area: Rect) -> bool 
 }
 
 fn schedule_confirmation_can_confirm(app: &App, drawn: Rect, actual: Rect) -> bool {
-    if app.schedule_read_only || drawn != actual {
+    if app.schedule_read_only || schedule_activation_is_preview_only(app) || drawn != actual {
         return false;
     }
     let Some((_, lines, _)) = schedule_confirmation_review(app) else {
@@ -10016,6 +10545,20 @@ fn schedule_confirmation_can_confirm(app: &App, drawn: Rect, actual: Rect) -> bo
     };
     schedule_confirmation_ready(app, &lines, drawn)
         && schedule_confirmation_ready(app, &lines, actual)
+}
+
+fn schedule_activation_is_preview_only(app: &App) -> bool {
+    !cfg!(target_os = "linux")
+        && (app
+            .schedule_install_plan
+            .as_ref()
+            .is_some_and(|(plan, _)| crate::schedule::schedules_artifact_cleanup(plan))
+            || app.schedule_enable_plan.as_ref().is_some_and(|(plan, _)| {
+                crate::schedule::schedules_artifact_cleanup(&plan.intended)
+            })
+            || app.schedule_edit_plan.as_ref().is_some_and(|(plan, _)| {
+                crate::schedule::schedules_artifact_cleanup(&plan.replacement)
+            }))
 }
 
 fn schedule_dialog_title(
@@ -10115,18 +10658,38 @@ fn schedule_edit_confirmation_lines_for(
         &plan.replacement,
         platform,
     ));
+    let artifact_cleanup = crate::schedule::schedules_artifact_cleanup(&plan.replacement);
     let bytecode_cleanup = crate::schedule::schedules_bytecode_cleanup(&plan.replacement);
+    let cleanup = artifact_cleanup || bytecode_cleanup;
+    if artifact_cleanup && platform != SchedulePlatform::Systemd {
+        append_schedule_cleanup_details(&mut lines, true, bytecode_cleanup);
+        lines.push("Scheduled artifact cleanup can only be edited on Linux with systemd.".into());
+        lines.push(format!(
+            "Replacement cleanup warning: {}",
+            plan.replacement.warning
+        ));
+        lines.push(format!("Edit warning: {}", plan.warning));
+        return lines;
+    }
+    if cleanup && platform != SchedulePlatform::Systemd {
+        append_schedule_cleanup_details(&mut lines, artifact_cleanup, bytecode_cleanup);
+        lines.push(
+            "Automatic scheduled cleanup can be installed only as a configured Linux systemd timer.".into(),
+        );
+        lines.push(format!(
+            "Replacement cleanup warning: {}",
+            plan.replacement.warning
+        ));
+        lines.push(format!("Edit warning: {}", plan.warning));
+        lines.push("Press y to replace; Esc/n cancels.".into());
+        return lines;
+    }
     lines.extend([
-        schedule_edit_transition_note(platform, bytecode_cleanup).into(),
+        schedule_edit_transition_note(platform, cleanup).into(),
         schedule_edit_failure_note(platform).into(),
     ]);
-    if bytecode_cleanup {
-        lines.extend([
-            "The replacement automatically and permanently removes eligible Python bytecode.".into(),
-            "Configured retention is at least 7 days; at most 32 files are removed per run.".into(),
-            "Each file is revalidated against project, Git, process, path, source and configuration policy.".into(),
-            "Unchecked-hash bytecode is excluded; concurrent changes can still race.".into(),
-        ]);
+    if cleanup {
+        append_schedule_cleanup_details(&mut lines, artifact_cleanup, bytecode_cleanup);
     } else {
         lines.push(scheduled_scan_output_note(platform).into());
         lines.push("No workspace files are cleaned.".into());
@@ -10140,7 +10703,7 @@ fn schedule_edit_confirmation_lines_for(
     }
     lines.push(format!(
         "Replacement {} warning: {}",
-        if bytecode_cleanup { "cleanup" } else { "scan" },
+        if cleanup { "cleanup" } else { "scan" },
         plan.replacement.warning
     ));
     lines.push(format!("Edit warning: {}", plan.warning));
@@ -10431,7 +10994,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 enum WorkerEvent {
-    Checked(Vec<ToolReport>),
+    Checked(Result<Vec<ToolReport>, String>),
     Diagnosed(
         Vec<String>,
         Option<u64>,
@@ -10439,6 +11002,8 @@ enum WorkerEvent {
     ),
     Updating(ToolKind, usize, usize),
     Updated(Vec<(ToolKind, Result<(), String>)>),
+    SelfUpdatePreview(Result<crate::application::SelfUpdatePlan, String>),
+    SelfUpdated(Result<(), String>),
     ManagedPreview(Result<crate::managed_cleanup::CleanupPlan, String>),
     ManagedBatchPreview(Result<Vec<ManagedCleanupTarget>, ManagedBatchPreviewFailure>),
     ManagedCleaned(crate::reports::Performed<&'static str>),
@@ -10446,7 +11011,6 @@ enum WorkerEvent {
     TempPreview(Result<crate::temp_cleanup::Plan, String>, bool),
     #[cfg(target_os = "linux")]
     TempCleaned(crate::reports::Performed<crate::temp_cleanup::CleanupResult>),
-    ScanProgress(usize),
     Scanned(Result<crate::sweep::ScanReport, String>),
     Previewed(Result<crate::sweep::CleanupPlan, String>),
     ArtifactPreview(Result<crate::artifact_cleanup::ArtifactPlan, String>),
@@ -10463,7 +11027,7 @@ enum WorkerEvent {
     BytecodeBatchRemoved(Result<crate::reports::BytecodeBatchResult, String>),
     SettingsLoaded(Result<crate::config::ConfigDocument, String>),
     SettingsSaved(Result<(crate::config::ConfigDocument, Option<PathBuf>), String>),
-    Maintenance(crate::maintenance::TrimStatus),
+    Maintenance(Result<crate::maintenance::TrimStatus, String>),
     TrimPreview(Result<crate::maintenance::TrimPlan, String>),
     TrimFinished(crate::reports::Performed<()>),
     Cache(crate::cache::CacheReport),
@@ -10522,10 +11086,136 @@ enum WorkerEvent {
     TrashRetentionChanged(&'static str, crate::reports::Performed<&'static str>),
 }
 
+const MAX_WORKER_EVENTS_PER_FRAME: usize = 64;
+
+fn worker_events_for_frame(rx: &mpsc::Receiver<WorkerEvent>) -> Vec<WorkerEvent> {
+    rx.try_iter().take(MAX_WORKER_EVENTS_PER_FRAME).collect()
+}
+
+fn report_scan_progress(progress: &AtomicUsize, visited: &mut usize) {
+    *visited = visited.saturating_add(1);
+    if *visited == 1 || visited.is_multiple_of(128) {
+        progress.store(*visited, Ordering::Relaxed);
+    }
+}
+
 fn check(ctx: Ctx, kinds: Vec<ToolKind>, tx: mpsc::Sender<WorkerEvent>) {
     thread::spawn(move || {
-        let _ = tx.send(WorkerEvent::Checked(check_tools_parallel(&ctx, &kinds)));
+        let result = operation_worker(|| Ok(check_tools_parallel(&ctx, &kinds)));
+        let _ = tx.send(WorkerEvent::Checked(result));
     });
+}
+
+fn inspect_self_update(ctx: Ctx, tx: mpsc::Sender<WorkerEvent>) {
+    thread::spawn(move || {
+        let result = operation_worker(|| crate::application::self_update_plan(&ctx));
+        let _ = tx.send(WorkerEvent::SelfUpdatePreview(result));
+    });
+}
+
+fn is_confirmation_navigation_or_cancellation(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key(KeyEvent {
+            code: KeyCode::Esc,
+            ..
+        }) | Event::Key(KeyEvent {
+            code: KeyCode::Char('n' | 'q' | 'j' | 'k'),
+            modifiers: KeyModifiers::NONE,
+            ..
+        }) | Event::Key(KeyEvent {
+            code: KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Home
+                | KeyCode::End,
+            modifiers: KeyModifiers::NONE,
+            ..
+        }) | Event::Key(KeyEvent {
+            code: KeyCode::Char('c'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        })
+    )
+}
+
+fn discard_pending_terminal_input(
+    retain_navigation_and_cancellation: bool,
+) -> io::Result<VecDeque<Event>> {
+    let mut retained = VecDeque::new();
+    for _ in 0..1024 {
+        if !event::poll(Duration::ZERO)? {
+            return Ok(retained);
+        }
+        let input = event::read()?;
+        if retain_navigation_and_cancellation && is_confirmation_navigation_or_cancellation(&input)
+        {
+            retained.push_back(input);
+        }
+    }
+    Err(io::Error::other(
+        "too much pending input; review the plan again",
+    ))
+}
+
+fn draw_confirmation_frame(
+    newly_visible: bool,
+    mut discard: impl FnMut(bool) -> io::Result<VecDeque<Event>>,
+    draw: impl FnOnce() -> io::Result<()>,
+) -> io::Result<VecDeque<Event>> {
+    if newly_visible {
+        discard(false)?;
+    }
+    draw()?;
+    if newly_visible {
+        discard(true)
+    } else {
+        Ok(VecDeque::new())
+    }
+}
+
+fn confirmation_surfaces(app: &App) -> [bool; 25] {
+    [
+        app.confirmation,
+        app.self_update_plan.is_some(),
+        app.managed_plan.is_some(),
+        !app.managed_batch_plans.is_empty(),
+        app.artifact_plan.is_some(),
+        app.artifact_confirm,
+        app.bytecode_plan.is_some(),
+        app.bytecode_batch_plan.is_some(),
+        app.temp_review_plan.is_some(),
+        app.temp_review_confirm,
+        app.trim_plan.is_some(),
+        app.go_test_plan.is_some(),
+        app.container_plan.is_some(),
+        app.network_plan.is_some(),
+        app.build_cache_plan.is_some(),
+        app.trash_removal_plan.is_some(),
+        app.history_purge_plan.is_some(),
+        app.schedule_edit_plan.is_some(),
+        app.schedule_remove_plan.is_some(),
+        app.schedule_install_plan.is_some(),
+        app.schedule_enable_plan.is_some(),
+        app.schedule_disable_plan.is_some(),
+        app.settings_prompt == Some(SettingsPrompt::Save),
+        app.settings_prompt == Some(SettingsPrompt::Discard),
+        {
+            #[cfg(target_os = "linux")]
+            {
+                app.trash_retention_plan.is_some()
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                false
+            }
+        },
+    ]
+}
+
+fn newly_visible_confirmation(previous: &[bool], current: &[bool]) -> bool {
+    previous.iter().zip(current).any(|(old, new)| !old && *new)
 }
 
 fn start_managed_preview(
@@ -10614,13 +11304,10 @@ fn preflight_managed_batch(
                 });
             }
         };
-        if matches!(
-            fresh.activity_status,
-            "open_handles_or_cwd_observed" | "executable_observed"
-        ) {
+        if let Err(error) = crate::managed_cleanup::validate_removal_plan(&fresh) {
             return Err(ManagedBatchPreviewFailure {
                 tool: Some(target.tool),
-                error: "a process is using this tool root; stop it before cleaning".into(),
+                error: format!("{error:#}"),
                 tools,
                 cancelled: false,
             });
@@ -11132,6 +11819,7 @@ pub(crate) struct LaunchOptions {
     pub history_purge_preview: Option<Duration>,
     pub managed_scope: Option<Vec<ToolKind>>,
     pub schedule_request: Option<crate::application::ScheduleCommand>,
+    pub self_update_requested: bool,
 }
 
 pub fn run(
@@ -11179,6 +11867,7 @@ pub(crate) fn run_with_config(
         history_purge_preview,
         managed_scope,
         schedule_request,
+        self_update_requested,
     } = options;
     let mut worker_ctx = ctx.clone();
     worker_ctx.quiet = true;
@@ -11187,6 +11876,9 @@ pub(crate) fn run_with_config(
         .clone()
         .unwrap_or_else(|| only.map_or_else(ToolKind::all, |kind| vec![kind]));
     let (tx, rx) = mpsc::channel();
+    if self_update_requested {
+        inspect_self_update(worker_ctx.clone(), tx.clone());
+    }
     use crate::application::ScheduleCommand as Schedule;
     let mut schedule_explicit = match schedule_request.as_ref() {
         Some(
@@ -11277,21 +11969,24 @@ pub(crate) fn run_with_config(
     }
     let mut session = TerminalSession::start()?;
     let mut terminal = ratatui::Terminal::new(CrosstermBackend::new(stdout()))?;
-    check(worker_ctx.clone(), kinds.clone(), tx.clone());
     let mut doctor_ctx = worker_ctx.clone();
     doctor_ctx.dry_run = true;
     let doctor_cancel = Arc::new(AtomicBool::new(false));
-    inspect_doctor(
-        doctor_ctx.clone(),
-        config.clone(),
-        profile.clone(),
-        doctor_cancel.clone(),
-        tx.clone(),
-    );
-    let maintenance_tx = tx.clone();
-    thread::spawn(move || {
-        let _ = maintenance_tx.send(WorkerEvent::Maintenance(crate::maintenance::trim_status()));
-    });
+    if !self_update_requested {
+        check(worker_ctx.clone(), kinds.clone(), tx.clone());
+        inspect_doctor(
+            doctor_ctx.clone(),
+            config.clone(),
+            profile.clone(),
+            doctor_cancel.clone(),
+            tx.clone(),
+        );
+        let maintenance_tx = tx.clone();
+        thread::spawn(move || {
+            let result = operation_worker(|| Ok(crate::maintenance::trim_status()));
+            let _ = maintenance_tx.send(WorkerEvent::Maintenance(result));
+        });
+    }
     let trim_preparing = trim_preview_target.is_some();
     let trim_read_only = trim_preparing;
     if let Some(mount) = trim_preview_target {
@@ -11517,6 +12212,7 @@ pub(crate) fn run_with_config(
         });
     }
     let scan_running = scan_request.is_some();
+    let scan_progress = Arc::new(AtomicUsize::new(0));
     let cli_preview_read_only = scan_request
         .as_ref()
         .is_some_and(|(_, _, _, _, selected)| selected.is_some());
@@ -11524,26 +12220,24 @@ pub(crate) fn run_with_config(
     if let Some((paths, exclude, older_than, enabled, preview_selection)) = scan_request {
         let tx = tx.clone();
         let cancel = scan_cancel.clone();
+        let progress = scan_progress.clone();
         thread::spawn(move || {
             let mut visited = 0usize;
-            let report = crate::sweep::scan_with_policy(
-                &paths,
-                &exclude,
-                older_than,
-                enabled.as_deref(),
-                &cancel,
-                |_| {
-                    visited += 1;
-                    if visited == 1 || visited.is_multiple_of(128) {
-                        let _ = tx.send(WorkerEvent::ScanProgress(visited));
-                    }
-                },
-            )
-            .map_err(|err| format!("{err:#}"));
+            let report = operation_worker(|| {
+                crate::sweep::scan_with_policy(
+                    &paths,
+                    &exclude,
+                    older_than,
+                    enabled.as_deref(),
+                    &cancel,
+                    |_| report_scan_progress(&progress, &mut visited),
+                )
+            });
             if let Some(selected) = preview_selection {
                 let plan = report.and_then(|report| {
-                    crate::sweep::preview_with_cancel(report, &selected, &cancel)
-                        .map_err(|err| format!("{err:#}"))
+                    operation_worker(|| {
+                        crate::sweep::preview_with_cancel(report, &selected, &cancel)
+                    })
                 });
                 let _ = tx.send(WorkerEvent::Previewed(plan));
             } else {
@@ -11552,15 +12246,28 @@ pub(crate) fn run_with_config(
         });
     }
     let result = (|| -> Result<()> {
+        let mut self_update_failed = false;
         let mut app = App {
             reports: None,
+            startup_checks: StartupChecks {
+                toolchains: !self_update_requested,
+                doctor: !self_update_requested,
+                maintenance: !self_update_requested,
+            },
+            toolchain_check_failed: false,
+            maintenance_check_failed: false,
             page: start,
             help: false,
             help_scroll: 0,
             selected: 0,
             confirmation: false,
             updating: false,
-            message: if go_test_preparing {
+            self_update_preparing: self_update_requested,
+            self_update_command: self_update_requested,
+            self_update_plan: None,
+            message: if self_update_requested {
+                "Preparing Upkit self-update preview…".into()
+            } else if go_test_preparing {
                 "Preparing Go test-cache preview…".into()
             } else if history_purge_preparing {
                 "Preparing read-only history purge preview…".into()
@@ -11760,12 +12467,37 @@ pub(crate) fn run_with_config(
             settings_confirmation_scroll: 0,
             settings_confirmation_area: Rect::default(),
         };
+        let mut visible_confirmations = confirmation_surfaces(&app);
+        let mut pending_safe_input = VecDeque::new();
         loop {
-            while let Ok(event) = rx.try_recv() {
+            if app.scan_running {
+                app.scan_visited = scan_progress.load(Ordering::Relaxed);
+            }
+            for event in worker_events_for_frame(&rx) {
                 match event {
-                    WorkerEvent::Checked(reports) => {
-                        app.reports = Some(reports);
-                        app.normalize_toolchain_selection();
+                    WorkerEvent::Checked(result) => {
+                        app.startup_checks.toolchains = false;
+                        match result {
+                            Ok(reports) => {
+                                app.reports = Some(reports);
+                                app.toolchain_check_failed = false;
+                                app.normalize_toolchain_selection();
+                                match app.message.as_str() {
+                                    "Refreshing toolchain inventory…" => {
+                                        app.message = "Toolchain inventory refreshed.".into();
+                                    }
+                                    "Toolchain inventory is already loading." => {
+                                        app.message.clear();
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            Err(_) => {
+                                app.toolchain_check_failed = true;
+                                app.message =
+                                    "Toolchain check failed; results are unavailable.".into();
+                            }
+                        }
                     }
                     WorkerEvent::ManagedPreview(result) => {
                         app.managed_preparing = false;
@@ -12161,11 +12893,25 @@ pub(crate) fn run_with_config(
                         app.scan = None;
                     }
                     WorkerEvent::Diagnosed(issues, available, capabilities) => {
+                        app.startup_checks.doctor = false;
                         app.issues = Some(issues);
                         app.doctor_available_bytes = available;
                         app.doctor_capabilities = capabilities;
                     }
-                    WorkerEvent::Maintenance(report) => app.maintenance = Some(report),
+                    WorkerEvent::Maintenance(report) => {
+                        app.startup_checks.maintenance = false;
+                        match report {
+                            Ok(report) => {
+                                app.maintenance = Some(report);
+                                app.maintenance_check_failed = false;
+                            }
+                            Err(_) => {
+                                app.maintenance_check_failed = true;
+                                app.message =
+                                    "Maintenance status unavailable; the check failed.".into();
+                            }
+                        }
+                    }
                     WorkerEvent::TempPreview(result, review) => {
                         app.temp_preparing = false;
                         if temp_cancel.load(Ordering::Relaxed) {
@@ -12428,6 +13174,10 @@ pub(crate) fn run_with_config(
                         app.schedule_edit_preparing = false;
                         match result {
                             Ok(plan) => {
+                                app.schedule_read_only |= !cfg!(target_os = "linux")
+                                    && crate::schedule::schedules_artifact_cleanup(
+                                        &plan.replacement,
+                                    );
                                 app.schedule_edit_plan = Some((plan, frequency));
                                 app.message.clear();
                             }
@@ -12526,6 +13276,8 @@ pub(crate) fn run_with_config(
                         app.schedule_enable_preparing = false;
                         match result {
                             Ok(plan) => {
+                                app.schedule_read_only |= !cfg!(target_os = "linux")
+                                    && crate::schedule::schedules_artifact_cleanup(&plan.intended);
                                 app.schedule_enable_plan = Some((plan, frequency));
                                 app.message.clear();
                             }
@@ -12760,7 +13512,6 @@ pub(crate) fn run_with_config(
                         app.trash_selected = 0;
                         app.trash_scroll = 0;
                     }
-                    WorkerEvent::ScanProgress(visited) => app.scan_visited = visited,
                     WorkerEvent::Scanned(report) => {
                         app.scan_running = false;
                         app.scan = Some(report);
@@ -12789,6 +13540,44 @@ pub(crate) fn run_with_config(
                         app.marked.clear();
                         check(worker_ctx.clone(), kinds.clone(), tx.clone());
                     }
+                    WorkerEvent::SelfUpdatePreview(result) => {
+                        app.self_update_preparing = false;
+                        match result {
+                            Ok(plan) => {
+                                self_update_failed = false;
+                                app.self_update_plan = Some(plan);
+                                app.message.clear();
+                            }
+                            Err(error) => {
+                                if self_update_requested {
+                                    self_update_failed = true;
+                                }
+                                app.message = format!(
+                                    "Self-update preview failed: {}",
+                                    schedule_escape_controls(&error)
+                                        .chars()
+                                        .take(300)
+                                        .collect::<String>()
+                                );
+                            }
+                        }
+                    }
+                    WorkerEvent::SelfUpdated(result) => {
+                        app.updating = false;
+                        if self_update_requested {
+                            self_update_failed = result.is_err();
+                        }
+                        app.message = match result {
+                            Ok(()) => "Upkit updated; restart it to use the new version.".into(),
+                            Err(error) => format!(
+                                "Self-update failed or its outcome is unknown: {}",
+                                schedule_escape_controls(&error)
+                                    .chars()
+                                    .take(300)
+                                    .collect::<String>()
+                            ),
+                        };
+                    }
                 }
             }
             let size = terminal.size()?;
@@ -12803,10 +13592,21 @@ pub(crate) fn run_with_config(
             clamp_history_settings_scroll(&mut app, area);
             clamp_schedule_scroll(&mut app, area, SchedulePlatform::current());
             clamp_cache_scroll(&mut app, area);
-            terminal.draw(|frame| draw(frame, &app))?;
-            if event::poll(Duration::from_millis(100))?
-                && let Event::Key(key) = event::read()?
-            {
+            let confirmations = confirmation_surfaces(&app);
+            pending_safe_input.extend(draw_confirmation_frame(
+                newly_visible_confirmation(&visible_confirmations, &confirmations),
+                discard_pending_terminal_input,
+                || terminal.draw(|frame| draw(frame, &app)).map(|_| ()),
+            )?);
+            visible_confirmations = confirmations;
+            let input = if let Some(input) = pending_safe_input.pop_front() {
+                Some(input)
+            } else if event::poll(Duration::from_millis(100))? {
+                Some(event::read()?)
+            } else {
+                None
+            };
+            if let Some(Event::Key(key)) = input {
                 if let Some(plan) = &app.artifact_plan {
                     let size = terminal.size()?;
                     let actual = Rect::new(0, 0, size.width, size.height);
@@ -12899,7 +13699,22 @@ pub(crate) fn run_with_config(
                         }
                     }
                 }
-                if app.confirmation && matches!(key.code, KeyCode::Enter | KeyCode::Char('y')) {
+                if let Some(plan) = &app.self_update_plan
+                    && matches!(key.code, KeyCode::Enter | KeyCode::Char('y'))
+                {
+                    let size = terminal.size()?;
+                    let drawn = terminal.get_frame().area();
+                    let actual = Rect::new(0, 0, size.width, size.height);
+                    if drawn != actual
+                        || !self_update_confirmation_fits(plan, drawn)
+                        || !self_update_confirmation_fits(plan, actual)
+                    {
+                        app.message =
+                            "Enlarge the terminal to see the entire plan before confirming.".into();
+                        continue;
+                    }
+                }
+                if app.confirmation && toolchain_confirmation_key(key) {
                     let size = terminal.size()?;
                     if !toolchain_confirmation_fits(&app, terminal.get_frame().area())
                         || !toolchain_confirmation_fits(
@@ -13241,8 +14056,10 @@ pub(crate) fn run_with_config(
                         };
                         artifact_scope = Some(request.clone());
                         scan_cancel.store(false, Ordering::Relaxed);
+                        scan_progress.store(0, Ordering::Relaxed);
                         let tx = tx.clone();
                         let cancel = scan_cancel.clone();
+                        let progress = scan_progress.clone();
                         let config = config.clone();
                         let profile = profile.clone();
                         thread::spawn(move || {
@@ -13262,12 +14079,7 @@ pub(crate) fn run_with_config(
                                     age,
                                     enabled.as_deref(),
                                     &cancel,
-                                    |_| {
-                                        visited += 1;
-                                        if visited == 1 || visited.is_multiple_of(128) {
-                                            let _ = tx.send(WorkerEvent::ScanProgress(visited));
-                                        }
-                                    },
+                                    |_| report_scan_progress(&progress, &mut visited),
                                 )
                             });
                             let _ = tx.send(WorkerEvent::Scanned(result));
@@ -14053,6 +14865,9 @@ pub(crate) fn run_with_config(
                             let _ = tx.send(WorkerEvent::Schedule(crate::schedule::status()));
                         });
                     }
+                    Action::RefreshToolchains => {
+                        check(worker_ctx.clone(), kinds.clone(), tx.clone());
+                    }
                     Action::RefreshHistory => {
                         let tx = tx.clone();
                         let home = ctx.home.clone();
@@ -14176,9 +14991,25 @@ pub(crate) fn run_with_config(
                             let _ = tx.send(WorkerEvent::Updated(results));
                         });
                     }
+                    Action::PreviewSelfUpdate => {
+                        inspect_self_update(worker_ctx.clone(), tx.clone());
+                    }
+                    Action::SelfUpdate(plan) => {
+                        let ctx = worker_ctx.clone();
+                        let tx = tx.clone();
+                        thread::spawn(move || {
+                            let result = operation_worker(|| {
+                                crate::application::run_approved_self_update(&ctx, &plan)
+                            });
+                            let _ = tx.send(WorkerEvent::SelfUpdated(result));
+                        });
+                    }
                     Action::None => {}
                 }
             }
+        }
+        if self_update_requested && self_update_failed {
+            anyhow::bail!("self-update failed or its outcome is unknown");
         }
         Ok(())
     })();
@@ -14210,6 +15041,32 @@ mod tests {
             .collect()
     }
 
+    #[cfg(target_os = "linux")]
+    fn bytecode_cleanup_policy_token() -> String {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("workspace");
+        let config = directory.path().join("upkit.toml");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(
+            &config,
+            format!(
+                "version = 1\nworkspace_roots = ['{}']\nartifact_retention = '7d'\nenabled_ecosystems = ['python']\nscheduled_bytecode_cleanup = true\n",
+                root.display(),
+            ),
+        )
+        .unwrap();
+        let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let plan = crate::schedule::preview_configured_install(
+            &executable,
+            Some(&config),
+            None,
+            crate::schedule::Frequency::Daily,
+        )
+        .unwrap();
+        assert!(plan.scheduled_scope_token.starts_with("v3."));
+        plan.scheduled_scope_token
+    }
+
     fn app() -> App {
         App {
             reports: Some(vec![ToolReport {
@@ -14220,12 +15077,18 @@ mod tests {
                 method: UpdateMethod::DirectDownload,
                 notes: vec![],
             }]),
+            startup_checks: StartupChecks::default(),
+            toolchain_check_failed: false,
+            maintenance_check_failed: false,
             page: Start::Toolchains,
             help: false,
             help_scroll: 0,
             selected: 0,
             confirmation: false,
             updating: false,
+            self_update_preparing: false,
+            self_update_command: false,
+            self_update_plan: None,
             message: String::new(),
             issues: None,
             doctor_available_bytes: None,
@@ -14422,6 +15285,7 @@ mod tests {
         assert!(matches!(tool, ToolKind::Go | ToolKind::Node));
         std::fs::create_dir_all(home).unwrap();
         std::fs::create_dir_all(bindir).unwrap();
+        std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o755)).unwrap();
         let root = home.join(tool.as_str());
         std::fs::create_dir(&root).unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -14752,6 +15616,33 @@ mod tests {
     }
 
     #[test]
+    fn repeated_vi_keys_only_scroll_a_destructive_review() {
+        let mut app = app();
+        app.page = Start::Reports;
+        app.history_purge_plan = Some(history_purge_plan(12));
+        let area = Rect::new(0, 0, 100, 10);
+        app.update_history_purge_review(area);
+        let repeated =
+            |code| KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Repeat);
+
+        assert!(matches!(
+            app.key(repeated(KeyCode::Char('j'))),
+            Action::None
+        ));
+        assert_eq!(app.history_purge_scroll, 1);
+        assert!(app.history_purge_plan.is_some());
+        assert!(!app.history_purging);
+
+        assert!(matches!(
+            app.key(repeated(KeyCode::Char('k'))),
+            Action::None
+        ));
+        assert_eq!(app.history_purge_scroll, 0);
+        assert!(app.history_purge_plan.is_some());
+        assert!(!app.history_purging);
+    }
+
+    #[test]
     fn history_purge_review_never_confirms_after_scroll_saturates() {
         let mut app = app();
         app.page = Start::Reports;
@@ -14971,6 +15862,10 @@ mod tests {
                 .collect(),
             preview_token: "fixture".into(),
             #[cfg(target_os = "linux")]
+            cargo_config_identity: None,
+            #[cfg(target_os = "linux")]
+            cargo_workspace_evidence: None,
+            #[cfg(target_os = "linux")]
             git_evidence_id: None,
             warning: "fixture",
             reproduction_warning: Some(
@@ -15027,6 +15922,10 @@ mod tests {
             logical_bytes: 1,
             entries: vec![],
             preview_token: "fixture".into(),
+            #[cfg(target_os = "linux")]
+            cargo_config_identity: None,
+            #[cfg(target_os = "linux")]
+            cargo_workspace_evidence: None,
             #[cfg(target_os = "linux")]
             git_evidence_id: None,
             warning: "fixture",
@@ -15184,6 +16083,111 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_shows_three_recent_operations_without_targets() {
+        let mut app = app();
+        app.page = Start::Dashboard;
+        app.history = Some(Ok(crate::reports::History {
+            records: [
+                (3, "newest_operation", "completed", "/private/newest"),
+                (2, "middle_operation", "partial", "/private/middle"),
+                (1, "older_operation", "failed", "/private/older"),
+                (0, "oldest_operation", "completed", "/private/oldest"),
+            ]
+            .into_iter()
+            .map(|(id, operation, outcome, target)| crate::reports::Record {
+                id,
+                started_unix: u64::try_from(id).unwrap(),
+                finished_unix: None,
+                duration_ms: 0,
+                operation: operation.into(),
+                target: target.into(),
+                outcome: outcome.into(),
+                detail: None,
+                estimated_bytes: None,
+                verified_reclaimed_bytes: None,
+                platform: "fixture".into(),
+            })
+            .collect(),
+            warnings: vec![],
+            capacity: 100,
+            known_reclaimed_bytes: None,
+            records_without_verified_reclaimed_bytes: 0,
+        }));
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let output = format!("{:?}", terminal.backend().buffer());
+        let positions =
+            ["newest_operation", "middle_operation", "older_operation"].map(|operation| {
+                output
+                    .find(operation)
+                    .expect("recent operation is rendered")
+            });
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(!output.contains("oldest_operation"));
+        assert!(!output.contains("/private/"));
+    }
+
+    #[test]
+    fn dashboard_cache_shortcut_opens_the_screen_and_starts_inventory() {
+        let mut app = app();
+        app.page = Start::Dashboard;
+        app.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        assert!(format!("{:?}", terminal.backend().buffer()).contains("c opens Caches"));
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(matches!(
+            app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+            Action::StartCache
+        ));
+        assert!(app.page == Start::Cache);
+        assert!(app.cache_running);
+        assert!(app.cache.is_none());
+
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let output = format!("{:?}", terminal.backend().buffer());
+        assert!(output.contains("Inventorying shared caches"));
+        assert!(output.contains("Esc: cancel inventory"));
+    }
+
+    #[test]
+    fn dashboard_scan_shortcut_reopens_an_active_scan_without_restarting_it() {
+        let mut app = app();
+        app.page = Start::Dashboard;
+        app.scan_running = true;
+        app.scan_visited = 17;
+
+        assert!(matches!(
+            app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+            Action::None
+        ));
+        assert!(app.page == Start::Artifacts);
+        assert!(app.scan_running);
+        assert_eq!(app.scan_visited, 17);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let output = format!("{:?}", terminal.backend().buffer());
+        assert!(output.contains("Scanning workspace… 17 directories inspected."));
+        assert!(output.contains("Esc: cancel scan"));
+    }
+
+    #[test]
+    fn dashboard_footer_keeps_cache_shortcut_visible_at_boundary_widths() {
+        let mut app = app();
+        app.page = Start::Dashboard;
+        for width in [30, 41, 42, 60, 64, 65, 80, 81] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 18)).unwrap();
+            terminal.draw(|frame| draw(frame, &app)).unwrap();
+            let output = format!("{:?}", terminal.backend().buffer());
+            assert!(output.contains("cache"), "width {width}: {output}");
+            assert!(output.contains("quit"), "width {width}: {output}");
+        }
+    }
+
+    #[test]
     fn dashboard_surfaces_bounded_important_warnings_only() {
         let mut app = app();
         app.page = Start::Dashboard;
@@ -15206,6 +16210,109 @@ mod tests {
         assert!(output.contains("Important warning: Upkit home filesystem"));
         assert!(!output.contains("missing tools in PATH"));
         assert!(!output.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn compact_header_shows_platform_and_current_operation_status() {
+        let mut app = app();
+        app.reports = None;
+        app.issues = None;
+        app.maintenance = None;
+        app.self_update_command = true;
+        app.settings_loading = false;
+        let mut terminal = Terminal::new(TestBackend::new(52, 24)).unwrap();
+
+        assert_eq!(application_status(&app), "Idle");
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let output = format!("{:?}", terminal.backend().buffer());
+        assert!(output.contains("Idle"));
+        assert!(output.contains(&format!(
+            "{}/{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )));
+
+        app.scan_running = true;
+        assert_eq!(application_status(&app), "Working");
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        assert!(format!("{:?}", terminal.backend().buffer()).contains("Working"));
+        for width in [30, 20] {
+            let mut compact = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            compact.draw(|frame| draw(frame, &app)).unwrap();
+            assert!(format!("{:?}", compact.backend().buffer()).contains("Working"));
+        }
+
+        app.scan_running = false;
+        app.reports = Some(Vec::new());
+        app.issues = Some(Vec::new());
+        app.maintenance = Some(crate::maintenance::TrimStatus {
+            platform: "fixture".into(),
+            fstrim_available: false,
+            capability: "unknown".into(),
+            timer: crate::maintenance::TimerStatus {
+                state: "unknown".into(),
+                load_state: None,
+                unit_file_state: None,
+                last_trigger: None,
+                next_trigger: None,
+                detail: None,
+            },
+            guidance: "fixture",
+            mounts: Vec::new(),
+            mounts_warning: None,
+        });
+        assert_eq!(application_status(&app), "Ready");
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        assert!(format!("{:?}", terminal.backend().buffer()).contains("Ready"));
+        app.confirmation = true;
+        assert_eq!(application_status(&app), "Review");
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        assert!(format!("{:?}", terminal.backend().buffer()).contains("Review"));
+    }
+
+    #[test]
+    fn startup_status_distinguishes_explicit_pages_from_self_update() {
+        let mut app = app();
+        app.page = Start::Automation;
+        app.reports = None;
+        app.issues = None;
+        app.maintenance = None;
+        app.startup_checks = StartupChecks {
+            toolchains: true,
+            doctor: true,
+            maintenance: true,
+        };
+        assert_eq!(application_status(&app), "Working");
+
+        app.self_update_command = true;
+        app.startup_checks = StartupChecks::default();
+        assert_eq!(application_status(&app), "Idle");
+        app.self_update_preparing = true;
+        assert_eq!(application_status(&app), "Working");
+
+        app.self_update_preparing = false;
+        app.toolchain_check_failed = true;
+        assert_eq!(application_status(&app), "Idle");
+    }
+
+    #[test]
+    fn failed_startup_checks_render_unavailable_instead_of_loading_forever() {
+        let mut app = app();
+        app.reports = None;
+        app.toolchain_check_failed = true;
+        assert_eq!(application_status(&app), "Idle");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let output = format!("{:?}", terminal.backend().buffer());
+        assert!(output.contains("Toolchain check failed; results are unavailable."));
+        assert!(!output.contains("Checking toolchains in the background"));
+
+        app.page = Start::Maintenance;
+        app.maintenance_check_failed = true;
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let output = format!("{:?}", terminal.backend().buffer());
+        assert!(output.contains("Maintenance status is unavailable."));
+        assert!(!output.contains("Checking TRIM timer status"));
     }
 
     #[test]
@@ -15554,6 +16661,7 @@ mod tests {
         assert!(matches!(app.key(key(KeyCode::Char('q'))), Action::None));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn automation_configured_plan_can_be_reviewed_read_only_without_installing() {
         let mut app = app();
@@ -15571,7 +16679,7 @@ mod tests {
             frequency: "weekly",
             unit_directory: "/fixture/units".into(),
             preview_token: "fixture-preview".into(),
-            scheduled_scope_token: "v3.fixture".into(),
+            scheduled_scope_token: bytecode_cleanup_policy_token(),
             service_unit: "[Service]\nExecStart=/fixture/upkit --scheduled-bytecode-cleanup\n"
                 .into(),
             timer_unit: "[Timer]\nOnCalendar=weekly\nPersistent=true\n".into(),
@@ -15676,6 +16784,7 @@ mod tests {
         assert!(matches!(app.key(key(KeyCode::Char('q'))), Action::None));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn schedule_enable_dialog_shows_legacy_and_v2_warning_fields() {
         let make_plan = |scheduled_scope_token: &str,
@@ -15821,7 +16930,7 @@ mod tests {
 
         let cleanup_warning = "This timer automatically and permanently removes eligible Python bytecode after at least 7 days, at most 32 files per run. Each file is revalidated against project, Git, process, path, source and configuration policy. Unchecked-hash bytecode is excluded. V3_WARNING_END";
         let v3 = make_plan(
-            "v3.policy-token",
+            &bytecode_cleanup_policy_token(),
             cleanup_warning,
             "Enabling the verified cleanup timer may start cleanup promptly.",
         );
@@ -15829,7 +16938,9 @@ mod tests {
 
         let install_lines = schedule_install_confirmation_lines(&v3.intended);
         let install_copy = install_lines.join("\n");
-        assert!(install_copy.contains("automatic, permanent Python bytecode cleanup"));
+        assert!(
+            install_copy.contains("automatically and permanently removes eligible Python bytecode")
+        );
         assert!(install_copy.contains("at least 7 days"));
         assert!(install_copy.contains("32 files are removed per run"));
         assert!(
@@ -16649,6 +17760,155 @@ mod tests {
     }
 
     #[test]
+    fn reports_screen_formats_timestamps_as_readable_utc() {
+        let mut app = app();
+        app.page = Start::Reports;
+        app.history = Some(Ok(crate::reports::History {
+            records: vec![crate::reports::Record {
+                id: 0,
+                started_unix: 0,
+                finished_unix: Some(1),
+                duration_ms: 1,
+                operation: "fixture_operation".into(),
+                target: "fixture_target".into(),
+                outcome: "completed".into(),
+                detail: None,
+                estimated_bytes: None,
+                verified_reclaimed_bytes: None,
+                platform: "test".into(),
+            }],
+            warnings: Vec::new(),
+            capacity: 100,
+            known_reclaimed_bytes: None,
+            records_without_verified_reclaimed_bytes: 1,
+        }));
+
+        let content = reports_content(&app);
+        assert!(content.contains("started=1970-01-01 00:00:00 UTC"));
+        assert!(content.contains("finished=1970-01-01 00:00:01 UTC"));
+    }
+
+    #[test]
+    fn settings_form_persists_the_scheduled_artifact_cleanup_opt_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upkit.toml");
+        std::fs::write(&path, "version = 1\n").unwrap();
+        let document = crate::config::read_document(&path).unwrap();
+        let mut form = SettingsForm::new(document).unwrap();
+
+        assert!(
+            settings_rows(&form)
+                .iter()
+                .any(|row| matches!(row, SettingsRow::ScheduledArtifactCleanup))
+        );
+        assert!(settings_form_content(&form).contains("Scheduled artifact cleanup: disabled"));
+        settings_form_toggle(&mut form, SettingsRow::ScheduledArtifactCleanup);
+
+        assert!(form.settings.scheduled_artifact_cleanup);
+        let saved = form.save_text().unwrap();
+        assert!(saved.contains("scheduled_artifact_cleanup = true"));
+        assert!(form.cleanup_impacts().unwrap().iter().any(|impact| {
+            impact.contains("Scheduled artifact cleanup policy will be enabled")
+                && impact.contains("separate preview and confirmation")
+        }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn artifact_schedule_confirmation_requires_full_review_before_activation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        let config = dir.path().join("upkit.toml");
+        std::fs::create_dir(&root).unwrap();
+        let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+
+        for bytecode in [false, true] {
+            std::fs::write(
+                &config,
+                format!(
+                    "version = 1\nworkspace_roots = ['{}']\nartifact_retention = '30d'\nenabled_ecosystems = ['cargo', 'python']\nscheduled_artifact_cleanup = true\nscheduled_bytecode_cleanup = {bytecode}\n",
+                    root.display(),
+                ),
+            )
+            .unwrap();
+            let plan = crate::schedule::preview_configured_install(
+                &executable,
+                Some(&config),
+                None,
+                crate::schedule::Frequency::Daily,
+            )
+            .unwrap();
+            let disabled = crate::schedule::DisableSchedulePreview {
+                unit_directory: plan.unit_directory.clone(),
+                service_unit: plan.service_unit.clone(),
+                timer_unit: plan.timer_unit.clone(),
+                active_state: "inactive".into(),
+                unit_file_state: Some("disabled".into()),
+                preview_token: "fixture-disabled".into(),
+                warning: "fixture",
+            };
+            let enable = crate::schedule::EnableSchedulePreview {
+                intended: plan.clone(),
+                installed: disabled.clone(),
+                preview_token: "fixture-enable".into(),
+                warning: "fixture",
+            };
+            let edit = crate::schedule::EditSchedulePreview {
+                previous: crate::schedule::RemoveSchedulePreview {
+                    existing: disabled,
+                    quarantine_paths: vec![],
+                    preview_token: "fixture-remove".into(),
+                    warning: "fixture",
+                },
+                replacement: plan.clone(),
+                preview_token: "fixture-edit".into(),
+                warning: "fixture",
+            };
+            for content in [
+                schedule_install_confirmation_lines_for(&plan, SchedulePlatform::Systemd)
+                    .join("\n"),
+                schedule_enable_confirmation_lines_for(&enable, SchedulePlatform::Systemd)
+                    .join("\n"),
+                schedule_edit_confirmation_lines_for(&edit, SchedulePlatform::Systemd).join("\n"),
+            ] {
+                assert!(content.contains("Press y to"));
+                assert!(content.contains("reserves local history first"));
+                assert!(content.contains(
+                    "permanently removes explicitly scoped rebuildable project artifacts"
+                ));
+                assert!(content.contains("at most 8 directories"));
+                assert!(!content.contains("No workspace files are cleaned"));
+                assert!(!content.contains("no workspace files are cleaned"));
+                if bytecode {
+                    assert!(content.contains("permanently removes eligible Python bytecode"));
+                } else {
+                    assert!(!content.contains("Python bytecode"));
+                }
+            }
+
+            let unsupported =
+                schedule_install_confirmation_lines_for(&plan, SchedulePlatform::TaskScheduler)
+                    .join("\n");
+            assert!(unsupported.contains("only be installed on Linux with systemd"));
+            assert!(!unsupported.contains("Press y to"));
+            assert!(!unsupported.contains("workspace files are not cleaned"));
+
+            let mut app = app();
+            app.schedule_install_plan = Some((plan, crate::schedule::Frequency::Daily));
+            assert!(!schedule_activation_is_preview_only(&app));
+            let area = Rect::new(0, 0, 120, 30);
+            app.update_schedule_confirmation(area);
+            assert!(!schedule_confirmation_can_confirm(&app, area, area));
+            review_schedule_confirmation_to_end(&mut app, area);
+            assert!(schedule_confirmation_can_confirm(&app, area, area));
+            assert!(matches!(
+                app.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+                Action::InstallSchedule(_, _)
+            ));
+        }
+    }
+
+    #[test]
     fn plain_settings_scroll_clamps_to_the_last_wrapped_line_after_resize() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("upkit.toml");
@@ -16797,6 +18057,49 @@ mod tests {
         ));
         assert!(toolchain_matches(&reports[2], "OUTDATED"));
         assert!(toolchain_matches(&reports[2], "25.0.0"));
+    }
+
+    #[test]
+    fn toolchain_inventory_refresh_preserves_filter_selection_and_marks() {
+        let mut app = app();
+        app.toolchain_filter = "go".into();
+        app.selected = 0;
+        app.marked = vec![ToolKind::Go];
+
+        assert!(matches!(
+            app.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+            Action::RefreshToolchains
+        ));
+        assert!(app.startup_checks.toolchains);
+        assert!(app.reports.is_none());
+        assert_eq!(app.toolchain_filter, "go");
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.marked, [ToolKind::Go]);
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let output = format!("{:?}", terminal.backend().buffer());
+        assert!(output.contains("Checking toolchains in the background"));
+        assert!(output.contains("Refreshing toolchain inventory"));
+
+        assert!(matches!(
+            app.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+            Action::None
+        ));
+        assert!(app.message.contains("already loading"));
+    }
+
+    #[test]
+    fn narrow_toolchain_footer_keeps_refresh_update_and_quit_visible() {
+        let app = app();
+        for width in [58, 59, 60, 61] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 18)).unwrap();
+            terminal.draw(|frame| draw(frame, &app)).unwrap();
+            let output = format!("{:?}", terminal.backend().buffer());
+            assert!(output.contains("r: refresh"), "width {width}: {output}");
+            assert!(output.contains("Enter: update"), "width {width}: {output}");
+            assert!(output.contains("q: quit"), "width {width}: {output}");
+        }
     }
 
     #[test]
@@ -17038,6 +18341,46 @@ mod tests {
         assert!(home.join("go").exists());
         assert!(home.join("node").exists());
         drop(held_open);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_writable_managed_home_blocks_the_whole_cleanup_batch() {
+        use crate::test_support::{TestPrompt, base_ctx};
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("managed");
+        let bindir = dir.path().join("bin");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&bindir).unwrap();
+        let mut installs = Vec::new();
+        for tool in [ToolKind::Go, ToolKind::Node] {
+            installs.push(sealed_managed_tool_fixture(&home, &bindir, tool, 0));
+        }
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let ctx = base_ctx(
+            home.clone(),
+            bindir.clone(),
+            Arc::new(TestPrompt::default()),
+        );
+        let targets = preview_managed_batch(
+            &ctx,
+            &[ToolKind::Go, ToolKind::Node],
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(targets.iter().all(|target| target.plan.writable_by_others));
+
+        let result = run_managed_batch(&ctx, &targets, &AtomicBool::new(false));
+
+        assert_eq!(result.items[0].status, "failed/uncertain");
+        assert_eq!(result.items[1].status, "skipped");
+        for (tool, install) in [ToolKind::Go, ToolKind::Node].into_iter().zip(installs) {
+            assert!(home.join(tool.as_str()).join("active").exists());
+            assert!(install.exists());
+            assert!(std::fs::symlink_metadata(bindir.join(tool.as_str())).is_ok());
+        }
     }
 
     #[test]
@@ -18022,6 +19365,10 @@ mod tests {
                 }],
                 preview_token: format!("item-{index}"),
                 #[cfg(target_os = "linux")]
+                cargo_config_identity: None,
+                #[cfg(target_os = "linux")]
+                cargo_workspace_evidence: None,
+                #[cfg(target_os = "linux")]
                 git_evidence_id: None,
                 warning: "fixture warning",
                 reproduction_warning: None,
@@ -18162,6 +19509,144 @@ mod tests {
         let output = format!("{:?}", terminal.backend().buffer());
         assert!(output.contains("Cargo workspace"));
         assert!(output.contains("workspace_manifest"));
+    }
+
+    #[test]
+    fn worker_event_batches_are_bounded_fifo_and_keep_completion() {
+        let (tx, rx) = mpsc::channel();
+        let queued_progress = MAX_WORKER_EVENTS_PER_FRAME + 3;
+        for visited in 0..queued_progress {
+            tx.send(WorkerEvent::Updating(
+                ToolKind::Go,
+                visited,
+                queued_progress,
+            ))
+            .unwrap();
+        }
+        tx.send(WorkerEvent::Scanned(Err("scan complete".into())))
+            .unwrap();
+
+        let first = worker_events_for_frame(&rx);
+        assert_eq!(first.len(), MAX_WORKER_EVENTS_PER_FRAME);
+        assert_eq!(
+            first
+                .iter()
+                .map(|event| match event {
+                    WorkerEvent::Updating(ToolKind::Go, visited, _) => *visited,
+                    _ => panic!("unexpected worker event before scan completion"),
+                })
+                .collect::<Vec<_>>(),
+            (0..MAX_WORKER_EVENTS_PER_FRAME).collect::<Vec<_>>()
+        );
+
+        let second = worker_events_for_frame(&rx);
+        assert_eq!(second.len(), 4);
+        assert_eq!(
+            second[..3]
+                .iter()
+                .map(|event| match event {
+                    WorkerEvent::Updating(ToolKind::Go, visited, _) => *visited,
+                    _ => panic!("unexpected worker event before scan completion"),
+                })
+                .collect::<Vec<_>>(),
+            (MAX_WORKER_EVENTS_PER_FRAME..queued_progress).collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            second.last(),
+            Some(WorkerEvent::Scanned(Err(error))) if error == "scan complete"
+        ));
+        assert!(rx.try_iter().next().is_none());
+    }
+
+    #[test]
+    fn confirmation_frame_discards_input_queued_before_and_during_draw() {
+        use std::cell::RefCell;
+
+        let pending = RefCell::new(vec![Event::Key(KeyEvent::new(
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+        ))]);
+        let calls = RefCell::new(Vec::new());
+        let kept = draw_confirmation_frame(
+            true,
+            |retain_navigation_and_cancellation| {
+                calls.borrow_mut().push("discard");
+                let mut pending = pending.borrow_mut();
+                Ok(pending
+                    .drain(..)
+                    .filter(|event| {
+                        retain_navigation_and_cancellation
+                            && is_confirmation_navigation_or_cancellation(event)
+                    })
+                    .collect())
+            },
+            || {
+                assert!(pending.borrow().is_empty());
+                calls.borrow_mut().push("draw");
+                pending.borrow_mut().push(Event::Key(KeyEvent::new(
+                    KeyCode::Char('y'),
+                    KeyModifiers::NONE,
+                )));
+                pending
+                    .borrow_mut()
+                    .push(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*calls.borrow(), ["discard", "draw", "discard"]);
+        assert!(pending.borrow().is_empty());
+        assert!(matches!(kept.front(), Some(Event::Key(key)) if key.code == KeyCode::Esc));
+        assert_eq!(kept.len(), 1);
+
+        pending.borrow_mut().push(Event::Key(KeyEvent::new(
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+        )));
+        assert!(
+            draw_confirmation_frame(false, |_| panic!("unexpected discard"), || Ok(()))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(pending.borrow().len(), 1);
+    }
+
+    #[test]
+    fn only_navigation_and_cancellation_are_retained_from_a_confirmation_frame() {
+        for code in [
+            KeyCode::Esc,
+            KeyCode::Char('n'),
+            KeyCode::Char('q'),
+            KeyCode::Char('j'),
+            KeyCode::Up,
+            KeyCode::PageDown,
+        ] {
+            assert!(is_confirmation_navigation_or_cancellation(&Event::Key(
+                KeyEvent::new(code, KeyModifiers::NONE)
+            )));
+        }
+        assert!(is_confirmation_navigation_or_cancellation(&Event::Key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+        )));
+        for code in [KeyCode::Enter, KeyCode::Char('y'), KeyCode::Char('d')] {
+            assert!(!is_confirmation_navigation_or_cancellation(&Event::Key(
+                KeyEvent::new(code, KeyModifiers::NONE)
+            )));
+        }
+    }
+
+    #[test]
+    fn scan_progress_keeps_only_the_latest_snapshot() {
+        let progress = AtomicUsize::new(0);
+        let mut visited = 0;
+        report_scan_progress(&progress, &mut visited);
+        assert_eq!(progress.load(Ordering::Relaxed), 1);
+        for _ in 1..16_384 {
+            report_scan_progress(&progress, &mut visited);
+        }
+        assert_eq!(progress.load(Ordering::Relaxed), 16_384);
+        report_scan_progress(&progress, &mut visited);
+        assert_eq!(progress.load(Ordering::Relaxed), 16_384);
     }
 
     #[test]
@@ -19778,10 +21263,149 @@ mod tests {
         assert!(matches!(app.key(key(KeyCode::Esc)), Action::None));
         assert!(!app.confirmation);
         app.key(key(KeyCode::Enter));
+        for code in [KeyCode::Char('y'), KeyCode::Enter] {
+            for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+                assert!(matches!(
+                    app.key(KeyEvent::new(code, modifiers)),
+                    Action::None
+                ));
+                assert!(app.confirmation);
+                assert!(!app.updating);
+            }
+        }
+        assert!(matches!(app.key(key(KeyCode::Enter)), Action::Update(_)));
+        assert!(!app.confirmation);
+        assert!(app.updating);
+        app.updating = false;
+        app.key(key(KeyCode::Enter));
         assert!(
             matches!(app.key(key(KeyCode::Char('y'))), Action::Update(tools) if tools == [ToolKind::Go])
         );
         assert!(matches!(app.key(key(KeyCode::Char('q'))), Action::None));
+    }
+
+    #[test]
+    fn held_navigation_repeats_but_confirmation_keys_do_not() {
+        let mut app = app();
+        app.page = Start::Dashboard;
+        let repeated =
+            |code| KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Repeat);
+        for _ in 0..3 {
+            app.key(repeated(KeyCode::Down));
+        }
+        for _ in 0..3 {
+            app.key(repeated(KeyCode::Char('j')));
+        }
+        assert_eq!(app.dashboard_scroll, 6);
+        for _ in 0..2 {
+            app.key(repeated(KeyCode::Char('k')));
+        }
+        assert_eq!(app.dashboard_scroll, 4);
+        for code in [KeyCode::Char('j'), KeyCode::Char('k')] {
+            app.key(KeyEvent::new_with_kind(
+                code,
+                KeyModifiers::CONTROL,
+                KeyEventKind::Repeat,
+            ));
+        }
+        assert_eq!(app.dashboard_scroll, 4);
+
+        app.page = Start::Toolchains;
+        app.confirmation = true;
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Char('y'),
+            KeyCode::Char(' '),
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+        ] {
+            assert!(matches!(app.key(repeated(code)), Action::None));
+            assert!(app.confirmation);
+            assert!(!app.updating);
+        }
+        assert!(matches!(
+            app.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+            Action::Update(_)
+        ));
+    }
+
+    #[test]
+    fn self_update_requires_a_visible_plan_and_explicit_confirmation() {
+        let mut app = app();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert!(matches!(
+            app.key(key(KeyCode::Char('U'))),
+            Action::PreviewSelfUpdate
+        ));
+        assert!(app.self_update_preparing);
+        app.self_update_preparing = false;
+        let plan = crate::application::SelfUpdatePlan {
+            program: "cargo".into(),
+            program_path: PathBuf::from("/fixture/bin/cargo"),
+            args: vec!["install".into(), "--force".into(), "upkit".into()],
+            destination: PathBuf::from("/fixture/bin"),
+            prompt: "fixture".into(),
+            description: "fixture".into(),
+            via: "cargo",
+            release_source: None,
+        };
+        app.self_update_plan = Some(plan.clone());
+        assert!(!self_update_confirmation_fits(
+            &plan,
+            Rect::new(0, 0, 30, 8)
+        ));
+        assert!(self_update_confirmation_fits(
+            &plan,
+            Rect::new(0, 0, 120, 20)
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let output = format!("{:?}", terminal.backend().buffer());
+        assert!(output.contains("Confirm Upkit self-update"));
+        assert!(output.contains("/fixture/bin/cargo"));
+        let mut github = plan.clone();
+        github.via = "github";
+        github.release_source =
+            Some("https://user:secret@example.invalid/releases?token=hidden".into());
+        let source = self_update_confirmation_lines(&github).join("\n");
+        assert!(source.contains("https://example.invalid/releases"));
+        assert!(!source.contains("secret"));
+        assert!(!source.contains("token=hidden"));
+        let ftp = self_update_source_display(std::ffi::OsStr::new(
+            "ftp://user:secret@example.invalid/releases?token=hidden",
+        ));
+        assert!(!ftp.contains("secret"));
+        assert!(!ftp.contains("token=hidden"));
+        assert!(matches!(app.key(key(KeyCode::Esc)), Action::None));
+        assert!(app.self_update_plan.is_none());
+        app.self_update_plan = Some(plan.clone());
+        assert!(matches!(
+            app.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)),
+            Action::None
+        ));
+        assert!(app.self_update_plan.is_some());
+        assert!(matches!(app.key(key(KeyCode::Char('y'))), Action::SelfUpdate(p) if p == plan));
+        assert!(app.updating);
+        assert!(matches!(app.key(key(KeyCode::Char('q'))), Action::None));
+    }
+
+    #[test]
+    fn each_new_confirmation_surface_requires_fresh_input() {
+        let mut app = app();
+        let before = confirmation_surfaces(&app);
+        app.confirmation = true;
+        let toolchain = confirmation_surfaces(&app);
+        assert!(newly_visible_confirmation(&before, &toolchain));
+        assert!(!newly_visible_confirmation(&toolchain, &toolchain));
+        app.confirmation = false;
+        app.container_plan = Some(crate::containers::test_removal_plan());
+        let container = confirmation_surfaces(&app);
+        assert!(newly_visible_confirmation(&toolchain, &container));
+        app.container_plan = None;
+        assert!(!newly_visible_confirmation(
+            &container,
+            &confirmation_surfaces(&app)
+        ));
     }
 
     #[test]
@@ -19880,9 +21504,23 @@ mod tests {
         terminal.draw(|frame| draw(frame, &app)).unwrap();
         let rendered = format!("{:?}", terminal.backend().buffer());
         assert!(rendered.contains("System timer: active"));
+        assert!(rendered.contains("filesystem ext4"));
         assert!(rendered.contains("FITRIM: unknown"));
         assert!(rendered.contains("online discard option: enabled"));
         assert!(rendered.contains("fstab TRIM exclusion: observed"));
+        assert!(rendered.contains("press Enter for a TRIM preview"));
+
+        app.maintenance.as_mut().unwrap().fstrim_available = false;
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("Volume inventory is read-only"));
+        assert!(!rendered.contains("press Enter for a TRIM preview"));
+        assert!(matches!(
+            app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::None
+        ));
+        assert!(app.message.contains("TRIM preview is unavailable"));
+        assert!(!app.trim_preparing);
     }
 
     #[test]

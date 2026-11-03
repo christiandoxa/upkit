@@ -1,8 +1,36 @@
 //! Bounded process observations; absence of evidence does not prove inactivity.
 use std::{path::PathBuf, sync::atomic::AtomicBool};
 
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static TEST_ACTIVITY_STATUS: std::cell::Cell<Option<&'static str>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) struct TestActivityStatus(Option<&'static str>);
+
+#[cfg(all(test, target_os = "linux"))]
+impl TestActivityStatus {
+    pub(crate) fn set(status: &'static str) -> Self {
+        Self(TEST_ACTIVITY_STATUS.with(|value| value.replace(Some(status))))
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for TestActivityStatus {
+    fn drop(&mut self) {
+        TEST_ACTIVITY_STATUS.with(|value| value.set(self.0));
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn inspect(paths: &[PathBuf], cancel: &AtomicBool) -> Vec<&'static str> {
+    #[cfg(test)]
+    if let Some(status) = TEST_ACTIVITY_STATUS.with(std::cell::Cell::get) {
+        return vec![status; paths.len()];
+    }
     scan(
         std::path::Path::new("/proc"),
         rustix::process::geteuid().as_raw(),

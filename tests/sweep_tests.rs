@@ -164,6 +164,288 @@ fn discovers_manifest_backed_artifacts_and_deduplicates_roots() {
     assert!(report.warnings.is_empty());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn custom_cargo_target_dir_is_review_only_and_excluded_from_cleanup_adapters() {
+    use std::{
+        fs::FileTimes,
+        sync::atomic::AtomicBool,
+        time::{Duration, SystemTime},
+    };
+    use upkit::schedule::{Frequency, preview_configured_install};
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("workspace");
+    let custom_project = root.join("custom");
+    let default_project = root.join("default");
+    let custom_target = custom_project.join("generated/target");
+    let default_target = default_project.join("target");
+    for path in [&custom_target, &default_target] {
+        fs::create_dir_all(path).unwrap();
+    }
+    fs::create_dir(custom_project.join(".cargo")).unwrap();
+    fs::write(custom_project.join("Cargo.toml"), "[workspace]\n").unwrap();
+    fs::write(
+        custom_project.join(".cargo/config.toml"),
+        "[build]\ntarget-dir = 'generated/target'\n",
+    )
+    .unwrap();
+    fs::write(custom_target.join("custom-output"), b"custom fixture").unwrap();
+    fs::write(default_project.join("Cargo.toml"), "[workspace]\n").unwrap();
+    fs::write(default_target.join("default-output"), b"default fixture").unwrap();
+
+    let old = SystemTime::now() - Duration::from_secs(31 * 24 * 60 * 60);
+    for path in [
+        custom_project.join("Cargo.toml"),
+        custom_target.join("custom-output"),
+        custom_target.clone(),
+        default_project.join("Cargo.toml"),
+        default_target.join("default-output"),
+        default_target.clone(),
+    ] {
+        fs::File::open(path)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(old))
+            .unwrap();
+    }
+
+    let stale_report = scan(std::slice::from_ref(&root)).unwrap();
+    let report = scan(std::slice::from_ref(&root)).unwrap();
+    let custom = report
+        .candidates
+        .iter()
+        .find(|candidate| candidate.target == custom_target)
+        .unwrap();
+    let default = report
+        .candidates
+        .iter()
+        .find(|candidate| candidate.target == default_target)
+        .unwrap();
+    assert_eq!(custom.ecosystem, "cargo");
+    assert_eq!(custom.classification, "review");
+    assert_eq!(custom.operation, "inspection only");
+    assert!(
+        custom
+            .reproduction_warning
+            .unwrap()
+            .contains("custom directory")
+    );
+    assert_eq!(default.classification, "rebuildable");
+
+    let plan = upkit::sweep::preview(report, std::slice::from_ref(&custom_target)).unwrap();
+    let custom_item = plan
+        .items
+        .iter()
+        .find(|item| item.candidate.target == custom_target)
+        .unwrap();
+    assert_eq!(custom_item.identity_status, "metadata_match");
+    assert!(!custom_item.execution_ready);
+
+    let scope = upkit::sweep::Scope {
+        roots: vec![root.clone()],
+        exclusions: Vec::new(),
+        older_than_seconds: None,
+        enabled: None,
+    };
+    let error = upkit::artifact_cleanup::preview(&scope, &custom_target, &AtomicBool::new(false))
+        .unwrap_err();
+    assert!(
+        format!("{error:#}")
+            .contains("custom or unresolved Cargo target directories are inspection-only")
+    );
+
+    let settings = dir.path().join("settings.toml");
+    fs::write(
+        &settings,
+        format!(
+            "version = 1\nworkspace_roots = ['{}']\nartifact_retention = '30d'\nenabled_ecosystems = ['cargo', 'maven']\nscheduled_artifact_cleanup = true\n",
+            root.display(),
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&settings, fs::Permissions::from_mode(0o600)).unwrap();
+    let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+    let schedule =
+        preview_configured_install(&executable, Some(&settings), None, Frequency::Daily).unwrap();
+    let scheduled = upkit::scheduled_cleanup::run_artifact_cleanup(
+        &dir.path().join("upkit-home"),
+        &executable,
+        &schedule.roots,
+        &schedule.exclusions,
+        &schedule.scheduled_scope_token,
+        true,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(scheduled.candidates, 0);
+    assert_eq!(scheduled.selected, 0);
+    assert!(custom_target.exists());
+    assert!(default_target.exists());
+
+    fs::write(
+        custom_project.join(".cargo/config.toml"),
+        "[build]\ntarget-dir = 'generated/target'\n# changed after the scan\n",
+    )
+    .unwrap();
+    let stale_plan = upkit::sweep::preview(stale_report, &[]).unwrap();
+    let stale_item = stale_plan
+        .items
+        .iter()
+        .find(|item| item.candidate.target == custom_target)
+        .unwrap();
+    assert_eq!(stale_item.identity_status, "changed_or_unavailable");
+}
+
+#[test]
+fn cargo_custom_target_dir_requires_unambiguous_in_scope_config() {
+    let dir = tempdir().unwrap();
+    let outside = dir.path().join("shared");
+    fs::create_dir_all(&outside).unwrap();
+    fs::create_dir(outside.join("target")).unwrap();
+    let project = dir.path().join("outside-project");
+    fs::create_dir_all(project.join(".cargo")).unwrap();
+    fs::create_dir(project.join("target")).unwrap();
+    fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
+    fs::write(project.join("target/keep"), b"fixture").unwrap();
+    fs::write(
+        project.join(".cargo/config.toml"),
+        "[build]\ntarget-dir = '../shared/target'\n",
+    )
+    .unwrap();
+    let outside_report = scan(std::slice::from_ref(&project)).unwrap();
+    assert_eq!(outside_report.candidates.len(), 1);
+    assert_eq!(outside_report.candidates[0].target, project.join("target"));
+    assert_eq!(outside_report.candidates[0].classification, "review");
+    assert!(
+        outside_report.candidates[0]
+            .reproduction_warning
+            .unwrap()
+            .contains("could not be resolved safely")
+    );
+    assert!(outside_report.warnings.iter().any(|warning| {
+        warning.contains(
+            "Cargo target-dir configuration or a known environment override is unresolved",
+        )
+    }));
+    let plan = upkit::sweep::preview(outside_report, &[project.join("target")]).unwrap();
+    assert_eq!(plan.items[0].identity_status, "unavailable");
+    assert!(!plan.items[0].execution_ready);
+    #[cfg(target_os = "linux")]
+    {
+        let scope = upkit::sweep::Scope {
+            roots: vec![project.clone()],
+            exclusions: Vec::new(),
+            older_than_seconds: None,
+            enabled: None,
+        };
+        let error = upkit::artifact_cleanup::preview(
+            &scope,
+            &project.join("target"),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}")
+                .contains("artifact cleanup requires a complete scan of the approved roots")
+        );
+    }
+
+    let no_config = dir.path().join("no-config");
+    fs::create_dir_all(no_config.join(".cargo")).unwrap();
+    fs::create_dir_all(no_config.join("target")).unwrap();
+    fs::write(no_config.join("Cargo.toml"), "[workspace]\n").unwrap();
+    let report = scan(std::slice::from_ref(&no_config)).unwrap();
+    assert_eq!(report.candidates.len(), 1);
+    assert_eq!(report.candidates[0].target, no_config.join("target"));
+    assert_eq!(report.candidates[0].classification, "rebuildable");
+
+    let explicit_default = dir.path().join("explicit-default");
+    fs::create_dir_all(explicit_default.join(".cargo")).unwrap();
+    fs::create_dir_all(explicit_default.join("target")).unwrap();
+    fs::write(explicit_default.join("Cargo.toml"), "[workspace]\n").unwrap();
+    fs::write(
+        explicit_default.join(".cargo/config.toml"),
+        "[build]\ntarget-dir = 'target'\n",
+    )
+    .unwrap();
+    let report = scan(std::slice::from_ref(&explicit_default)).unwrap();
+    assert_eq!(report.candidates.len(), 1);
+    assert_eq!(report.candidates[0].classification, "rebuildable");
+    assert!(report.candidates[0].reproduction_warning.is_none());
+
+    let ambiguous = dir.path().join("ambiguous");
+    fs::create_dir_all(ambiguous.join(".cargo")).unwrap();
+    fs::create_dir(ambiguous.join("build")).unwrap();
+    fs::write(ambiguous.join("Cargo.toml"), "[workspace]\n").unwrap();
+    fs::write(ambiguous.join("pyproject.toml"), "[project]\n").unwrap();
+    fs::write(
+        ambiguous.join(".cargo/config.toml"),
+        "[build]\ntarget-dir = 'build'\n",
+    )
+    .unwrap();
+    let report = scan(std::slice::from_ref(&ambiguous)).unwrap();
+    assert!(report.candidates.is_empty());
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("ambiguous artifact match"))
+    );
+
+    let conflicting = dir.path().join("conflicting");
+    fs::create_dir_all(conflicting.join(".cargo")).unwrap();
+    fs::create_dir(conflicting.join("generated")).unwrap();
+    fs::create_dir(conflicting.join("target")).unwrap();
+    fs::write(conflicting.join("Cargo.toml"), "[workspace]\n").unwrap();
+    for name in ["config.toml", "config"] {
+        fs::write(
+            conflicting.join(".cargo").join(name),
+            "[build]\ntarget-dir = 'generated'\n",
+        )
+        .unwrap();
+    }
+    let report = scan(std::slice::from_ref(&conflicting)).unwrap();
+    assert_eq!(report.candidates.len(), 1);
+    assert_eq!(report.candidates[0].target, conflicting.join("target"));
+    assert_eq!(report.candidates[0].classification, "review");
+    assert!(report.warnings.iter().any(|warning| {
+        warning.contains(
+            "Cargo target-dir configuration or a known environment override is unresolved",
+        )
+    }));
+}
+
+#[cfg(unix)]
+#[test]
+fn cargo_target_dir_scanning_does_not_follow_a_cargo_config_symlink() {
+    let dir = tempdir().unwrap();
+    let outside = dir.path().join("outside/.cargo");
+    fs::create_dir_all(outside.join("generated/target")).unwrap();
+    fs::write(
+        outside.join("config.toml"),
+        "[build]\ntarget-dir = 'generated/target'\n",
+    )
+    .unwrap();
+    let project = dir.path().join("project");
+    fs::create_dir(&project).unwrap();
+    fs::create_dir(project.join("target")).unwrap();
+    fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
+    fs::write(project.join("target/keep"), b"fixture").unwrap();
+    std::os::unix::fs::symlink(&outside, project.join(".cargo")).unwrap();
+
+    let report = scan(std::slice::from_ref(&project)).unwrap();
+    assert_eq!(report.candidates.len(), 1);
+    assert_eq!(report.candidates[0].target, project.join("target"));
+    assert_eq!(report.candidates[0].classification, "review");
+    assert!(report.warnings.iter().any(|warning| {
+        warning.contains(
+            "Cargo target-dir configuration or a known environment override is unresolved",
+        )
+    }));
+    assert!(outside.join("generated/target").is_dir());
+}
+
 #[test]
 fn discovers_only_python_root_tox_and_nox_directories_for_review() {
     use std::process::Command;
@@ -475,7 +757,11 @@ fn discovers_parcel_cache_only_at_a_javascript_project_root_for_review() {
     let project = dir.path().join("project");
     let cache = project.join(".parcel-cache");
     fs::create_dir_all(&cache).unwrap();
-    fs::write(project.join("package.json"), "{}\n").unwrap();
+    fs::write(
+        project.join("package.json"),
+        r#"{"devDependencies":{"@parcel/core":"^2.0.0"}}"#,
+    )
+    .unwrap();
     fs::write(cache.join("data"), b"fixture").unwrap();
     fs::create_dir_all(project.join("nested/.parcel-cache")).unwrap();
     fs::create_dir_all(dir.path().join("unrelated/.parcel-cache")).unwrap();
@@ -496,6 +782,324 @@ fn discovers_parcel_cache_only_at_a_javascript_project_root_for_review() {
             .any(|warning| { warning.contains("Parcel") && warning.contains("do not prove") })
     );
     assert!(cache.join("data").is_file());
+}
+
+#[test]
+fn javascript_framework_output_names_are_review_only_not_proof_of_generated_contents() {
+    let dir = tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    let next = workspace.join("next-app");
+    let nuxt = workspace.join("nuxt-app");
+    let unrelated = workspace.join("unrelated-js");
+    let unmanifested = workspace.join("unmanifested");
+    for (project, manifest, target) in [
+        (&next, r#"{"dependencies":{"next":"^15.0.0"}}"#, ".next"),
+        (&nuxt, r#"{"devDependencies":{"nuxt":"^3.0.0"}}"#, ".nuxt"),
+    ] {
+        fs::create_dir_all(project.join(target)).unwrap();
+        fs::write(project.join("package.json"), manifest).unwrap();
+        fs::write(project.join(target).join("fixture"), b"output").unwrap();
+    }
+
+    let unrelated_cache = [".next", ".nuxt", ".parcel-cache"].map(|name| {
+        let path = unrelated.join(name);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("keep"), b"user data").unwrap();
+        path
+    });
+    fs::write(unrelated.join("package.json"), "{}\n").unwrap();
+    fs::create_dir_all(unmanifested.join(".next")).unwrap();
+    fs::write(unmanifested.join(".next/keep"), b"user data").unwrap();
+
+    let report = scan(std::slice::from_ref(&workspace)).unwrap();
+    assert_eq!(report.candidates.len(), 5);
+    for (project, target_name, framework) in [(&next, ".next", "Next.js"), (&nuxt, ".nuxt", "Nuxt")]
+    {
+        let target = project.join(target_name);
+        let candidate = report
+            .candidates
+            .iter()
+            .find(|candidate| candidate.target == target)
+            .unwrap();
+        assert_eq!(&candidate.project_root, project);
+        assert_eq!(candidate.classification, "review");
+        assert!(candidate.reproduction_warning.is_some_and(|warning| {
+            warning.contains(framework)
+                && warning.contains("configurable")
+                && warning.contains("do not prove its contents are generated")
+        }));
+    }
+    assert!(report.candidates.iter().all(|candidate| {
+        candidate.classification == "review"
+            && candidate
+                .reproduction_warning
+                .is_some_and(|warning| warning.contains("do not prove its contents are generated"))
+    }));
+    assert!(report.candidates.iter().all(|candidate| {
+        candidate.project_root != unmanifested && candidate.target != unmanifested.join(".next")
+    }));
+    for path in unrelated_cache {
+        assert!(path.join("keep").is_file());
+    }
+    assert!(unmanifested.join(".next/keep").is_file());
+}
+
+#[test]
+fn discovers_root_javascript_coverage_reports_only_with_known_file_markers() {
+    let dir = tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    let project = workspace.join("covered-app");
+    let coverage = project.join("coverage");
+    fs::create_dir_all(&coverage).unwrap();
+    fs::write(project.join("package.json"), "{}\n").unwrap();
+    fs::write(coverage.join("lcov.info"), "TN:\nSF:src/app.ts\n").unwrap();
+    fs::write(coverage.join("index.html"), b"report").unwrap();
+
+    let unverified = workspace.join("unverified");
+    fs::create_dir_all(unverified.join("coverage")).unwrap();
+    fs::write(unverified.join("package.json"), "{}\n").unwrap();
+    fs::write(unverified.join("coverage/README.md"), b"user files").unwrap();
+
+    let unmanifested = workspace.join("unmanifested");
+    fs::create_dir_all(unmanifested.join("coverage")).unwrap();
+    fs::write(unmanifested.join("coverage/lcov.info"), b"outside project").unwrap();
+
+    fs::create_dir_all(project.join("packages/nested/coverage")).unwrap();
+    fs::write(
+        project.join("packages/nested/coverage/lcov.info"),
+        b"nested",
+    )
+    .unwrap();
+
+    let report = scan(std::slice::from_ref(&workspace)).unwrap();
+    assert_eq!(report.candidates.len(), 1);
+    let candidate = &report.candidates[0];
+    assert_eq!(candidate.ecosystem, "javascript");
+    assert_eq!(candidate.project_root, project);
+    assert_eq!(candidate.target, coverage);
+    assert_eq!(candidate.classification, "review");
+    assert_eq!(
+        candidate.logical_bytes,
+        b"TN:\nSF:src/app.ts\n".len() as u64 + b"report".len() as u64
+    );
+    assert!(candidate.size_complete);
+    assert!(candidate.reproduction_warning.is_some_and(|warning| {
+        warning.contains("known coverage report filename")
+            && warning.contains("does not prove every entry is disposable")
+    }));
+    #[cfg(unix)]
+    {
+        let plan = upkit::sweep::preview(report, std::slice::from_ref(&coverage)).unwrap();
+        assert_eq!(plan.items[0].risk, "potentially destructive");
+        assert!(!plan.items[0].execution_ready);
+        assert!(plan.warnings.iter().any(|warning| {
+            warning.contains("known coverage report filename")
+                && warning.contains("inspect all entries before removal")
+        }));
+    }
+    assert!(unverified.join("coverage/README.md").is_file());
+    assert!(unmanifested.join("coverage/lcov.info").is_file());
+    assert!(project.join("packages/nested/coverage/lcov.info").is_file());
+}
+
+#[test]
+fn discovers_only_angular_workspace_cli_cache_for_review() {
+    let dir = tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    let project = workspace.join("angular-app");
+    let cache = project.join(".angular/cache");
+    fs::create_dir_all(cache.join("18.0.0")).unwrap();
+    fs::write(project.join("package.json"), "{}\n").unwrap();
+    fs::write(
+        project.join("angular.json"),
+        r#"{"version":1,"projects":{"app":{"projectType":"application"}}}"#,
+    )
+    .unwrap();
+    fs::write(cache.join("18.0.0/build"), b"generated cache").unwrap();
+    fs::create_dir_all(project.join("user/cache")).unwrap();
+
+    let unrelated = workspace.join("unrelated");
+    let unrelated_cache = unrelated.join(".angular/cache");
+    fs::create_dir_all(&unrelated_cache).unwrap();
+    fs::write(unrelated.join("package.json"), "{}\n").unwrap();
+    fs::write(unrelated_cache.join("keep"), b"not identified").unwrap();
+
+    let invalid = workspace.join("invalid-angular-config");
+    let invalid_cache = invalid.join(".angular/cache");
+    fs::create_dir_all(&invalid_cache).unwrap();
+    fs::write(invalid.join("package.json"), "{}\n").unwrap();
+    fs::write(invalid.join("angular.json"), r#"{"projects":[]}"#).unwrap();
+    fs::write(invalid_cache.join("keep"), b"not identified").unwrap();
+
+    let report = scan(std::slice::from_ref(&workspace)).unwrap();
+    let safe_manifest_open_available = {
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::fs::{Mode, OFlags, ResolveFlags, openat2};
+            openat2(
+                rustix::fs::CWD,
+                project.join("angular.json"),
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+                ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+            )
+            .is_ok()
+        }
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            true
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        {
+            false
+        }
+    };
+    if safe_manifest_open_available {
+        assert_eq!(report.candidates.len(), 1);
+        let candidate = &report.candidates[0];
+        assert_eq!(candidate.ecosystem, "javascript");
+        assert_eq!(candidate.project_root, project);
+        assert_eq!(candidate.target, cache);
+        assert_eq!(candidate.classification, "review");
+        assert_eq!(candidate.logical_bytes, b"generated cache".len() as u64);
+        assert!(candidate.reproduction_warning.is_some_and(|warning| {
+            warning.contains("cache path is configurable in angular.json")
+        }));
+    } else {
+        assert!(report.candidates.is_empty());
+    }
+    assert!(unrelated_cache.join("keep").is_file());
+    assert!(invalid_cache.join("keep").is_file());
+    assert!(project.join("user/cache").is_dir());
+}
+
+#[test]
+fn discovers_sveltekit_default_output_only_with_manifest_evidence_and_never_plans_removal() {
+    let dir = tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    let project = workspace.join("app");
+    let nested = project.join("packages/widget");
+    let generic = workspace.join("generic");
+    let oversized = workspace.join("oversized");
+    let cache = project.join(".svelte-kit");
+    let nested_cache = nested.join(".svelte-kit");
+    let generic_named_output = generic.join(".svelte-kit");
+    let oversized_named_output = oversized.join(".svelte-kit");
+
+    for (root, output) in [(&project, &cache), (&nested, &nested_cache)] {
+        fs::create_dir_all(output.join("types")).unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"devDependencies":{"@sveltejs/kit":"^3.0.0"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("vite.config.js"),
+            "import { sveltekit } from '@sveltejs/kit/vite';\n",
+        )
+        .unwrap();
+        fs::write(output.join("types/generated.d.ts"), b"generated fixture").unwrap();
+    }
+    fs::create_dir_all(&generic_named_output).unwrap();
+    fs::write(
+        generic.join("package.json"),
+        r#"{"dependencies":{"vite":"^8"}}"#,
+    )
+    .unwrap();
+    fs::write(generic_named_output.join("keep"), b"user data").unwrap();
+    fs::create_dir_all(&oversized_named_output).unwrap();
+    fs::write(oversized.join("package.json"), vec![b' '; 1024 * 1024 + 1]).unwrap();
+    fs::write(oversized_named_output.join("keep"), b"user data").unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let linked = workspace.join("linked");
+        let linked_output = linked.join(".svelte-kit");
+        let external_manifest = dir.path().join("external-package.json");
+        fs::create_dir_all(&linked_output).unwrap();
+        fs::write(
+            &external_manifest,
+            r#"{"devDependencies":{"@sveltejs/kit":"^3.0.0"}}"#,
+        )
+        .unwrap();
+        symlink(&external_manifest, linked.join("package.json")).unwrap();
+        fs::write(linked_output.join("keep"), b"user data").unwrap();
+    }
+
+    let report = scan(std::slice::from_ref(&workspace)).unwrap();
+    let safe_manifest_open_available = {
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::fs::{Mode, OFlags, ResolveFlags, openat2};
+            openat2(
+                rustix::fs::CWD,
+                project.join("package.json"),
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+                ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+            )
+            .is_ok()
+        }
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            true
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        {
+            false
+        }
+    };
+    if safe_manifest_open_available {
+        assert_eq!(report.candidates.len(), 2);
+        for (target, root) in [(&cache, &project), (&nested_cache, &nested)] {
+            let candidate = report
+                .candidates
+                .iter()
+                .find(|candidate| &candidate.target == target)
+                .unwrap();
+            assert_eq!(candidate.ecosystem, "javascript");
+            assert_eq!(&candidate.project_root, root);
+            assert_eq!(candidate.classification, "review");
+            assert_eq!(candidate.operation, "inspection only");
+            assert!(candidate.reproduction_warning.is_some_and(|warning| {
+                warning.contains("configurable outDir")
+                    && warning.contains("cannot verify every entry is disposable")
+            }));
+        }
+    } else {
+        assert!(report.candidates.is_empty());
+    }
+    assert!(report.candidates.iter().all(|candidate| {
+        candidate.target != generic_named_output && candidate.target != oversized_named_output
+    }));
+    assert!(generic_named_output.join("keep").is_file());
+    assert!(oversized_named_output.join("keep").is_file());
+
+    #[cfg(target_os = "linux")]
+    {
+        if report
+            .candidates
+            .iter()
+            .any(|candidate| candidate.target == cache)
+        {
+            let scope = upkit::sweep::Scope {
+                roots: vec![workspace],
+                exclusions: Vec::new(),
+                older_than_seconds: None,
+                enabled: None,
+            };
+            let error = upkit::artifact_cleanup::preview(
+                &scope,
+                &cache,
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("SvelteKit output is inspection-only"));
+            assert!(cache.join("types/generated.d.ts").is_file());
+        }
+    }
 }
 
 #[test]
@@ -743,14 +1347,16 @@ fn cargo_workspace_evidence_respects_members_excludes_overrides_and_scan_scope()
     );
     let member = workspace.join("crates/member");
     let isolated = scan(std::slice::from_ref(&member)).unwrap();
+    let isolated_candidate = isolated
+        .candidates
+        .iter()
+        .find(|candidate| candidate.target == member.join("target"))
+        .unwrap();
     assert_eq!(
-        isolated.candidates[0]
-            .cargo_workspace
-            .as_ref()
-            .unwrap()
-            .status,
-        "workspace_not_observed_within_scope"
+        isolated_candidate.cargo_workspace.as_ref().unwrap().status,
+        "member_pattern_match"
     );
+    assert_eq!(isolated_candidate.classification, "review");
     let value = serde_json::to_value(&report).unwrap();
     let json_member = value["candidates"]
         .as_array()
@@ -902,7 +1508,15 @@ fn recognizes_project_specific_artifact_signatures() {
     ] {
         let root = dir.path().join(name);
         fs::create_dir_all(root.join(target)).unwrap();
-        fs::write(root.join(manifest), "").unwrap();
+        fs::write(
+            root.join(manifest),
+            if name == "js" {
+                r#"{"dependencies":{"next":"^15"}}"#
+            } else {
+                ""
+            },
+        )
+        .unwrap();
         if name == "cmake" {
             fs::write(root.join("build/CMakeCache.txt"), "").unwrap();
         }
@@ -1152,7 +1766,7 @@ fn discovers_sbt_target_as_review_only_and_respects_ecosystem_filter() {
 }
 
 #[test]
-fn go_vendor_source_is_not_a_build_artifact() {
+fn go_build_and_bin_are_review_only_and_vendor_is_not_an_artifact() {
     let dir = tempdir().unwrap();
     let project = dir.path().join("service");
     let vendor = project.join("vendor");
@@ -1178,7 +1792,21 @@ fn go_vendor_source_is_not_a_build_artifact() {
     fs::write(project.join("bin/tool"), b"custom output").unwrap();
 
     let report = scan(&[dir.path().to_owned()]).unwrap();
-    assert!(report.candidates.is_empty());
+    assert_eq!(report.candidates.len(), 2);
+    for target in [&project.join("build"), &project.join("bin")] {
+        let candidate = report
+            .candidates
+            .iter()
+            .find(|candidate| &candidate.target == target)
+            .unwrap();
+        assert_eq!(candidate.ecosystem, "go");
+        assert_eq!(candidate.classification, "review");
+        assert_eq!(candidate.operation, "inspection only");
+        assert!(candidate.reproduction_warning.is_some_and(|warning| {
+            warning.contains("may contain tracked or user-authored files")
+                && warning.contains("removal is unsupported")
+        }));
+    }
     assert!(
         vendor
             .join("example.com/dependency/dependency.go")
@@ -1186,6 +1814,238 @@ fn go_vendor_source_is_not_a_build_artifact() {
     );
     assert!(project.join("build/service").is_file());
     assert!(project.join("bin/tool").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn go_output_scan_respects_exclusions_nested_projects_and_symlinks() {
+    use std::{os::unix::fs::symlink, path::PathBuf};
+    use upkit::sweep::scan_with_policy;
+
+    let dir = tempdir().unwrap();
+    let project = dir.path().join("service");
+    let build = project.join("build");
+    let nested = build.join("nested");
+    let bin = project.join("bin");
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&nested).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir(&outside).unwrap();
+    fs::write(
+        project.join("go.mod"),
+        "module example.com/service\ngo 1.22\n",
+    )
+    .unwrap();
+    fs::write(
+        nested.join("go.mod"),
+        "module example.com/nested\ngo 1.22\n",
+    )
+    .unwrap();
+    fs::write(build.join("output"), b"fixture output").unwrap();
+    fs::write(bin.join("tool"), b"fixture output").unwrap();
+    fs::write(outside.join("secret"), b"outside").unwrap();
+    symlink(&outside, bin.join("linked")).unwrap();
+
+    let report = scan(std::slice::from_ref(&project)).unwrap();
+    assert_eq!(report.candidates.len(), 2);
+    let build_candidate = report
+        .candidates
+        .iter()
+        .find(|candidate| candidate.target == build)
+        .unwrap();
+    assert_eq!(
+        build_candidate.nested_project_marker.as_deref(),
+        Some(nested.join("go.mod").as_path())
+    );
+    let bin_candidate = report
+        .candidates
+        .iter()
+        .find(|candidate| candidate.target == bin)
+        .unwrap();
+    assert_eq!(bin_candidate.logical_bytes, b"fixture output".len() as u64);
+    assert_eq!(
+        bin_candidate.symlink_marker.as_deref(),
+        Some(bin.join("linked").as_path())
+    );
+
+    let excluded = scan_with_policy(
+        std::slice::from_ref(&project),
+        &[PathBuf::from("build")],
+        None,
+        None,
+        &std::sync::atomic::AtomicBool::new(false),
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(excluded.candidates.len(), 1);
+    assert_eq!(excluded.candidates[0].target, bin);
+    assert!(outside.join("secret").is_file());
+}
+
+#[test]
+fn go_and_dotnet_bin_collision_fails_closed_as_ambiguous() {
+    let dir = tempdir().unwrap();
+    let project = dir.path().join("service");
+    let bin = project.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        project.join("go.mod"),
+        "module example.com/service\ngo 1.22\n",
+    )
+    .unwrap();
+    fs::write(project.join("app.csproj"), "<Project />\n").unwrap();
+    fs::write(bin.join("keep"), b"user data").unwrap();
+
+    let report = scan(&[project]).unwrap();
+    assert!(report.candidates.is_empty());
+    assert!(report.warnings.iter().any(|warning| {
+        warning.contains("ambiguous artifact match (go, dotnet)")
+            && warning.contains("target and its subtree were skipped")
+    }));
+    assert_eq!(fs::read(bin.join("keep")).unwrap(), b"user data");
+}
+
+#[test]
+fn dotnet_project_extensions_ignore_case_for_discovery_and_nested_safety() {
+    let dir = tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    let dotnet = workspace.join("dotnet");
+    let bin = dotnet.join("bin");
+    let rust = workspace.join("rust");
+    let target = rust.join("target");
+    let nested_manifest = target.join("source/Nested.FSPROJ");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(nested_manifest.parent().unwrap()).unwrap();
+    fs::write(dotnet.join("App.CSPROJ"), "<Project />\n").unwrap();
+    fs::write(bin.join("fixture.dll"), b"generated output").unwrap();
+    fs::write(rust.join("Cargo.toml"), "[workspace]\n").unwrap();
+    fs::write(&nested_manifest, "<Project />\n").unwrap();
+
+    let report = scan(std::slice::from_ref(&workspace)).unwrap();
+    assert_eq!(report.candidates.len(), 2);
+    let dotnet_candidate = report
+        .candidates
+        .iter()
+        .find(|candidate| candidate.target == bin)
+        .unwrap();
+    assert_eq!(dotnet_candidate.ecosystem, "dotnet");
+    assert_eq!(dotnet_candidate.project_root, dotnet);
+    assert_eq!(
+        dotnet_candidate.logical_bytes,
+        b"generated output".len() as u64
+    );
+
+    let rust_candidate = report
+        .candidates
+        .iter()
+        .find(|candidate| candidate.target == target)
+        .unwrap();
+    assert_eq!(
+        rust_candidate.nested_project_marker.as_deref(),
+        Some(nested_manifest.as_path())
+    );
+
+    #[cfg(unix)]
+    {
+        let plan = upkit::sweep::preview(report, &[]).unwrap();
+        let item = plan
+            .items
+            .iter()
+            .find(|item| item.candidate.target == bin)
+            .unwrap();
+        assert_eq!(item.identity_status, "metadata_match");
+        assert!(!item.execution_ready);
+        let nested_item = plan
+            .items
+            .iter()
+            .find(|item| item.candidate.target == target)
+            .unwrap();
+        assert_eq!(
+            nested_item.risk,
+            "nested project or version-control marker; do not remove"
+        );
+        assert!(!nested_item.execution_ready);
+        assert!(target.join("source/Nested.FSPROJ").is_file());
+    }
+}
+
+#[test]
+fn go_work_workspace_outputs_remain_review_only_and_fail_closed() {
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    let build = workspace.join("build");
+    let nested = build.join("nested");
+    let module = workspace.join("modules/service");
+    let bin = workspace.join("bin");
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&nested).unwrap();
+    fs::create_dir_all(&module).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir(&outside).unwrap();
+    fs::write(
+        workspace.join("go.work"),
+        "go 1.22\n\nuse ./modules/service\n",
+    )
+    .unwrap();
+    fs::write(
+        module.join("go.mod"),
+        "module example.com/service\ngo 1.22\n",
+    )
+    .unwrap();
+    fs::write(workspace.join("app.csproj"), "<Project />\n").unwrap();
+    fs::write(
+        nested.join("go.mod"),
+        "module example.com/nested\ngo 1.22\n",
+    )
+    .unwrap();
+    fs::write(build.join("output"), b"fixture output").unwrap();
+    fs::write(bin.join("keep"), b"user data").unwrap();
+    fs::write(outside.join("secret"), vec![0u8; 4096]).unwrap();
+    #[cfg(unix)]
+    symlink(&outside, build.join("linked")).unwrap();
+
+    let report = scan(std::slice::from_ref(&workspace)).unwrap();
+    assert_eq!(report.candidates.len(), 1);
+    let candidate = &report.candidates[0];
+    assert_eq!(candidate.ecosystem, "go");
+    assert_eq!(candidate.project_root, workspace);
+    assert_eq!(candidate.target, build);
+    assert_eq!(candidate.classification, "review");
+    assert_eq!(candidate.operation, "inspection only");
+    assert!(candidate.reproduction_warning.is_some_and(|warning| {
+        warning.contains("may contain tracked or user-authored files")
+            && warning.contains("removal is unsupported")
+    }));
+    assert!(candidate.logical_bytes < fs::metadata(outside.join("secret")).unwrap().len());
+    assert_eq!(
+        candidate.nested_project_marker.as_deref(),
+        Some(nested.join("go.mod").as_path())
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        candidate.symlink_marker.as_deref(),
+        Some(build.join("linked").as_path())
+    );
+    assert!(report.warnings.iter().any(|warning| {
+        warning.contains("ambiguous artifact match (go, dotnet)")
+            && warning.contains("target and its subtree were skipped")
+    }));
+
+    let plan = upkit::sweep::preview(report, std::slice::from_ref(&build)).unwrap();
+    #[cfg(unix)]
+    assert_eq!(plan.items[0].identity_status, "metadata_match");
+    #[cfg(not(unix))]
+    assert_eq!(plan.items[0].identity_status, "unavailable");
+    assert!(!plan.items[0].execution_ready);
+    assert_eq!(
+        plan.items[0].risk,
+        "nested project or version-control marker; do not remove"
+    );
+    assert!(bin.join("keep").is_file());
+    assert!(outside.join("secret").is_file());
 }
 
 #[test]
@@ -1447,6 +2307,30 @@ fn preview_reports_hard_links_without_touching_external_file() {
     assert_eq!(fs::read(&original).unwrap(), b"source data");
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_scan_reports_fixture_hard_links_without_claiming_allocated_space() {
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("target");
+    fs::create_dir(&target).unwrap();
+    fs::write(dir.path().join("Cargo.toml"), "[workspace]").unwrap();
+    let original = dir.path().join("source.txt");
+    let linked = target.join("linked");
+    fs::write(&original, b"source data").unwrap();
+    fs::hard_link(&original, &linked).unwrap();
+
+    let report = scan(&[dir.path().to_owned()]).unwrap();
+    let candidate = &report.candidates[0];
+    assert_eq!(
+        candidate.hard_link_marker.as_deref(),
+        Some(linked.as_path())
+    );
+    assert_eq!(candidate.logical_bytes, b"source data".len() as u64);
+    assert!(candidate.allocated_bytes.is_none());
+    assert!(candidate.size_complete);
+    assert_eq!(fs::read(&original).unwrap(), b"source data");
+}
+
 #[cfg(unix)]
 #[test]
 fn preview_flags_symlink_without_following_or_modifying_target() {
@@ -1616,6 +2500,82 @@ fn glob_exclusions_skip_projects_and_mark_partial_sizes() {
 }
 
 #[test]
+fn discovers_ninja_build_state_for_inspection_only() {
+    use std::sync::atomic::AtomicBool;
+    use upkit::sweep::{Ecosystem, scan_with_policy};
+
+    assert_eq!(
+        serde_json::from_str::<Ecosystem>("\"ninja\"").unwrap(),
+        Ecosystem::Ninja
+    );
+    let dir = tempdir().unwrap();
+    let project = dir.path().join("project");
+    let target = project.join("build");
+    let unrelated = dir.path().join("unrelated/build");
+    let unmarked = dir.path().join("unmarked");
+    fs::create_dir_all(&target).unwrap();
+    fs::create_dir_all(&unrelated).unwrap();
+    fs::create_dir_all(unmarked.join("build")).unwrap();
+    fs::write(project.join("build.ninja"), "build fixture: phony\n").unwrap();
+    fs::write(target.join(".ninja_log"), "# ninja log v5\n").unwrap();
+    fs::write(target.join("source.cpp"), "user source").unwrap();
+    fs::write(unrelated.join(".ninja_log"), "# ninja log v5\n").unwrap();
+    fs::write(unmarked.join("build.ninja"), "build fixture: phony\n").unwrap();
+    #[cfg(unix)]
+    {
+        let linked_project = dir.path().join("linked");
+        fs::create_dir_all(linked_project.join("build")).unwrap();
+        std::os::unix::fs::symlink(
+            project.join("build.ninja"),
+            linked_project.join("build.ninja"),
+        )
+        .unwrap();
+        fs::write(linked_project.join("build/.ninja_log"), "# ninja log v5\n").unwrap();
+        std::os::unix::fs::symlink(target.join(".ninja_log"), unmarked.join("build/.ninja_log"))
+            .unwrap();
+    }
+    let roots = vec![dir.path().to_owned()];
+    let scan = |enabled: Option<&[Ecosystem]>| {
+        scan_with_policy(&roots, &[], None, enabled, &AtomicBool::new(false), |_| {}).unwrap()
+    };
+    let report = scan(Some(&[Ecosystem::Ninja]));
+    assert_eq!(report.candidates.len(), 1);
+    let candidate = &report.candidates[0];
+    assert_eq!(candidate.target, target);
+    assert_eq!(candidate.ecosystem, "ninja");
+    assert_eq!(candidate.classification, "review");
+    assert_eq!(candidate.operation, "inspection only");
+    assert!(
+        candidate
+            .reproduction_warning
+            .unwrap()
+            .contains("user files")
+    );
+    let plan = upkit::sweep::preview(report, std::slice::from_ref(&target)).unwrap();
+    assert!(!plan.items[0].execution_ready);
+    assert!(scan(Some(&[Ecosystem::Cargo])).candidates.is_empty());
+    let stale = scan(None);
+    fs::remove_file(target.join(".ninja_log")).unwrap();
+    let plan = upkit::sweep::preview(stale, std::slice::from_ref(&target)).unwrap();
+    assert_eq!(plan.items[0].identity_status, "changed_or_unavailable");
+    fs::write(target.join(".ninja_log"), "# ninja log v5\n").unwrap();
+
+    #[cfg(target_os = "linux")]
+    {
+        let scope = upkit::sweep::Scope {
+            roots,
+            exclusions: vec![],
+            older_than_seconds: None,
+            enabled: None,
+        };
+        let error =
+            upkit::artifact_cleanup::preview(&scope, &target, &AtomicBool::new(false)).unwrap_err();
+        assert!(format!("{error:#}").contains("inspection-only"));
+    }
+    assert_eq!(fs::read(target.join("source.cpp")).unwrap(), b"user source");
+}
+
+#[test]
 fn discovers_custom_cmake_and_meson_build_directories_with_metadata() {
     use std::sync::atomic::AtomicBool;
     let dir = tempdir().unwrap();
@@ -1626,6 +2586,7 @@ fn discovers_custom_cmake_and_meson_build_directories_with_metadata() {
     fs::create_dir_all(meson.join("out-release/meson-private")).unwrap();
     fs::write(cmake.join("CMakeLists.txt"), "project(fixture)").unwrap();
     fs::write(cmake.join("out-debug/CMakeCache.txt"), "fixture").unwrap();
+    fs::write(cmake.join("out-debug/build.ninja"), "generated fixture").unwrap();
     fs::write(cmake.join("source/source.cpp"), "source").unwrap();
     fs::write(meson.join("meson.build"), "project('fixture')").unwrap();
     fs::write(
@@ -1685,7 +2646,7 @@ fn discovers_nested_c_family_build_metadata_for_review_without_crossing_projects
     fs::write(meson_output.join("meson-private/coredata.dat"), "fixture").unwrap();
 
     let report = scan(&[dir.path().to_owned()]).unwrap();
-    assert_eq!(report.candidates.len(), 3);
+    assert_eq!(report.candidates.len(), 4);
     for (target, project_root, ecosystem) in [
         (cmake_output.clone(), cmake.clone(), "cmake"),
         (nested_cmake.join("out"), nested_cmake, "cmake"),
@@ -1706,12 +2667,35 @@ fn discovers_nested_c_family_build_metadata_for_review_without_crossing_projects
                 .contains("user files")
         );
     }
+    let go_build = report
+        .candidates
+        .iter()
+        .find(|candidate| candidate.target == go.join("build"))
+        .unwrap();
+    assert_eq!(go_build.project_root, go);
+    assert_eq!(go_build.ecosystem, "go");
+    assert_eq!(go_build.classification, "review");
     assert!(
-        report
-            .candidates
-            .iter()
-            .all(|candidate| candidate.target != go.join("build"))
+        go_build
+            .reproduction_warning
+            .is_some_and(|warning| { warning.contains("removal is unsupported") })
     );
+    #[cfg(target_os = "linux")]
+    {
+        let scope = upkit::sweep::Scope {
+            roots: vec![dir.path().to_owned()],
+            exclusions: Vec::new(),
+            older_than_seconds: None,
+            enabled: None,
+        };
+        let error = upkit::artifact_cleanup::preview(
+            &scope,
+            &go_build.target,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("inspection-only"));
+    }
 
     let plan = upkit::sweep::preview(report, std::slice::from_ref(&cmake_output)).unwrap();
     let item = plan
@@ -1750,6 +2734,47 @@ fn cancellation_stops_scanning_and_is_reported() {
     assert_eq!(visits, 1);
     assert!(report.cancelled);
     assert!(report.candidates.is_empty());
+}
+
+#[test]
+fn cancellation_during_size_estimation_marks_partial_candidate_incomplete() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use upkit::sweep::scan_with;
+
+    let dir = tempdir().unwrap();
+    let project = dir.path().join("project");
+    let target = project.join("target");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(project.join("Cargo.toml"), "[workspace]").unwrap();
+    fs::write(target.join("artifact"), b"fixture artifact").unwrap();
+
+    let cancelled = AtomicBool::new(false);
+    let mut target_visits = 0;
+    let report = scan_with(&[dir.path().to_owned()], &[], &cancelled, |path| {
+        if path == target {
+            target_visits += 1;
+            if target_visits == 2 {
+                cancelled.store(true, Ordering::Relaxed);
+            }
+        }
+    })
+    .unwrap();
+
+    assert!(report.cancelled);
+    let candidate = report
+        .candidates
+        .iter()
+        .find(|candidate| candidate.target == target)
+        .expect("partially measured target remains in the report");
+    assert!(!candidate.size_complete);
+    assert_eq!(candidate.logical_bytes, 0);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| { warning.contains("scan cancelled during size estimation") })
+    );
+    assert!(target.join("artifact").is_file());
 }
 
 #[cfg(windows)]
@@ -2357,7 +3382,11 @@ fn preview_detects_changed_manifest_and_replaced_directory() {
     assert!(!plan.items[0].execution_ready);
 
     let report = scan(&[dir.path().to_owned()]).unwrap();
-    fs::write(&manifest, "[package]\nname = 'changed'\n").unwrap();
+    fs::write(
+        &manifest,
+        "[package]\nname = 'changed'\nversion = '0.1.0'\n",
+    )
+    .unwrap();
     let plan = upkit::sweep::preview(report, &[]).unwrap();
     assert_eq!(plan.items[0].identity_status, "changed_or_unavailable");
     assert!(plan.items[0].risk.contains("identity changed"));
@@ -2399,7 +3428,7 @@ fn preview_does_not_claim_identity_for_ambiguous_dotnet_projects() {
 #[test]
 fn preview_checks_git_index_without_running_fsmonitor_hooks() {
     use std::{os::unix::fs::PermissionsExt, process::Command};
-    let Some(git) = system_git_path() else {
+    let Some(git) = system_git_path().filter(|_| which::which("git").is_ok()) else {
         return;
     };
     let version = Command::new(&git).arg("--version").output().unwrap();
@@ -2820,4 +3849,159 @@ fn disabled_ecosystem_is_not_inventoried_or_descended() {
         fs::read_to_string(dir.path().join("rust/target/nested/keep")).unwrap(),
         "fixture"
     );
+}
+
+#[test]
+fn cargo_workspace_roots_are_rebuildable_and_members_or_exclusions_are_review_only() {
+    let dir = tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    let member = workspace.join("member");
+    let excluded = workspace.join("excluded");
+    for target in [
+        workspace.join("target"),
+        member.join("target"),
+        excluded.join("target"),
+    ] {
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("output"), b"fixture").unwrap();
+    }
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nmembers = ['member']\nexclude = ['excluded']\n",
+    )
+    .unwrap();
+    fs::write(
+        member.join("Cargo.toml"),
+        "[package]\nname = 'member'\nversion = '0.1.0'\n",
+    )
+    .unwrap();
+    fs::write(
+        excluded.join("Cargo.toml"),
+        "[package]\nname = 'excluded'\nversion = '0.1.0'\n",
+    )
+    .unwrap();
+
+    let report = scan(std::slice::from_ref(&workspace)).unwrap();
+    let candidate = |target: &std::path::Path| {
+        report
+            .candidates
+            .iter()
+            .find(|candidate| candidate.target == target)
+            .unwrap()
+    };
+    let root = candidate(&workspace.join("target"));
+    assert_eq!(root.classification, "rebuildable");
+    assert_eq!(
+        root.cargo_workspace.as_ref().unwrap().status,
+        "workspace_manifest"
+    );
+
+    let member = candidate(&member.join("target"));
+    assert_eq!(member.classification, "review");
+    assert_eq!(
+        member.cargo_workspace.as_ref().unwrap().status,
+        "member_pattern_match"
+    );
+    assert!(
+        member
+            .reproduction_warning
+            .unwrap()
+            .contains("workspace root")
+    );
+
+    let excluded = candidate(&excluded.join("target"));
+    assert_eq!(excluded.classification, "review");
+    assert_eq!(
+        excluded.cargo_workspace.as_ref().unwrap().status,
+        "exclude_pattern_match"
+    );
+    assert!(excluded.reproduction_warning.unwrap().contains("exclusion"));
+}
+
+#[test]
+fn standalone_cargo_package_is_rebuildable_after_full_ancestor_inspection() {
+    let dir = tempdir().unwrap();
+    let project = dir.path().join("project");
+    let target = project.join("target");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("output"), b"fixture").unwrap();
+    fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = 'project'\nversion = '0.1.0'\n",
+    )
+    .unwrap();
+
+    let report = scan(std::slice::from_ref(&project)).unwrap();
+    let candidate = report
+        .candidates
+        .iter()
+        .find(|item| item.target == target)
+        .unwrap();
+    assert_eq!(candidate.classification, "rebuildable");
+    assert_eq!(
+        candidate.cargo_workspace.as_ref().unwrap().status,
+        "standalone_package"
+    );
+    assert!(candidate.reproduction_warning.is_none());
+
+    fs::write(project.join("Cargo.toml"), "[package]\n").unwrap();
+    let invalid_package = scan(std::slice::from_ref(&project)).unwrap();
+    let invalid_package = invalid_package
+        .candidates
+        .iter()
+        .find(|item| item.target == target)
+        .unwrap();
+    assert_eq!(invalid_package.classification, "review");
+    assert_eq!(
+        invalid_package.cargo_workspace.as_ref().unwrap().status,
+        "manifest_unavailable"
+    );
+
+    fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = 'project'\nversion = '0.1.0'\nworkspace = '../external-workspace'\n",
+    )
+    .unwrap();
+    let overridden = scan(std::slice::from_ref(&project)).unwrap();
+    let overridden = overridden
+        .candidates
+        .iter()
+        .find(|item| item.target == target)
+        .unwrap();
+    assert_eq!(overridden.classification, "review");
+    assert_eq!(
+        overridden.cargo_workspace.as_ref().unwrap().status,
+        "workspace_override_unresolved"
+    );
+}
+
+#[test]
+fn cargo_local_config_include_and_build_dir_make_default_target_review_only() {
+    let dir = tempdir().unwrap();
+    for (name, config) in [
+        ("include", "include = ['extra.toml']\n"),
+        ("build-dir", "[build]\nbuild-dir = 'generated'\n"),
+    ] {
+        let project = dir.path().join(name);
+        let cargo = project.join(".cargo");
+        let target = project.join("target");
+        fs::create_dir_all(&cargo).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("output"), b"fixture").unwrap();
+        fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
+        fs::write(cargo.join("config.toml"), config).unwrap();
+
+        let report = scan(std::slice::from_ref(&project)).unwrap();
+        let candidate = report
+            .candidates
+            .iter()
+            .find(|item| item.target == target)
+            .unwrap();
+        assert_eq!(candidate.classification, "review");
+        assert!(report.warnings.iter().any(|warning| {
+            warning.contains(
+                "Cargo target-dir configuration or a known environment override is unresolved",
+            )
+        }));
+    }
 }

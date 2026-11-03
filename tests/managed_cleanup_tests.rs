@@ -18,6 +18,7 @@ fn fixture() -> (tempfile::TempDir, Ctx, PathBuf) {
     let root = home.join("go");
     fs::create_dir_all(&root).unwrap();
     fs::create_dir_all(&bindir).unwrap();
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).unwrap();
     fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
     fs::set_permissions(&bindir, fs::Permissions::from_mode(0o755)).unwrap();
     let stage = tempfile::Builder::new()
@@ -211,6 +212,7 @@ fn cli_json_encodes_non_unicode_managed_cleanup_paths_and_token_inputs() {
     fs::create_dir_all(&root).unwrap();
     fs::create_dir_all(&bindir).unwrap();
     fs::create_dir(&shell_home).unwrap();
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).unwrap();
     fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
     fs::set_permissions(&bindir, fs::Permissions::from_mode(0o755)).unwrap();
     let stage = tempfile::Builder::new()
@@ -299,6 +301,23 @@ fn preview_is_read_only_and_rejects_a_changed_nested_file() {
         fs::read_to_string(plan.selected_entries[0].join("go/keep")).unwrap(),
         "changed after preview"
     );
+    assert!(fs::symlink_metadata(ctx.bindir.join("go")).is_ok());
+}
+
+#[test]
+fn shared_writable_managed_home_is_previewable_but_cannot_be_cleaned() {
+    let (_dir, ctx, root) = fixture();
+    fs::set_permissions(&ctx.home, fs::Permissions::from_mode(0o775)).unwrap();
+    let install = install_path(&root);
+    let cancel = AtomicBool::new(false);
+    let plan = managed_cleanup::preview(&ctx, ToolKind::Go, &cancel).unwrap();
+
+    assert!(plan.writable_by_others);
+    assert!(!plan.selected_entries.is_empty());
+    let error = managed_cleanup::remove(&ctx, &plan, &cancel).unwrap_err();
+    assert!(error.to_string().contains("writable by group or others"));
+    assert!(install.exists());
+    assert!(root.join("active").exists());
     assert!(fs::symlink_metadata(ctx.bindir.join("go")).is_ok());
 }
 
@@ -719,7 +738,7 @@ fn clean_and_uninstall_require_a_reviewed_batch_and_stop_on_stale_scope() {
 }
 
 #[test]
-fn clean_all_reviews_every_tool_and_stops_after_a_blocked_tool() {
+fn clean_all_preflights_every_tool_before_removing_anything() {
     use std::process::{Child, Command, Stdio};
     struct ChildGuard(Child);
     impl Drop for ChildGuard {
@@ -729,6 +748,7 @@ fn clean_all_reviews_every_tool_and_stops_after_a_blocked_tool() {
         }
     }
     let (dir, ctx, root) = fixture();
+    let go_install = install_path(&root);
     let node = ctx.home.join("node");
     fs::create_dir(&node).unwrap();
     fs::set_permissions(&node, fs::Permissions::from_mode(0o755)).unwrap();
@@ -798,15 +818,12 @@ fn clean_all_reviews_every_tool_and_stops_after_a_blocked_tool() {
     ]);
     drop(child);
     assert!(!output.status.success());
-    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let results = result["results"].as_array().unwrap();
-    assert_eq!(results[0]["verification"], "verified_selected_absent");
-    assert_eq!(results[1]["verification"], "no_verified_targets");
-    assert_eq!(results[2]["tool"], "node");
-    assert_eq!(results[2]["ok"], false);
-    assert_eq!(results[3]["executed"], false);
     assert!(root.exists());
     assert!(node.exists());
+    assert!(go_install.exists());
+    assert!(node_install.exists());
+    assert!(root.join("active").exists());
+    assert!(node.join("active").exists());
 }
 
 #[test]

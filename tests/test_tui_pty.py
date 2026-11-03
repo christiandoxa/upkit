@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unix terminal smoke test; uses an isolated home and never starts an update."""
+"""Unix terminal tests using isolated homes, fixtures, and fake installers."""
 import fcntl
 import json
 import os
@@ -15,6 +15,15 @@ import tempfile
 import termios
 import time
 from pathlib import Path
+
+
+def controlling_pty_preexec(slave_fd):
+    """Give a PTY child its own controlling terminal for accurate size checks."""
+    def attach():
+        os.setsid()
+        fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+
+    return attach
 
 
 def terminal_text(output):
@@ -234,6 +243,7 @@ def terminal_restoration_pty_test():
                     stdout=slave,
                     stderr=slave,
                     env=env,
+                    preexec_fn=controlling_pty_preexec(slave),
                 )
                 output = bytearray()
                 try:
@@ -327,6 +337,7 @@ def doctor_configuration_pty_test(binary):
             stdout=slave,
             stderr=slave,
             env=env,
+            preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
 
@@ -506,6 +517,7 @@ def trim_preview_read_only_pty_test(binary):
             stdout=slave,
             stderr=slave,
             env=env,
+            preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
 
@@ -594,6 +606,7 @@ def go_test_preview_read_only_pty_test(binary):
             stdout=slave,
             stderr=slave,
             env=env,
+            preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
 
@@ -688,6 +701,7 @@ def artifact_preview_read_only_pty_test(binary):
             stdout=slave,
             stderr=slave,
             env=env,
+            preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
 
@@ -732,6 +746,95 @@ def artifact_preview_read_only_pty_test(binary):
             os.close(master)
             os.close(slave)
     print("Explicit artifact CLI preview read-only and terminal-restoration PTY test passed")
+
+
+def go_output_preview_fails_closed_pty_test(binary):
+    with tempfile.TemporaryDirectory(prefix="upkit-go-output-pty-") as temporary:
+        root = Path(temporary)
+        fake_home = root / "fake-home"
+        workspace = root / "workspace"
+        build = workspace / "build"
+        build.mkdir(parents=True, mode=0o700)
+        (workspace / "bin").mkdir(mode=0o700)
+        fake_home.mkdir(mode=0o700)
+        (workspace / "go.mod").write_text("module example.invalid/service\ngo 1.22\n")
+        fixture_files = [build / "keep", workspace / "bin" / "keep"]
+        for fixture_file in fixture_files:
+            fixture_file.write_text("keep this Go fixture")
+
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 160, 0, 0))
+        before = termios.tcgetattr(slave)
+        env = {
+            "HOME": str(fake_home),
+            "TERM": "xterm",
+            "PATH": "/usr/bin:/bin",
+            "XDG_DATA_HOME": str(fake_home / "data"),
+            "XDG_CACHE_HOME": str(fake_home / "cache"),
+            "XDG_CONFIG_HOME": str(fake_home / "config"),
+        }
+        child = subprocess.Popen(
+            [
+                binary,
+                "--timeout",
+                "1",
+                "--retries",
+                "0",
+                "--home",
+                str(root / "upkit-data"),
+                "sweep",
+                "run",
+                "--scope",
+                "artifacts",
+                "--select",
+                str(build),
+                "--root",
+                str(workspace),
+            ],
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            env=env,
+            preexec_fn=controlling_pty_preexec(slave),
+        )
+        output = bytearray()
+
+        def read_until(marker_text, timeout=15):
+            marker_bytes = marker_text if isinstance(marker_text, bytes) else marker_text.encode()
+            deadline = time.monotonic() + timeout
+            while marker_bytes not in terminal_text(output) and time.monotonic() < deadline:
+                if select.select([master], [], [], 0.2)[0]:
+                    output.extend(os.read(master, 65536))
+            return marker_bytes in terminal_text(output)
+
+        try:
+            assert read_until("Artifact preview failed"), (
+                "Go output removal preview did not fail closed in the TUI: "
+                + terminal_text(output).decode(errors="replace")
+            )
+            rendered = terminal_screen_text(output, 24, 160)
+            assert (
+                b"Go build and bin directories are inspection-only" in rendered
+            ), rendered.decode(errors="replace")
+            assert b"Confirm permanent removal" not in rendered, rendered.decode(errors="replace")
+            assert all(path.read_text() == "keep this Go fixture" for path in fixture_files)
+            assert not (root / "upkit-data" / "history").exists()
+
+            output.clear()
+            os.write(master, b"y")
+            time.sleep(0.2)
+            assert all(path.read_text() == "keep this Go fixture" for path in fixture_files)
+            os.write(master, b"q")
+            assert child.wait(timeout=10) == 0
+            assert termios.tcgetattr(slave) == before
+            assert all(path.read_text() == "keep this Go fixture" for path in fixture_files)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+            os.close(master)
+            os.close(slave)
+    print("Go output TUI removal preview fails closed and restores the terminal")
 
 
 def temp_cleanup_review_pty_test(binary):
@@ -791,6 +894,7 @@ def temp_cleanup_review_pty_test(binary):
             stdout=slave,
             stderr=slave,
             env=env,
+            preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
 
@@ -852,7 +956,12 @@ def temp_cleanup_review_pty_test(binary):
             assert termios.tcgetattr(slave) == before, "terminal attributes were not restored"
         finally:
             if child.poll() is None:
-                child.kill()
+                # unshare --fork may leave a namespaced child behind if only
+                # the launcher PID is killed. Own a dedicated process group.
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 child.wait()
             os.close(master)
             os.close(slave)
@@ -942,6 +1051,7 @@ def history_purge_pty_test(binary):
             stdout=preview_slave,
             stderr=preview_slave,
             env=env,
+            preexec_fn=controlling_pty_preexec(preview_slave),
         )
         preview_output = bytearray()
 
@@ -995,6 +1105,7 @@ def history_purge_pty_test(binary):
             stdout=slave,
             stderr=slave,
             env=env,
+            preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
 
@@ -1013,31 +1124,37 @@ def history_purge_pty_test(binary):
                 + terminal_text(output).decode(errors="replace")
             )
             assert read_until(b"Candidates (ID"), "purge candidates did not render"
+            assert read_until(b"fixture_old_target"), "initial review omitted the old candidate"
             review_prompt = b"Press y after r"
             assert review_prompt not in terminal_text(output), "short terminal did not require scrolling"
 
+            time.sleep(0.2)
             os.write(master, b"y")
-            rejected = b"Scroll through every history record and warning before confirming"
+            # In a nine-row terminal the modal covers the status message,
+            # so verify the actual safety property rather than text that
+            # cannot be rendered: early approval must not delete anything.
+            time.sleep(0.3)
+            assert child.poll() is None, "short terminal exited during review"
+            assert {path.name: path.read_bytes() for path in history.iterdir()} == original_history, (
+                "unreviewed history purge removed data"
+            )
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 18, 160, 0, 0))
             os.kill(child.pid, signal.SIGWINCH)
-            assert read_until(rejected), (
-                "unreviewed purge confirmation was not rejected: "
-                + terminal_text(output).decode(errors="replace")
-            )
             assert json.loads((history / "000.json").read_text()) == records[0]
             assert json.loads((history / "001.json").read_text()) == records[1]
             assert json.loads((history / "002.json").read_text()) == records[2]
 
-            output.clear()
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 9, 160, 0, 0))
             os.kill(child.pid, signal.SIGWINCH)
-            assert read_until(b"Warning: This permanently removes selected records"), (
-                "small terminal purge preview did not redraw"
-            )
-            assert review_prompt not in terminal_text(output), "short terminal did not require scrolling"
+            time.sleep(0.2)
+            assert child.poll() is None
+            assert {path.name: path.read_bytes() for path in history.iterdir()} == original_history
+            # Ratatui sends incremental redraws; do not wait for an unchanged
+            # title to be sent again after the resize.
             output.clear()
             os.write(master, b"\x1b[6~")
-            assert read_until(b"fixture_old_target"), "scrolling did not reveal the old candidate"
+            # Paging down may scroll the already-reviewed candidate offscreen;
+            # the required warning and approval line must instead appear.
             assert read_until(b"Warning:"), (
                 "scrolling did not reveal the purge warning: "
                 + terminal_text(output).decode(errors="replace")
@@ -1107,22 +1224,35 @@ def structured_settings_form_pty_test(binary):
             stdout=slave,
             stderr=slave,
             env=env,
+            preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
+        transcript = bytearray()
 
         def read_until(marker, timeout=10):
             deadline = time.monotonic() + timeout
             while marker not in terminal_text(output) and time.monotonic() < deadline:
                 if select.select([master], [], [], 0.2)[0]:
-                    output.extend(os.read(master, 65536))
+                    data = os.read(master, 65536)
+                    output.extend(data)
+                    transcript.extend(data)
             return marker in terminal_text(output)
+
+        def read_screen_until(marker, timeout=10):
+            deadline = time.monotonic() + timeout
+            while marker not in terminal_screen_text(transcript, 10, 160) and time.monotonic() < deadline:
+                if select.select([master], [], [], 0.2)[0]:
+                    data = os.read(master, 65536)
+                    output.extend(data)
+                    transcript.extend(data)
+            return marker in terminal_screen_text(transcript, 10, 160)
 
         def drain_output():
             deadline = time.monotonic() + 1
             quiet_deadline = time.monotonic() + 0.1
             while time.monotonic() < deadline:
                 if select.select([master], [], [], 0.05)[0]:
-                    os.read(master, 65536)
+                    transcript.extend(os.read(master, 65536))
                     quiet_deadline = time.monotonic() + 0.1
                 elif time.monotonic() >= quiet_deadline:
                     break
@@ -1150,12 +1280,15 @@ def structured_settings_form_pty_test(binary):
                 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, 160, 0, 0))
                 os.kill(child.pid, signal.SIGWINCH)
                 if select.select([master], [], [], 0.3)[0]:
-                    output.extend(os.read(master, 65536))
+                    data = os.read(master, 65536)
+                    output.extend(data)
+                    transcript.extend(data)
             assert b"Artifact retention: 45d" in terminal_text(output), (
                 "retention edit was not applied in the form: "
                 + terminal_text(output).decode(errors="replace")
             )
             output.clear()
+            transcript.clear()
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 10, 160, 0, 0))
             os.kill(child.pid, signal.SIGWINCH)
             assert read_until(b"Ctrl+S: save"), (
@@ -1170,13 +1303,19 @@ def structured_settings_form_pty_test(binary):
                 "save preview did not render: "
                 + terminal_text(output).decode(errors="replace")
             )
+            assert read_until(b"Changed scope fields"), (
+                "save preview contents did not finish rendering: "
+                + terminal_text(output).decode(errors="replace")
+            )
+            drain_output()
             before_after = 'global defaults.artifact_retention: "30d" → "45d"'.encode()
             assert config.read_text() == original, "Ctrl+S saved before confirmation"
 
+            output.clear()
             os.write(master, b"y")
-            assert read_until(b"Review every") and read_until(b"saving."), (
+            assert read_screen_until(b"Review every settings impact"), (
                 "unreviewed Settings confirmation was not rejected: "
-                + terminal_text(output).decode(errors="replace")
+                + terminal_screen_text(transcript, 10, 160).decode(errors="replace")
             )
             assert config.read_text() == original, "premature confirmation changed the config"
             output.clear()
@@ -1283,7 +1422,7 @@ def managed_cleanup_pty_test(binary):
             command = [binary, "--timeout", "1", "--retries", "0", "--home", str(managed), "--bindir", str(bindir), "clean", "go"]
             if isolated:
                 command = [unshare, *namespace_args, *command]
-            child = subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave, env=env)
+            child = subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=controlling_pty_preexec(slave))
             output = bytearray()
             try:
                 deadline = time.monotonic() + 15
@@ -1303,14 +1442,16 @@ def managed_cleanup_pty_test(binary):
                 assert b"Top-level contents" in terminal_text(output), terminal_text(output).decode(errors="replace")
                 os.write(master, b"\x1b")
                 time.sleep(0.2)
-                fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 160, 0, 0))
                 output.clear()
+                # A long disclosure needs enough room for its complete review.
+                fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 240, 0, 0))
                 resize_target = child.pid
                 if isolated:
                     children = Path(f"/proc/{child.pid}/task/{child.pid}/children").read_text().split()
                     assert children, "isolated dashboard process did not start"
                     resize_target = int(children[0])
                 os.kill(resize_target, signal.SIGWINCH)
+                complete_review = b"Press y to remove; Esc/n cancels. i shows top-level contents."
                 activity_statuses = (
                     b"Process activity: no_open_handles_or_cwd_observed",
                     b"Process activity: open_handles_or_cwd_observed",
@@ -1323,9 +1464,10 @@ def managed_cleanup_pty_test(binary):
                     deadline = time.monotonic() + timeout
                     while time.monotonic() < deadline:
                         screen = terminal_text(output)
-                        for status in activity_statuses:
-                            if status in screen:
-                                return status
+                        if complete_review in screen:
+                            for status in activity_statuses:
+                                if status in screen:
+                                    return status
                         if select.select([master], [], [], 0.2)[0]:
                             output.extend(os.read(master, 65536))
                     return None
@@ -1343,11 +1485,17 @@ def managed_cleanup_pty_test(binary):
                     "managed cleanup never reached a no-activity preview: "
                     + terminal_text(output).decode(errors="replace")
                 )
-                os.write(master, b"y")
-                deadline = time.monotonic() + 15
-                while install.exists() and time.monotonic() < deadline:
-                    if select.select([master], [], [], 0.2)[0]:
-                        output.extend(os.read(master, 65536))
+                # Wait for a full redraw at the enlarged PTY dimensions. A
+                # stale 12x55 frame can safely reject the first confirmation.
+                time.sleep(0.4)
+                for _ in range(3):
+                    os.write(master, b"y")
+                    deadline = time.monotonic() + 3
+                    while install.exists() and time.monotonic() < deadline:
+                        if select.select([master], [], [], 0.2)[0]:
+                            output.extend(os.read(master, 65536))
+                    if not install.exists():
+                        break
                 assert not install.exists(), terminal_text(output).decode(errors="replace")
                 assert root.exists(), "cleanup removed the tool root and its receipt"
                 assert (root / "user-data").read_text() == "keep root fixture"
@@ -1366,7 +1514,11 @@ def managed_cleanup_pty_test(binary):
                 assert any(record["operation"] == "managed_tool_cleanup" for record in json.loads(history.stdout)["records"])
             finally:
                 if child.poll() is None:
-                    child.kill()
+                    # unshare --fork may outlive its launcher on test failure.
+                    try:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
                     child.wait()
                 os.close(master)
                 os.close(slave)
@@ -1398,6 +1550,7 @@ def managed_cleanup_pty_test(binary):
                 stdout=slave,
                 stderr=slave,
                 env=env,
+                preexec_fn=controlling_pty_preexec(slave),
             )
             output = bytearray()
 
@@ -1505,7 +1658,19 @@ def cache_tui_pty_smoke_test(binary, unshare, mount, namespace_args):
         go_env.write_text(
             f"GOCACHE={go_cache}\nGOPATH={home / 'go'}\nGOMODCACHE={home / 'go' / 'pkg' / 'mod'}\nGOCACHEPROG=\n"
         )
-        env = {"HOME": str(home), "TERM": "xterm", "PATH": "", "GOENV": str(go_env), "GOCACHE": str(go_cache), "XDG_DATA_HOME": str(home / "data"), "XDG_CACHE_HOME": str(home / "cache"), "XDG_CONFIG_HOME": str(home / "config")}
+        global_config = home / "npm-global.npmrc"
+        global_config.write_text("")
+        env = {
+            "HOME": str(home),
+            "TERM": "xterm",
+            "PATH": "",
+            "GOENV": str(go_env),
+            "GOCACHE": str(go_cache),
+            "XDG_DATA_HOME": str(home / "data"),
+            "XDG_CACHE_HOME": str(home / "cache"),
+            "XDG_CONFIG_HOME": str(home / "config"),
+            "NPM_CONFIG_GLOBALCONFIG": str(global_config),
+        }
         child = subprocess.Popen(
             private_etc_opt_namespace_command(
                 unshare,
@@ -1518,6 +1683,8 @@ def cache_tui_pty_smoke_test(binary, unshare, mount, namespace_args):
             stdout=slave,
             stderr=slave,
             env=env,
+            cwd=home,
+            preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
 
@@ -1617,6 +1784,7 @@ def cache_tui_pty_smoke_test(binary, unshare, mount, namespace_args):
                 response = b"q"
             else:
                 assert b"Review shared-cache entries" in preview, preview.decode(errors="replace")
+                time.sleep(0.2)
                 output.clear()
                 os.write(master, b"\r")
                 deadline = time.monotonic() + 10
@@ -1679,7 +1847,19 @@ def shared_cache_review_removal_pty_test(binary, unshare, mount, namespace_args)
         go_env.write_text(
             f"GOCACHE={target}\nGOPATH={home / 'go'}\nGOMODCACHE={home / 'go' / 'pkg' / 'mod'}\nGOCACHEPROG=\n"
         )
-        env = {"HOME": temporary, "PATH": "/usr/bin:/bin", "TERM": "xterm", "GOENV": str(go_env), "GOCACHE": str(target), "XDG_DATA_HOME": str(home / "data"), "XDG_CONFIG_HOME": str(home / "config"), "XDG_CACHE_HOME": str(parent)}
+        global_config = home / "npm-global.npmrc"
+        global_config.write_text("")
+        env = {
+            "HOME": temporary,
+            "PATH": "/usr/bin:/bin",
+            "TERM": "xterm",
+            "GOENV": str(go_env),
+            "GOCACHE": str(target),
+            "XDG_DATA_HOME": str(home / "data"),
+            "XDG_CONFIG_HOME": str(home / "config"),
+            "XDG_CACHE_HOME": str(parent),
+            "NPM_CONFIG_GLOBALCONFIG": str(global_config),
+        }
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 160, 0, 0))
         before = termios.tcgetattr(slave)
@@ -1695,6 +1875,8 @@ def shared_cache_review_removal_pty_test(binary, unshare, mount, namespace_args)
             stdout=slave,
             stderr=slave,
             env=env,
+            cwd=home,
+            preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
         try:
@@ -1803,6 +1985,8 @@ def shared_cache_review_removal_pty_test(binary, unshare, mount, namespace_args)
             stdout=slave,
             stderr=slave,
             env=env,
+            cwd=home,
+            preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
         try:
@@ -1829,6 +2013,374 @@ def shared_cache_review_removal_pty_test(binary, unshare, mount, namespace_args)
     print("Shared-cache review and removal TUI PTY test passed in an isolated namespace")
 
 
+def queued_container_confirmation_pty_test(binary):
+    with tempfile.TemporaryDirectory() as temporary:
+        home = Path(temporary)
+        bindir = home / "bin"
+        bindir.mkdir()
+        container_id = "a" * 64
+        docker = bindir / "docker"
+        docker.write_text('''#!/bin/sh
+case "$*" in
+  'info --format json') printf '%s\\n' '{"ID":"fixture-daemon"}' ;;
+  'container ls --all --size --no-trunc --format json') printf '{"ID":"%s","State":"exited","Names":"fixture"}\\n' "$EXPECTED_ID" ;;
+  'container inspect --size '*) /bin/sleep 0.4; printf '[{"Id":"%s","Name":"fixture","RestartCount":0,"SizeRw":1,"State":{"Status":"exited","Running":false,"Restarting":false,"StartedAt":"a","FinishedAt":"b"}}]\\n' "$4" ;;
+  'container rm -- '*) printf removed > "$HOME/removed" ;;
+  *) printf '[]\\n' ;;
+esac
+''')
+        docker.chmod(0o700)
+        env = {"HOME": temporary, "TERM": "xterm", "PATH": str(bindir),
+               "EXPECTED_ID": container_id, "XDG_DATA_HOME": str(home / "data"),
+               "XDG_CONFIG_HOME": str(home / "config")}
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 120, 0, 0))
+        before = termios.tcgetattr(slave)
+        child = subprocess.Popen(
+            [binary, "--timeout", "2", "--retries", "0", "containers", "preview-remove",
+             "--engine", "docker", "--id", container_id],
+            cwd=home, env=env, stdin=slave, stdout=slave, stderr=slave,
+            preexec_fn=controlling_pty_preexec(slave),
+        )
+        output = bytearray()
+        try:
+            deadline = time.monotonic() + 10
+            while b"\x1b[?1049h" not in output and time.monotonic() < deadline:
+                if select.select([master], [], [], 0.2)[0]:
+                    output.extend(os.read(master, 65536))
+            assert b"\x1b[?1049h" in output, "TUI did not enter its alternate screen"
+            os.write(master, b"y" * 64)
+            deadline = time.monotonic() + 10
+            while b"Confirm container removal" not in output and time.monotonic() < deadline:
+                if select.select([master], [], [], 0.2)[0]:
+                    output.extend(os.read(master, 65536))
+            assert b"Confirm container removal" in output, terminal_text(output).decode(errors="replace")
+            time.sleep(0.3)
+            assert child.poll() is None
+            assert not (home / "removed").exists(), "queued input confirmed an unseen plan"
+            os.write(master, b"nq")
+            assert child.wait(timeout=10) == 0
+            assert termios.tcgetattr(slave) == before
+            assert not (home / "removed").exists()
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+            os.close(master)
+            os.close(slave)
+    print("Queued container confirmation is discarded before preview")
+
+
+def self_update_pty_test(binary):
+    with tempfile.TemporaryDirectory() as temporary:
+        home = Path(temporary)
+        bindir = home / "bin"
+        bindir.mkdir()
+        cargo = bindir / "cargo"
+        cargo.write_text(
+            '#!/bin/sh\nif [ "$1" = install ]; then printf "%s\\n" "$@" > "$HOME/update-args"; '
+            'exit "${UPKIT_FIXTURE_STATUS:-0}"; fi\nprintf probe >> "$HOME/unrelated-probes"\n'
+        )
+        cargo.chmod(0o700)
+        for name in ("go", "rustc", "node", "python3", "flutter", "mojo", "java", "dotnet"):
+            probe = bindir / name
+            probe.write_text('#!/bin/sh\nprintf probe >> "$HOME/unrelated-probes"\n')
+            probe.chmod(0o700)
+        env = {
+            "HOME": temporary,
+            "PATH": str(bindir),
+            "TERM": "xterm",
+            "UPKIT_INSTALLER": "cargo",
+            "XDG_CONFIG_HOME": str(home / "config"),
+            "XDG_DATA_HOME": str(home / "data"),
+            "HTTPS_PROXY": "http://127.0.0.1:1",
+            "https_proxy": "http://127.0.0.1:1",
+        }
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 140, 0, 0))
+        before = termios.tcgetattr(slave)
+        child = subprocess.Popen(
+            [binary, "--timeout", "1", "--retries", "0", "self-update"],
+            cwd=home, env=env, stdin=slave, stdout=slave, stderr=slave,
+            preexec_fn=controlling_pty_preexec(slave),
+        )
+        output = bytearray()
+
+        def read_until(marker, timeout=15):
+            deadline = time.monotonic() + timeout
+            while marker not in terminal_text(output) and time.monotonic() < deadline:
+                if select.select([master], [], [], 0.2)[0]:
+                    try:
+                        output.extend(os.read(master, 65536))
+                    except OSError:
+                        break
+            return marker in terminal_text(output)
+
+        try:
+            os.write(master, b"y")
+            assert read_until(b"Confirm Upkit self-update"), terminal_text(output).decode(errors="replace")
+            assert read_until(str(cargo).encode()), terminal_text(output).decode(errors="replace")
+            time.sleep(0.2)
+            assert not (home / "update-args").exists()
+            assert not (home / "unrelated-probes").exists(), "preview started unrelated checks"
+            output.clear()
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 10, 45, 0, 0))
+            os.kill(child.pid, signal.SIGWINCH)
+            time.sleep(0.3)
+            os.write(master, b"y")
+            time.sleep(0.4)
+            assert child.poll() is None
+            assert not (home / "update-args").exists(), "small terminal allowed self-update"
+            output.clear()
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 140, 0, 0))
+            os.kill(child.pid, signal.SIGWINCH)
+            assert read_until(b"Confirm Upkit self-update"), terminal_text(output).decode(errors="replace")
+            assert read_until(b"Enter/y: confirm"), terminal_text(output).decode(errors="replace")
+            time.sleep(0.2)
+            os.write(master, b"y")
+            deadline = time.monotonic() + 10
+            while not (home / "update-args").exists() and time.monotonic() < deadline:
+                if select.select([master], [], [], 0.2)[0]:
+                    output.extend(os.read(master, 65536))
+            assert (home / "update-args").read_text().splitlines() == ["install", "--force", "upkit"]
+            deadline = time.monotonic() + 10
+            while child.poll() is None and time.monotonic() < deadline:
+                os.write(master, b"q")
+                if select.select([master], [], [], 0.2)[0]:
+                    try:
+                        output.extend(os.read(master, 65536))
+                    except OSError:
+                        break
+            assert child.wait(timeout=2) == 0
+            assert termios.tcgetattr(slave) == before
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+            os.close(master)
+            os.close(slave)
+        (home / "update-args").unlink()
+        env["UPKIT_FIXTURE_STATUS"] = "7"
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 140, 0, 0))
+        before = termios.tcgetattr(slave)
+        child = subprocess.Popen(
+            [binary, "--timeout", "1", "--retries", "0", "self-update"],
+            cwd=home, env=env, stdin=slave, stdout=slave, stderr=slave,
+            preexec_fn=controlling_pty_preexec(slave),
+        )
+        output = bytearray()
+        try:
+            assert read_until(b"Confirm Upkit self-update"), terminal_text(output).decode(errors="replace")
+            assert read_until(str(cargo).encode()), terminal_text(output).decode(errors="replace")
+            assert read_until(b"Enter/y: confirm"), terminal_text(output).decode(errors="replace")
+            time.sleep(0.2)
+            os.write(master, b"y")
+            deadline = time.monotonic() + 10
+            while not (home / "update-args").exists() and time.monotonic() < deadline:
+                if select.select([master], [], [], 0.2)[0]:
+                    output.extend(os.read(master, 65536))
+            assert (home / "update-args").exists()
+            deadline = time.monotonic() + 10
+            while child.poll() is None and time.monotonic() < deadline:
+                os.write(master, b"q")
+                if select.select([master], [], [], 0.2)[0]:
+                    try:
+                        output.extend(os.read(master, 65536))
+                    except OSError:
+                        break
+            assert child.wait(timeout=2) != 0
+            assert termios.tcgetattr(slave) == before
+            assert (home / "update-args").exists()
+            assert not (home / "unrelated-probes").exists()
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+            os.close(master)
+            os.close(slave)
+        (home / "update-args").unlink()
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 140, 0, 0))
+        before = termios.tcgetattr(slave)
+        child = subprocess.Popen(
+            [binary, "--timeout", "1", "--retries", "0", "self-update"],
+            cwd=home, env=env, stdin=slave, stdout=slave, stderr=slave,
+            preexec_fn=controlling_pty_preexec(slave),
+        )
+        output = bytearray()
+        try:
+            assert read_until(b"Confirm Upkit self-update"), terminal_text(output).decode(errors="replace")
+            assert read_until(str(cargo).encode()), terminal_text(output).decode(errors="replace")
+            assert read_until(b"Enter/y: confirm"), terminal_text(output).decode(errors="replace")
+            time.sleep(0.2)
+            os.write(master, b"n")
+            assert child.wait(timeout=10) == 0
+            assert termios.tcgetattr(slave) == before
+            assert not (home / "update-args").exists()
+            assert not (home / "unrelated-probes").exists()
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+            os.close(master)
+            os.close(slave)
+        shell = bindir / "sh"
+        shell.write_text('#!/bin/sh\nprintf "%s" "$UPKIT_RELEASE_BASE_URL" > "$HOME/release-source"\n')
+        shell.chmod(0o700)
+        env["UPKIT_INSTALLER"] = "standalone"
+        env["UPKIT_RELEASE_BASE_URL"] = "https://user:secret@example.invalid/releases?token=hidden"
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 140, 0, 0))
+        before = termios.tcgetattr(slave)
+        child = subprocess.Popen(
+            [binary, "--timeout", "1", "--retries", "0", "self-update"],
+            cwd=home, env=env, stdin=slave, stdout=slave, stderr=slave,
+            preexec_fn=controlling_pty_preexec(slave),
+        )
+        output = bytearray()
+        try:
+            assert read_until(b"Confirm Upkit self-update"), terminal_text(output).decode(errors="replace")
+            assert read_until(b"https://example.invalid/releases"), terminal_text(output).decode(errors="replace")
+            assert b"secret" not in terminal_text(output)
+            assert b"token=hidden" not in terminal_text(output)
+            assert not (home / "release-source").exists()
+            assert read_until(b"Enter/y: confirm"), terminal_text(output).decode(errors="replace")
+            time.sleep(0.2)
+            os.write(master, b"y")
+            deadline = time.monotonic() + 10
+            while not (home / "release-source").exists() and time.monotonic() < deadline:
+                if select.select([master], [], [], 0.2)[0]:
+                    output.extend(os.read(master, 65536))
+            assert (home / "release-source").read_text() == env["UPKIT_RELEASE_BASE_URL"]
+            deadline = time.monotonic() + 10
+            while child.poll() is None and time.monotonic() < deadline:
+                os.write(master, b"q")
+                if select.select([master], [], [], 0.2)[0]:
+                    try:
+                        output.extend(os.read(master, 65536))
+                    except OSError:
+                        break
+            assert child.wait(timeout=2) == 0
+            assert termios.tcgetattr(slave) == before
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+            os.close(master)
+            os.close(slave)
+    print("Self-update preview and fake installer TUI PTY test passed")
+
+
+def dashboard_recent_activity_pty_test(binary):
+    with tempfile.TemporaryDirectory(prefix="upkit-dashboard-history-pty-") as temporary:
+        root = Path(temporary)
+        home = root / "upkit"
+        history = home / "history"
+        history.mkdir(parents=True, mode=0o700)
+        history.chmod(0o700)
+        home.chmod(0o700)
+        records = [
+            (0, "oldest_operation", "completed", "/private/oldest"),
+            (1, "older_operation", "failed", "/private/older"),
+            (2, "middle_operation", "partial", "/private/middle"),
+            (3, "newest_operation", "completed", "/private/newest"),
+        ]
+        for record_id, operation, outcome, target in records:
+            record = {
+                "id": record_id,
+                "started_unix": record_id,
+                "finished_unix": None,
+                "duration_ms": 0,
+                "operation": operation,
+                "target": target,
+                "outcome": outcome,
+                "detail": None,
+                "estimated_bytes": None,
+                "verified_reclaimed_bytes": None,
+                "platform": "fixture",
+            }
+            path = history / f"{record_id:03}.json"
+            path.write_text(json.dumps(record))
+            path.chmod(0o600)
+
+        cargo_home = root / ".cargo"
+        cargo_registry = cargo_home / "registry"
+        cargo_registry.mkdir(parents=True, mode=0o700)
+        cargo_home.chmod(0o700)
+        (cargo_registry / "fixture").write_text("cache fixture")
+        (cargo_registry / "fixture").chmod(0o600)
+
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
+        before = termios.tcgetattr(slave)
+        env = {
+            "HOME": str(root),
+            "TERM": "xterm",
+            "PATH": "",
+            "XDG_DATA_HOME": str(root / "xdg-data"),
+            "XDG_CACHE_HOME": str(root / "xdg-cache"),
+            "XDG_CONFIG_HOME": str(root / "xdg-config"),
+        }
+        child = subprocess.Popen(
+            [binary, "--timeout", "1", "--retries", "0", "--home", str(home)],
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            env=env,
+            preexec_fn=controlling_pty_preexec(slave),
+        )
+        output = bytearray()
+        try:
+            deadline = time.monotonic() + 10
+            rendered = b""
+            while time.monotonic() < deadline:
+                if select.select([master], [], [], 0.2)[0]:
+                    output.extend(os.read(master, 65536))
+                rendered = terminal_screen_text(output, 30, 120)
+                if all(
+                    marker in rendered
+                    for marker in (b"newest_operation", b"middle_operation", b"older_operation")
+                ):
+                    break
+            assert all(
+                marker in rendered
+                for marker in (b"newest_operation", b"middle_operation", b"older_operation")
+            ), rendered.decode(errors="replace")
+            positions = [
+                rendered.index(marker)
+                for marker in (b"newest_operation", b"middle_operation", b"older_operation")
+            ]
+            assert positions == sorted(positions), "recent operations are not newest-first"
+            assert b"oldest_operation" not in rendered
+            assert b"/private/" not in rendered
+            output.clear()
+            os.write(master, b"c")
+            deadline = time.monotonic() + 15
+            rendered = b""
+            while b"Cargo registry: logical snapshot 13 bytes" not in rendered and time.monotonic() < deadline:
+                if select.select([master], [], [], 0.2)[0]:
+                    output.extend(os.read(master, 65536))
+                rendered = terminal_screen_text(output, 30, 120)
+            assert b"Cargo registry: logical snapshot 13 bytes" in rendered, (
+                "Dashboard c shortcut did not start cache inventory: "
+                + rendered.decode(errors="replace")
+            )
+            assert b"(1 of 1 caches)" in rendered
+            assert b"Shared caches" in rendered
+            assert b"Recent activity" not in rendered
+            os.write(master, b"q")
+            assert child.wait(timeout=10) == 0
+            assert termios.tcgetattr(slave) == before
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+            os.close(master)
+            os.close(slave)
+    print("Dashboard shows recent outcomes without target paths and opens cache inventory")
+
+
 def main():
     binary = os.path.abspath(os.environ.get("UPKIT_TUI_TEST_BINARY", "target/debug/upkit"))
     dashboard_only = sys.argv[1:] == ["dashboard"]
@@ -1841,6 +2393,8 @@ def main():
             go_test_preview_read_only_pty_test(binary)
         elif sys.argv[1:] == ["artifact-preview"]:
             artifact_preview_read_only_pty_test(binary)
+        elif sys.argv[1:] == ["go-artifact-preview"]:
+            go_output_preview_fails_closed_pty_test(binary)
         elif sys.argv[1:] == ["trim-preview"]:
             trim_preview_read_only_pty_test(binary)
         elif sys.argv[1:] == ["settings-form"] and sys.platform == "linux":
@@ -1851,18 +2405,28 @@ def main():
             terminal_restoration_pty_test()
         elif sys.argv[1:] == ["doctor-config"]:
             doctor_configuration_pty_test(binary)
+        elif sys.argv[1:] == ["self-update"]:
+            self_update_pty_test(binary)
+        elif sys.argv[1:] == ["queued-container"]:
+            queued_container_confirmation_pty_test(binary)
+        elif sys.argv[1:] == ["dashboard-recent-activity"]:
+            dashboard_recent_activity_pty_test(binary)
         else:
             raise SystemExit(f"unknown PTY test selector: {' '.join(sys.argv[1:])}")
         return
     if not dashboard_only:
         terminal_restoration_pty_test()
         doctor_configuration_pty_test(binary)
+        self_update_pty_test(binary)
+        queued_container_confirmation_pty_test(binary)
     if not dashboard_only and sys.platform == "linux":
         history_purge_pty_test(binary)
         temp_cleanup_review_pty_test(binary)
         trim_preview_read_only_pty_test(binary)
         go_test_preview_read_only_pty_test(binary)
         artifact_preview_read_only_pty_test(binary)
+        go_output_preview_fails_closed_pty_test(binary)
+    dashboard_recent_activity_pty_test(binary)
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 120, 0, 0))
     before = termios.tcgetattr(slave)
@@ -1873,8 +2437,16 @@ def main():
         child = subprocess.Popen(
             [binary, "--timeout", "1", "--retries", "0"],
             stdin=slave, stdout=slave, stderr=slave, env=env,
+            preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
+        transcript = bytearray()
+
+        def read_output():
+            data = os.read(master, 65536)
+            output.extend(data)
+            transcript.extend(data)
+
         try:
             deadline = time.monotonic() + 10
             while (
@@ -1882,7 +2454,7 @@ def main():
                 or b"Recent activity" not in terminal_text(output)
             ) and time.monotonic() < deadline:
                 if select.select([master], [], [], 0.2)[0]:
-                    output.extend(os.read(master, 65536))
+                    read_output()
             assert b"Upkit" in output, "dashboard did not render"
             assert b"Storage & maintenance" in terminal_text(output)
             assert b"Recent activity" in terminal_text(output)
@@ -1890,7 +2462,7 @@ def main():
             deadline = time.monotonic() + 10
             while b"Keyboard help" not in output and time.monotonic() < deadline:
                 if select.select([master], [], [], 0.2)[0]:
-                    output.extend(os.read(master, 65536))
+                    read_output()
             assert b"Keyboard help" in output, "keyboard help did not render"
             help_closed_at = len(output)
             help_closed_text = b"Recent activity"
@@ -1901,7 +2473,7 @@ def main():
                 and time.monotonic() < deadline
             ):
                 if select.select([master], [], [], 0.2)[0]:
-                    output.extend(os.read(master, 65536))
+                    read_output()
             assert help_closed_text in terminal_text(output[help_closed_at:]), "dashboard did not redraw after closing help"
             resized_at = len(output)
             dashboard_page = b"Dashboard"
@@ -1913,34 +2485,87 @@ def main():
                 and time.monotonic() < deadline
             ):
                 if select.select([master], [], [], 0.2)[0]:
-                    output.extend(os.read(master, 65536))
+                    read_output()
             assert dashboard_page in terminal_text(output[resized_at:]), "dashboard did not redraw after resize"
             navigated_at = len(output)
-            toolchains_marker = b"Enter: update"
+            toolchains_markers = (
+                b"Checking toolchains in the background",
+                b"installed:",
+                b"Toolchain check failed; results are unavailable.",
+            )
             os.write(master, b"\t")
             deadline = time.monotonic() + 10
             while (
-                toolchains_marker not in terminal_text(output[navigated_at:])
+                not any(
+                    marker in terminal_text(output[navigated_at:])
+                    for marker in toolchains_markers
+                )
                 and time.monotonic() < deadline
             ):
                 if select.select([master], [], [], 0.2)[0]:
-                    output.extend(os.read(master, 65536))
+                    read_output()
             navigated_output = terminal_text(output[navigated_at:])
-            assert toolchains_marker in navigated_output, (
-                "Tab navigation did not reach Toolchains; output after Tab: "
+            assert any(marker in navigated_output for marker in toolchains_markers), (
+                "Tab navigation did not render the Toolchains screen; output after Tab: "
                 f"{navigated_output.decode(errors='replace')!r}"
+            )
+            assert b"r: refresh" in navigated_output and b"Enter: update" in navigated_output, (
+                "narrow Toolchains footer hid refresh or update controls: "
+                + navigated_output.decode(errors="replace")
+            )
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
+            os.kill(child.pid, signal.SIGWINCH)
+            ready_deadline = time.monotonic() + 15
+            while (
+                b"installed:" not in terminal_text(output)
+                and b"Toolchain check failed" not in terminal_text(output)
+                and time.monotonic() < ready_deadline
+            ):
+                if select.select([master], [], [], 0.2)[0]:
+                    read_output()
+            assert b"installed:" in terminal_text(output), (
+                "toolchain inventory did not finish before refresh: "
+                + terminal_text(output).decode(errors="replace")
+            )
+            output.clear()
+            os.write(master, b"/go\r")
+            filter_deadline = time.monotonic() + 10
+            while b"Filter: go" not in terminal_text(output) and time.monotonic() < filter_deadline:
+                if select.select([master], [], [], 0.2)[0]:
+                    read_output()
+            assert b"Filter: go" in terminal_text(output), (
+                "toolchain filter did not apply: "
+                + terminal_text(output).decode(errors="replace")
+            )
+            output.clear()
+            os.write(master, b"r")
+            refresh_deadline = time.monotonic() + 15
+            while (
+                b"Toolchain inventory refreshed." not in terminal_screen_text(transcript, 30, 120)
+                and time.monotonic() < refresh_deadline
+            ):
+                if select.select([master], [], [], 0.2)[0]:
+                    read_output()
+            refreshed_screen = terminal_screen_text(transcript, 30, 120)
+            assert b"Toolchain inventory refreshed." in refreshed_screen, (
+                "r did not refresh the toolchain inventory: "
+                + refreshed_screen.decode(errors="replace")
+            )
+            assert b"Filter: go" in refreshed_screen, (
+                "toolchain refresh lost the active filter: "
+                + refreshed_screen.decode(errors="replace")
             )
             os.write(master, b"\x03")
             deadline = time.monotonic() + 10
             while child.poll() is None and time.monotonic() < deadline:
                 if select.select([master], [], [], 0.2)[0]:
-                    output.extend(os.read(master, 65536))
+                    read_output()
             assert child.wait(timeout=10) == 0
             assert termios.tcgetattr(slave) == before, "terminal attributes were not restored"
             assert not os.listdir(home), "opening the dashboard changed its isolated home"
             while select.select([master], [], [], 0)[0]:
-                output.extend(os.read(master, 65536))
-            assert b"\x1b[?1049h" in output and b"\x1b[?1049l" in output
+                read_output()
+            assert b"\x1b[?1049h" in transcript and b"\x1b[?1049l" in transcript
         finally:
             if child.poll() is None:
                 child.kill()
@@ -1964,7 +2589,7 @@ def main():
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 140, 0, 0))
         before = termios.tcgetattr(slave)
         env = {"HOME": temporary, "TERM": "xterm", "PATH": "", "XDG_DATA_HOME": str(home / "data"), "XDG_CONFIG_HOME": str(home / "config")}
-        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "--config", str(config)], stdin=slave, stdout=slave, stderr=slave, env=env)
+        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "--config", str(config)], stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=controlling_pty_preexec(slave))
         output = bytearray()
         try:
             deadline = time.monotonic() + 10
@@ -2008,7 +2633,7 @@ def main():
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 160, 0, 0))
         before = termios.tcgetattr(slave)
         env = {"HOME": temporary, "TERM": "xterm", "PATH": "", "XDG_DATA_HOME": str(home / "data"), "XDG_CONFIG_HOME": str(home / "config")}
-        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "--config", str(config), "config", "show"], stdin=slave, stdout=slave, stderr=slave, env=env)
+        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "--config", str(config), "config", "show"], stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=controlling_pty_preexec(slave))
         output = bytearray()
         try:
             deadline = time.monotonic() + 10
@@ -2081,7 +2706,7 @@ def main():
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 110, 0, 0))
         before = termios.tcgetattr(slave)
         env = {"HOME": str(home), "TERM": "xterm", "PATH": "", "TZ": "UTC", "XDG_DATA_HOME": str(home), "XDG_CONFIG_HOME": str(home / "config")}
-        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "trash", "preview", "--older-than", "30d"], stdin=slave, stdout=slave, stderr=slave, env=env)
+        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "trash", "preview", "--older-than", "30d"], stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=controlling_pty_preexec(slave))
         output = bytearray()
         try:
             deadline = time.monotonic() + 10
@@ -2116,7 +2741,7 @@ def main():
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 160, 0, 0))
         before = termios.tcgetattr(slave)
         env = {"HOME": str(home), "TERM": "xterm", "PATH": "", "TZ": "UTC", "XDG_DATA_HOME": str(home), "XDG_CONFIG_HOME": str(home / "config")}
-        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "trash", "preview-retention", "--location", str(trash), "--older-than", "30d"], stdin=slave, stdout=slave, stderr=slave, env=env)
+        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "trash", "preview-retention", "--location", str(trash), "--older-than", "30d"], stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=controlling_pty_preexec(slave))
         output = bytearray()
         try:
             deadline = time.monotonic() + 10
@@ -2163,7 +2788,7 @@ def main():
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 160, 0, 0))
         before = termios.tcgetattr(slave)
         env = {"HOME": str(home), "TERM": "xterm", "PATH": "", "TZ": "UTC", "XDG_DATA_HOME": str(home), "XDG_CONFIG_HOME": str(home / "config")}
-        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "trash", "empty", "--location", str(trash)], stdin=slave, stdout=slave, stderr=slave, env=env)
+        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "trash", "empty", "--location", str(trash)], stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=controlling_pty_preexec(slave))
         output = bytearray()
         try:
             deadline = time.monotonic() + 10
@@ -2213,7 +2838,7 @@ def main():
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 160, 0, 0))
         before = termios.tcgetattr(slave)
         env = {"HOME": str(home), "TERM": "xterm", "PATH": "", "TZ": "UTC", "XDG_DATA_HOME": str(home), "XDG_CONFIG_HOME": str(home / "config")}
-        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "trash", "empty", "--location", str(trash)], stdin=slave, stdout=slave, stderr=slave, env=env)
+        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "trash", "empty", "--location", str(trash)], stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=controlling_pty_preexec(slave))
         output = bytearray()
         try:
             deadline = time.monotonic() + 10
@@ -2222,6 +2847,7 @@ def main():
                     output.extend(os.read(master, 65536))
             assert b"Confirm permanent Trash deletion" in terminal_text(output), terminal_text(output).decode(errors="replace")
             assert b"descendants=1" in terminal_text(output)
+            time.sleep(0.2)
             os.write(master, b"y")
             deadline = time.monotonic() + 10
             while (directory.exists() or metadata.exists()) and time.monotonic() < deadline:
@@ -2262,7 +2888,7 @@ def main():
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 120, 0, 0))
         before = termios.tcgetattr(slave)
         env = {"HOME": str(home), "TERM": "xterm", "PATH": "", "TZ": "UTC", "XDG_DATA_HOME": str(home), "XDG_CONFIG_HOME": str(home / "config")}
-        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "trash", "preview", "--older-than", "30d"], stdin=slave, stdout=slave, stderr=slave, env=env)
+        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "trash", "preview", "--older-than", "30d"], stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=controlling_pty_preexec(slave))
         output = bytearray()
         try:
             deadline = time.monotonic() + 10
@@ -2288,7 +2914,14 @@ def main():
             os.kill(child.pid, signal.SIGWINCH)
             os.write(master, b"\r")
             deadline = time.monotonic() + 10
+            size = 24
+            redraw_at = 0
             while b"Review marked Trash" not in terminal_text(output) and time.monotonic() < deadline:
+                if time.monotonic() >= redraw_at:
+                    size = 25 if size == 24 else 24
+                    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", size, 120, 0, 0))
+                    os.kill(child.pid, signal.SIGWINCH)
+                    redraw_at = time.monotonic() + 0.25
                 if select.select([master], [], [], 0.2)[0]:
                     output.extend(os.read(master, 65536))
             reviewed = terminal_text(output)
@@ -2377,6 +3010,7 @@ def main():
             child = subprocess.Popen(
                 [binary, "--timeout", "1", "--retries", "0", "--config", str(config), "--profile", "work", "sweep", command],
                 stdin=slave, stdout=slave, stderr=slave, env=env,
+                preexec_fn=controlling_pty_preexec(slave),
             )
             output = bytearray()
             try:
@@ -2455,7 +3089,7 @@ esac
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
         before = termios.tcgetattr(slave)
         env = {"HOME": str(home), "TERM": "xterm", "PATH": str(bin_dir), "IMAGE_ID": image_id, "XDG_DATA_HOME": str(home / "data"), "XDG_CONFIG_HOME": str(home / "config")}
-        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "containers", "status"], stdin=slave, stdout=slave, stderr=slave, env=env)
+        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "containers", "status"], stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=controlling_pty_preexec(slave))
         output = bytearray()
         try:
             deadline = time.monotonic() + 10
@@ -2534,6 +3168,7 @@ esac
             stdout=slave,
             stderr=slave,
             env=env,
+            preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
         try:
@@ -2592,14 +3227,18 @@ esac
         fcntl.ioctl(direct_slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 110, 0, 0))
         direct_before = termios.tcgetattr(direct_slave)
         direct_env = {"HOME": str(home), "TERM": "xterm", "PATH": str(bin_dir), "EXPECTED_ID": container_id, "XDG_DATA_HOME": str(home / "data"), "XDG_CONFIG_HOME": str(home / "config")}
-        direct = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "containers", "preview-remove", "--engine", "docker", "--id", container_id], stdin=direct_slave, stdout=direct_slave, stderr=direct_slave, env=direct_env)
+        direct = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "containers", "preview-remove", "--engine", "docker", "--id", container_id], stdin=direct_slave, stdout=direct_slave, stderr=direct_slave, env=direct_env, preexec_fn=controlling_pty_preexec(direct_slave))
         direct_output = bytearray()
         try:
+            os.write(direct_master, b"y" * 64)
             deadline = time.monotonic() + 10
             while b"Confirm container removal" not in direct_output and time.monotonic() < deadline:
                 if select.select([direct_master], [], [], 0.2)[0]:
                     direct_output.extend(os.read(direct_master, 65536))
             assert b"Confirm container removal" in direct_output, "direct container preview did not render"
+            time.sleep(0.3)
+            assert direct.poll() is None
+            assert not (home / "removed").exists(), "queued input confirmed an unseen plan"
             os.write(direct_master, b"nq")
             assert direct.wait(timeout=10) == 0
             assert not (home / "removed").exists()
@@ -2614,7 +3253,7 @@ esac
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 110, 0, 0))
         before = termios.tcgetattr(slave)
         env = {"HOME": str(home), "TERM": "xterm", "PATH": str(bin_dir), "EXPECTED_ID": container_id, "XDG_DATA_HOME": str(home / "data"), "XDG_CONFIG_HOME": str(home / "config")}
-        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "containers", "status"], stdin=slave, stdout=slave, stderr=slave, env=env)
+        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "containers", "status"], stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=controlling_pty_preexec(slave))
         output = bytearray()
         try:
             deadline = time.monotonic() + 10
@@ -2701,8 +3340,20 @@ esac
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 240, 0, 0))
         before = termios.tcgetattr(slave)
-        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "schedule", "list"], stdin=slave, stdout=slave, stderr=slave, env=env)
+        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "schedule", "list"], stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=controlling_pty_preexec(slave))
         output = bytearray()
+
+        def wait_for_schedule_review(marker):
+            deadline = time.monotonic() + 10
+            while marker not in terminal_text(output) and time.monotonic() < deadline:
+                if select.select([master], [], [], 0.2)[0]:
+                    output.extend(os.read(master, 65536))
+            assert marker in terminal_text(output), "complete schedule review did not render"
+            settle = time.monotonic() + 0.2
+            while time.monotonic() < settle:
+                if select.select([master], [], [], 0.05)[0]:
+                    output.extend(os.read(master, 65536))
+
         try:
             deadline = time.monotonic() + 10
             while b"not_found" not in output and time.monotonic() < deadline:
@@ -2753,6 +3404,7 @@ esac
                 if select.select([master], [], [], 0.2)[0]:
                     output.extend(os.read(master, 65536))
             assert b"Confirm timer installation" in output, "fresh timer install preview did not render"
+            wait_for_schedule_review(b"Press y to install; Esc/n cancels.")
             output.clear()
             os.write(master, b"y")
             deadline = time.monotonic() + 15
@@ -2899,6 +3551,7 @@ esac
                 if select.select([master], [], [], 0.2)[0]:
                     output.extend(os.read(master, 65536))
             assert b"Confirm timer disable" in output, "second timer disable preview did not render"
+            wait_for_schedule_review(b"Press y to disable; Esc/n cancels.")
             output.clear()
             os.write(master, b"y")
             deadline = time.monotonic() + 15
@@ -2928,11 +3581,23 @@ esac
             os.write(master, b"y")
             time.sleep(0.3)
             assert (unit_dir / "upkit-scan.timer").read_text() == plan["timer_unit"], "small terminal allowed schedule replacement"
+            output.clear()
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 70, 300, 0, 0))
             os.kill(child.pid, signal.SIGWINCH)
-            time.sleep(0.3)
+            deadline = time.monotonic() + 10
+            review_start = b"Review all lines"
+            review_end = b"Press y to replace; Esc/n cancels."
+            while (
+                (review_start not in terminal_text(output) or review_end not in terminal_text(output))
+                and time.monotonic() < deadline
+            ):
+                if select.select([master], [], [], 0.2)[0]:
+                    output.extend(os.read(master, 65536))
+            assert review_start in terminal_text(output) and review_end in terminal_text(output), (
+                "replacement review did not redraw completely after resize: "
+                + terminal_text(output).decode(errors="replace")
+            )
             (home / "change_during_reload").write_text("fixture")
-            output.clear()
             os.write(master, b"y")
             deadline = time.monotonic() + 20
             failed_edit = False
@@ -2961,6 +3626,7 @@ esac
                 if select.select([master], [], [], 0.2)[0]:
                     output.extend(os.read(master, 65536))
             assert b"Confirm timer replacement" in output, "fresh timer edit preview did not render"
+            wait_for_schedule_review(b"Press y to replace; Esc/n cancels.")
             output.clear()
             os.write(master, b"y")
             deadline = time.monotonic() + 20
@@ -2984,6 +3650,7 @@ esac
                 if select.select([master], [], [], 0.2)[0]:
                     output.extend(os.read(master, 65536))
             assert b"Confirm timer disable" in output, "edited timer disable preview did not render"
+            wait_for_schedule_review(b"Press y to disable; Esc/n cancels.")
             output.clear()
             os.write(master, b"y")
             deadline = time.monotonic() + 15
@@ -3081,7 +3748,7 @@ esac
             master, slave = pty.openpty()
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 70, 300, 0, 0))
             before = termios.tcgetattr(slave)
-            child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "schedule", *command], stdin=slave, stdout=slave, stderr=slave, env=env)
+            child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "schedule", *command], stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=controlling_pty_preexec(slave))
             output = bytearray()
             try:
                 deadline = time.monotonic() + 15
@@ -3089,7 +3756,15 @@ esac
                     if select.select([master], [], [], 0.2)[0]:
                         output.extend(os.read(master, 65536))
                 assert title in output, terminal_text(output).decode(errors="replace")[-2500:]
-                time.sleep(0.3)
+                if not readonly:
+                    while b"Esc/n cancels." not in terminal_text(output) and time.monotonic() < deadline:
+                        if select.select([master], [], [], 0.2)[0]:
+                            output.extend(os.read(master, 65536))
+                    assert b"Esc/n cancels." in terminal_text(output), "complete schedule review did not render"
+                settle = time.monotonic() + 0.3
+                while time.monotonic() < settle:
+                    if select.select([master], [], [], 0.05)[0]:
+                        output.extend(os.read(master, 65536))
                 os.write(master, b"y")
                 if readonly:
                     time.sleep(0.4)
@@ -3187,6 +3862,7 @@ esac
             stdout=slave,
             stderr=slave,
             env=env,
+            preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
 
@@ -3367,6 +4043,7 @@ esac
             stdout=slave,
             stderr=slave,
             env=env,
+            preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
 
@@ -3388,7 +4065,7 @@ esac
                     break
             assert b"cancels." in terminal_text(output), "configured schedule review did not reach the end"
             reviewed = terminal_screen_text(output, 24, 120)
-            assert b"automatic, permanent Python bytecode cleanup" in reviewed
+            assert b"automatically and permanently removes eligible Python bytecode" in reviewed
             assert b"at most 32 files are removed per run" in reviewed
             assert b"revalidated against" in reviewed
             assert b"No files are cleaned" not in reviewed
@@ -3456,7 +4133,7 @@ esac
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 12 if not readonly else 24, 50 if not readonly else 120, 0, 0))
             before = termios.tcgetattr(slave)
             child = subprocess.Popen([binary, "containers", command, "--builder", "fixture", "--id", cache_id],
-                                     stdin=slave, stdout=slave, stderr=slave, env=env)
+                                     stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=controlling_pty_preexec(slave))
             output = bytearray()
             try:
                 title = b"Build cache preview" if readonly else b"Confirm build cache removal"
@@ -3520,7 +4197,7 @@ esac
         before = termios.tcgetattr(slave)
         child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "containers",
                                   "preview-network", "--engine", "docker", "--id", network_id],
-                                 stdin=slave, stdout=slave, stderr=slave, env=env)
+                                 stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=controlling_pty_preexec(slave))
         output = bytearray()
         try:
             deadline = time.monotonic() + 10
@@ -3603,7 +4280,7 @@ esac
             master, slave = pty.openpty()
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 12, 50, 0, 0))
             before = termios.tcgetattr(slave)
-            child = subprocess.Popen([unshare, *namespace_args, binary, "--timeout", "1", "--retries", "0", "--config", str(config), "sweep", "bytecode", str(bytecode), "--root", str(project)], stdin=slave, stdout=slave, stderr=slave, env=env, cwd=temporary)
+            child = subprocess.Popen([unshare, *namespace_args, binary, "--timeout", "1", "--retries", "0", "--config", str(config), "sweep", "bytecode", str(bytecode), "--root", str(project)], stdin=slave, stdout=slave, stderr=slave, env=env, cwd=temporary, preexec_fn=controlling_pty_preexec(slave))
             output = bytearray()
             try:
                 deadline = time.monotonic() + 15
@@ -3611,6 +4288,7 @@ esac
                     if select.select([master], [], [], 0.2)[0]:
                         output.extend(os.read(master, 65536))
                 assert b"Confirm bytecode removal" in output, terminal_text(output).decode(errors="replace")
+                time.sleep(0.2)
                 os.write(master, b"y")
                 time.sleep(0.4)
                 assert bytecode.exists(), "small terminal allowed bytecode deletion"
@@ -3641,7 +4319,7 @@ esac
             master, slave = pty.openpty()
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 160, 0, 0))
             before = termios.tcgetattr(slave)
-            child = subprocess.Popen([unshare, *namespace_args, binary, "--timeout", "1", "--retries", "0", "--config", str(config), "sweep", "bytecode", str(bytecode), "--root", str(project)], stdin=slave, stdout=slave, stderr=slave, env=env, cwd=temporary)
+            child = subprocess.Popen([unshare, *namespace_args, binary, "--timeout", "1", "--retries", "0", "--config", str(config), "sweep", "bytecode", str(bytecode), "--root", str(project)], stdin=slave, stdout=slave, stderr=slave, env=env, cwd=temporary, preexec_fn=controlling_pty_preexec(slave))
             output = bytearray()
             try:
                 deadline = time.monotonic() + 15
@@ -3649,6 +4327,11 @@ esac
                     if select.select([master], [], [], 0.2)[0]:
                         output.extend(os.read(master, 65536))
                 assert b"Confirm bytecode removal" in output, terminal_text(output).decode(errors="replace")
+                while b"Press y to remove this file" not in terminal_text(output) and time.monotonic() < deadline:
+                    if select.select([master], [], [], 0.2)[0]:
+                        output.extend(os.read(master, 65536))
+                assert b"Press y to remove this file" in terminal_text(output), "complete bytecode review did not render"
+                time.sleep(0.2)
                 os.write(master, b"y")
                 deadline = time.monotonic() + 10
                 while bytecode.exists() and time.monotonic() < deadline:
@@ -3678,7 +4361,7 @@ esac
             master, slave = pty.openpty()
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 160, 0, 0))
             before = termios.tcgetattr(slave)
-            child = subprocess.Popen([unshare, *namespace_args, binary, "--timeout", "1", "--retries", "0", "--config", str(config), "sweep", "scan", str(project)], stdin=slave, stdout=slave, stderr=slave, env=env, cwd=temporary)
+            child = subprocess.Popen([unshare, *namespace_args, binary, "--timeout", "1", "--retries", "0", "--config", str(config), "sweep", "scan", str(project)], stdin=slave, stdout=slave, stderr=slave, env=env, cwd=temporary, preexec_fn=controlling_pty_preexec(slave))
             output = bytearray()
             try:
                 deadline = time.monotonic() + 15
@@ -3710,6 +4393,11 @@ esac
                     if select.select([master], [], [], 0.2)[0]:
                         output.extend(os.read(master, 65536))
                 assert b"Confirm bytecode removal" in output, terminal_text(output).decode(errors="replace")
+                while b"Press y to remove this file" not in terminal_text(output) and time.monotonic() < deadline:
+                    if select.select([master], [], [], 0.2)[0]:
+                        output.extend(os.read(master, 65536))
+                assert b"Press y to remove this file" in terminal_text(output), "complete bytecode review did not render"
+                time.sleep(0.2)
                 os.write(master, b"y")
                 deadline = time.monotonic() + 10
                 while bytecode.exists() and time.monotonic() < deadline:
@@ -3739,7 +4427,7 @@ esac
             master, slave = pty.openpty()
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 160, 0, 0))
             before = termios.tcgetattr(slave)
-            child = subprocess.Popen([unshare, *namespace_args, binary, "--timeout", "1", "--retries", "0", "--config", str(config), "sweep", "scan", str(project)], stdin=slave, stdout=slave, stderr=slave, env=env, cwd=temporary)
+            child = subprocess.Popen([unshare, *namespace_args, binary, "--timeout", "1", "--retries", "0", "--config", str(config), "sweep", "scan", str(project)], stdin=slave, stdout=slave, stderr=slave, env=env, cwd=temporary, preexec_fn=controlling_pty_preexec(slave))
             output = bytearray()
             try:
                 deadline = time.monotonic() + 15
@@ -3818,7 +4506,7 @@ esac
             project.chmod(0o700)
             target.chmod(0o700)
             manifest = project / "Cargo.toml"
-            manifest.write_text("[package]\nname='fixture'\nversion='0.1.0'\n")
+            manifest.write_text("[package]\nname='fixture'\nversion='0.1.0'\n[workspace]\n")
             manifest.chmod(0o600)
             for i in range(25):
                 file = target / f"file-{i:02}"
@@ -3848,7 +4536,7 @@ esac
             master, slave = pty.openpty()
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 160, 0, 0))
             before = termios.tcgetattr(slave)
-            child = subprocess.Popen([unshare, *namespace_args, binary, "--timeout", "1", "--retries", "0", "--config", str(config), "sweep", "run", "--scope", "artifacts", "--select", str(target), "--root", str(project)], stdin=slave, stdout=slave, stderr=slave, env=env, cwd=temporary)
+            child = subprocess.Popen([unshare, *namespace_args, binary, "--timeout", "1", "--retries", "0", "--config", str(config), "sweep", "run", "--scope", "artifacts", "--select", str(target), "--root", str(project)], stdin=slave, stdout=slave, stderr=slave, env=env, cwd=temporary, preexec_fn=controlling_pty_preexec(slave))
             output = bytearray()
             try:
                 deadline = time.monotonic() + 20
@@ -3949,7 +4637,7 @@ esac
             master, slave = pty.openpty()
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 12, 160, 0, 0))
             before = termios.tcgetattr(slave)
-            child = subprocess.Popen([unshare, *namespace_args, binary, "--timeout", "1", "--retries", "0", "--config", str(config)], stdin=slave, stdout=slave, stderr=slave, env=env, cwd=temporary)
+            child = subprocess.Popen([unshare, *namespace_args, binary, "--timeout", "1", "--retries", "0", "--config", str(config)], stdin=slave, stdout=slave, stderr=slave, env=env, cwd=temporary, preexec_fn=controlling_pty_preexec(slave))
             output = bytearray()
 
             def wait_for(marker, timeout=15):

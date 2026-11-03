@@ -10,6 +10,17 @@ const MAX_TAR_SYMLINK_PATH_BYTES: usize = 64 * 1024 * 1024;
 
 fn ensure_empty_destination(destination: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(destination).context("inspect archive destination")?;
+    if !plain_directory(&metadata) {
+        bail!("archive destination must be a real directory");
+    }
+    // shortcut: relies on caller-private staging; use descriptor-relative extraction if staging becomes shared with an attacker.
+    if fs::read_dir(destination)?.next().transpose()?.is_some() {
+        bail!("archive destination must be empty");
+    }
+    Ok(())
+}
+
+fn plain_directory(metadata: &fs::Metadata) -> bool {
     #[cfg(windows)]
     let reparse_point = {
         use std::os::windows::fs::MetadataExt;
@@ -17,12 +28,57 @@ fn ensure_empty_destination(destination: &Path) -> Result<()> {
     };
     #[cfg(not(windows))]
     let reparse_point = false;
-    if metadata.file_type().is_symlink() || reparse_point || !metadata.is_dir() {
-        bail!("archive destination must be a real directory");
-    }
-    // shortcut: relies on caller-private staging; use descriptor-relative extraction if staging becomes shared with an attacker.
-    if fs::read_dir(destination)?.next().transpose()?.is_some() {
-        bail!("archive destination must be empty");
+    metadata.is_dir() && !metadata.file_type().is_symlink() && !reparse_point
+}
+
+fn ensure_tar_parent_directories(destination: &Path, path: &Path) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let mut current = destination.to_path_buf();
+    for component in parent.components() {
+        match component {
+            Component::Normal(name) => current.push(name),
+            Component::CurDir => continue,
+            _ => bail!("archive contains an unsafe parent path"),
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if plain_directory(&metadata) => {}
+            Ok(_) => bail!("archive path traverses a non-directory or linked directory"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let created = {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::DirBuilderExt;
+                        let mut builder = fs::DirBuilder::new();
+                        builder.mode(0o755);
+                        builder.create(&current)
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        fs::create_dir(&current)
+                    }
+                };
+                // Create each implicit parent here so its mode is bounded before extraction continues.
+                created.with_context(|| {
+                    format!(
+                        "create archive parent {}",
+                        crate::sweep::display_path(&current)
+                    )
+                })?;
+                if !plain_directory(&fs::symlink_metadata(&current)?) {
+                    bail!("archive parent changed while being created");
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "inspect archive parent {}",
+                        crate::sweep::display_path(&current)
+                    )
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -125,6 +181,9 @@ pub(super) fn unpack_tar_with_limit(
             add_symlink_path_bytes(&mut symlink_path_bytes, path.as_os_str().len())?;
             symlinks.push(path.to_path_buf());
         }
+        ensure_tar_parent_directories(destination, &path)?;
+        // Managed-install seals reject group/other-writable entries; keep other archive mode bits.
+        entry.set_mask(0o022);
         if !entry.unpack_in(destination)? {
             bail!("archive contains an unsafe path");
         }
@@ -395,6 +454,139 @@ fn unpack_zip(archive: &Path, destination: &Path, allow_links: bool, max_bytes: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn archive_parent_errors_escape_terminal_controls_and_non_unicode_paths() {
+        use std::{
+            ffi::OsString,
+            os::unix::{
+                ffi::OsStringExt,
+                fs::{MetadataExt, PermissionsExt},
+            },
+        };
+
+        let prefix = OsString::from_vec(b"upkit-\x1b[\xff-".to_vec());
+        let destination = tempfile::Builder::new().prefix(&prefix).tempdir().unwrap();
+        let overlong_component = "x".repeat(256);
+        let error = ensure_tar_parent_directories(
+            destination.path(),
+            Path::new(&format!("{overlong_component}/file")),
+        )
+        .unwrap_err();
+        let rendered = format!("{error:#}");
+
+        assert!(rendered.contains("inspect archive parent"), "{rendered}");
+        assert!(rendered.contains("%1B[%FF-"), "{rendered}");
+        assert!(!rendered.contains('\x1b'), "{rendered}");
+        assert!(!rendered.contains('\u{fffd}'), "{rendered}");
+
+        if rustix::process::geteuid().as_raw() == 0 {
+            eprintln!("SKIP: cannot force the create-error path while running as root");
+            return;
+        }
+        let mode = fs::metadata(destination.path()).unwrap().mode() & 0o777;
+        fs::set_permissions(
+            destination.path(),
+            fs::Permissions::from_mode(mode & !0o222),
+        )
+        .unwrap();
+        let error = ensure_tar_parent_directories(destination.path(), Path::new("missing/file"));
+        fs::set_permissions(destination.path(), fs::Permissions::from_mode(mode)).unwrap();
+        let rendered = format!("{:#}", error.unwrap_err());
+        assert!(rendered.contains("create archive parent"), "{rendered}");
+        assert!(rendered.contains("%1B[%FF-"), "{rendered}");
+        assert!(!rendered.contains('\x1b'), "{rendered}");
+        assert!(!rendered.contains('\u{fffd}'), "{rendered}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_extraction_clears_group_and_other_write_permissions() {
+        use std::os::unix::fs::MetadataExt;
+
+        let mut bytes = Vec::new();
+        {
+            let mut tar = tar::Builder::new(&mut bytes);
+            for path in ["python", "python/bin"] {
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Directory);
+                header.set_size(0);
+                header.set_mode(0o775);
+                header.set_cksum();
+                tar.append_data(&mut header, path, std::io::empty())
+                    .unwrap();
+            }
+            let mut header = tar::Header::new_gnu();
+            header.set_size(7);
+            header.set_mode(0o775);
+            header.set_cksum();
+            tar.append_data(&mut header, "python/bin/python3", &b"fixture"[..])
+                .unwrap();
+            tar.finish().unwrap();
+        }
+
+        let destination = tempfile::tempdir().unwrap();
+        unpack_tar(&bytes[..], destination.path(), 1).unwrap();
+        for path in ["python", "python/bin", "python/bin/python3"] {
+            let mode = fs::metadata(destination.path().join(path)).unwrap().mode() & 0o777;
+            assert_eq!(mode, 0o755, "{path}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_extraction_creates_safe_parents_for_files_without_directory_entries() {
+        use std::os::unix::fs::MetadataExt;
+
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(7);
+        header.set_mode(0o775);
+        header.set_cksum();
+        tar.append_data(&mut header, "python/bin/python3", &b"fixture"[..])
+            .unwrap();
+        let bytes = tar.into_inner().unwrap();
+
+        let destination = tempfile::tempdir().unwrap();
+        unpack_tar(&bytes[..], destination.path(), 1).unwrap();
+        for path in ["python", "python/bin", "python/bin/python3"] {
+            let mode = fs::metadata(destination.path().join(path)).unwrap().mode() & 0o777;
+            assert_eq!(mode & 0o022, 0, "{path}");
+        }
+        assert_eq!(
+            fs::read(destination.path().join("python/bin/python3")).unwrap(),
+            b"fixture"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_extraction_does_not_follow_a_symlinked_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("stage");
+        let outside = dir.path().join("outside");
+        fs::create_dir(&destination).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), b"fixture").unwrap();
+
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_size(0);
+        header.set_mode(0o755);
+        header.set_cksum();
+        tar.append_data(&mut header, "python/real", std::io::empty())
+            .unwrap();
+        tar_symlink(&mut tar, "python/link", "real");
+        tar_file(&mut tar, "python/link/payload", b"must not be written");
+        let bytes = tar.into_inner().unwrap();
+
+        assert!(unpack_tar(&bytes[..], &destination, 1).is_err());
+        assert!(!destination.join("python/real/payload").exists());
+        assert_eq!(fs::read(outside.join("keep")).unwrap(), b"fixture");
+        assert!(!outside.join("payload").exists());
+    }
 
     #[test]
     fn link_boundaries_follow_archive_layout() {

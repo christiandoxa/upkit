@@ -61,7 +61,8 @@ pub fn check_go(ctx: &Ctx) -> Result<ToolReport> {
     };
     let executable_found =
         managed_bin.as_ref().is_some_and(|bin| bin.is_file()) || path_bin.is_some();
-    let installed = if ctx.dry_run {
+    let skip_execution = ctx.dry_run || ctx.offline;
+    let installed = if skip_execution {
         None
     } else if let Some(bin) = managed_bin {
         let args = [OsStr::new("version")];
@@ -74,15 +75,25 @@ pub fn check_go(ctx: &Ctx) -> Result<ToolReport> {
     .and_then(|out| Version::parse_loose(&out));
 
     let latest = go_latest(ctx).ok();
-    let status = if ctx.dry_run && executable_found {
+    let version_unverified = executable_found && installed.is_none();
+    let status = if version_unverified {
         Status::Unknown
     } else {
         Status::from_versions(installed.as_ref(), latest.as_ref())
     };
 
     let mut notes = vec!["Installs into upkit home and symlinks binaries into bindir.".into()];
-    if ctx.dry_run && executable_found {
-        notes.push("Dry-run skipped running Go; the installed version is unknown.".into());
+    if skip_execution && executable_found {
+        notes.push(format!(
+            "{} skipped running Go; the installed version is unknown.",
+            if ctx.dry_run {
+                "Dry-run"
+            } else {
+                "Offline mode"
+            }
+        ));
+    } else if version_unverified {
+        notes.push("A Go executable was found, but its version could not be verified.".into());
     }
     if ctx.os == "windows" {
         notes.push("Windows installation requires permission to create symbolic links.".into());

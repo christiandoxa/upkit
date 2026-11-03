@@ -102,13 +102,15 @@ fn release(ctx: &Ctx) -> Result<Release> {
     if url.scheme() != "https"
         || !url.username().is_empty()
         || url.password().is_some()
+        || url.port().is_some_and(|port| port != 443)
+        || !matches!(url.host_str(), Some("github.com" | "api.adoptium.net"))
         || package.checksum.len() != 64
         || !package
             .checksum
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit())
     {
-        bail!("Temurin metadata lacks a valid HTTPS URL or SHA-256 checksum");
+        bail!("Temurin metadata lacks an official HTTPS archive URL or valid SHA-256 checksum");
     }
     Ok(Release {
         version: Version {
@@ -121,33 +123,38 @@ fn release(ctx: &Ctx) -> Result<Release> {
     })
 }
 
-fn installed(ctx: &Ctx) -> Option<Version> {
+fn installed(ctx: &Ctx) -> (Option<Version>, bool) {
     let managed = ctx.bindir.join(if ctx.os == "windows" {
         "javac.exe"
     } else {
         "javac"
     });
     let executable = if managed.is_file() {
-        managed
+        Some(managed)
     } else if ctx.os == "macos" {
         let path = which_or_none("javac");
         match path {
-            Some(path) if path != Path::new("/usr/bin/javac") => path,
-            _ => macos_javac()?,
+            Some(path) if path != Path::new("/usr/bin/javac") => Some(path),
+            _ => macos_javac(),
         }
     } else {
-        which_or_none("javac")?
+        which_or_none("javac")
     };
-    let output = run_output(executable.as_os_str(), &[OsStr::new("-version")]).ok()?;
+    let Some(executable) = executable else {
+        return (None, false);
+    };
+    let Ok(output) = run_output(executable.as_os_str(), &[OsStr::new("-version")]) else {
+        return (None, true);
+    };
     if !output.status.success() {
-        return None;
+        return (None, true);
     }
     let text = format!(
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    parse_version(&text)
+    (parse_version(&text), true)
 }
 
 fn macos_javac() -> Option<PathBuf> {
@@ -197,9 +204,13 @@ fn parse_version(text: &str) -> Option<Version> {
 }
 
 pub fn check_java(ctx: &Ctx) -> Result<ToolReport> {
-    let installed = if ctx.dry_run { None } else { installed(ctx) };
+    let (installed, executable_found) = if ctx.dry_run {
+        (None, false)
+    } else {
+        installed(ctx)
+    };
     let latest = release(ctx).ok().map(|release| release.version);
-    let status = if ctx.dry_run {
+    let status = if ctx.dry_run || (executable_found && installed.is_none()) {
         Status::Unknown
     } else {
         Status::from_versions(installed.as_ref(), latest.as_ref())
@@ -207,6 +218,8 @@ pub fn check_java(ctx: &Ctx) -> Result<ToolReport> {
     let mut notes = vec!["Targets Eclipse Temurin LTS JDK; JAVA_HOME is not changed.".into()];
     if ctx.dry_run {
         notes.push("Installed JDK version was not verified during dry-run.".into());
+    } else if executable_found && installed.is_none() {
+        notes.push("A javac executable was found, but its version could not be verified.".into());
     }
     if ctx.os == "windows" {
         notes.push("Windows installation requires permission to create symbolic links.".into());
@@ -238,7 +251,9 @@ pub fn update_java(ctx: &Ctx) -> Result<()> {
         bail!("unexpected Temurin archive format");
     }
     if !ctx.dry_run
-        && installed(ctx).is_some_and(|version| version >= release.version)
+        && installed(ctx)
+            .0
+            .is_some_and(|version| version >= release.version)
         && !ctx.force
     {
         info(ctx, format!("JDK is up-to-date ({})", release.version));

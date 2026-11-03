@@ -18,15 +18,24 @@ use upkit::{
 
 const AVAILABLE: &str = "https://api.adoptium.net/v3/info/available_releases";
 const ASSETS: &str = "https://api.adoptium.net/v3/assets/latest/25/hotspot?architecture=x64&heap_size=normal&image_type=jdk&os=linux&vendor=eclipse";
-const DOWNLOAD: &str = "https://example.invalid/temurin.tar.gz";
+const DOWNLOAD: &str =
+    "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/jdk.tar.gz";
 
 fn metadata(checksum: &str) -> String {
+    metadata_with_link(checksum, DOWNLOAD)
+}
+
+fn metadata_with_link(checksum: &str, link: &str) -> String {
     format!(
-        r#"[{{"vendor":"eclipse","binary":{{"architecture":"x64","os":"linux","image_type":"jdk","jvm_impl":"hotspot","heap_size":"normal","package":{{"name":"jdk.tar.gz","link":"{DOWNLOAD}","checksum":"{checksum}"}}}},"version":{{"major":25,"minor":0,"security":5}}}}]"#
+        r#"[{{"vendor":"eclipse","binary":{{"architecture":"x64","os":"linux","image_type":"jdk","jvm_impl":"hotspot","heap_size":"normal","package":{{"name":"jdk.tar.gz","link":"{link}","checksum":"{checksum}"}}}},"version":{{"major":25,"minor":0,"security":5}}}}]"#
     )
 }
 
 fn plan_metadata(checksum: &str) {
+    plan_metadata_with_link(checksum, DOWNLOAD);
+}
+
+fn plan_metadata_with_link(checksum: &str, link: &str) {
     set_http_plan(
         AVAILABLE,
         vec![Ok(MockResponse::new(
@@ -36,7 +45,10 @@ fn plan_metadata(checksum: &str) {
     );
     set_http_plan(
         ASSETS,
-        vec![Ok(MockResponse::new(metadata(checksum).into_bytes(), None))],
+        vec![Ok(MockResponse::new(
+            metadata_with_link(checksum, link).into_bytes(),
+            None,
+        ))],
     );
 }
 
@@ -175,6 +187,64 @@ fn supports_legacy_javac_versions_and_offline_checks() {
     assert_eq!(report.installed.unwrap().to_string(), "8.0.452");
     assert!(report.latest.is_none());
     assert!(update_java(&ctx).is_err());
+    assert!(!ctx.home.exists());
+}
+
+#[test]
+fn failed_javac_version_probe_is_unknown_not_not_installed() {
+    let _guard = reset_guard();
+    let (mut ctx, _dir) = fixture();
+    ctx.os = "linux".into();
+    ctx.arch = "x86_64".into();
+    set_which("javac", Some(PathBuf::from("/fixture/javac")));
+    set_run_output(
+        "/fixture/javac",
+        &["-version"],
+        output_with_status(1, b"", b"fixture probe failure"),
+    );
+    plan_metadata(&"a".repeat(64));
+
+    let report = check_java(&ctx).unwrap();
+
+    assert!(report.installed.is_none());
+    assert!(report.latest.is_some());
+    assert_eq!(report.status, Status::Unknown);
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|note| note.contains("could not be verified"))
+    );
+}
+
+#[test]
+fn rejects_untrusted_temurin_archive_host_before_download() {
+    let _guard = reset_guard();
+    let (mut ctx, _dir) = fixture();
+    ctx.os = "linux".into();
+    ctx.arch = "x86_64".into();
+    plan_metadata_with_link(&"a".repeat(64), "https://attacker.invalid/temurin.tar.gz");
+
+    let error = update_java(&ctx).unwrap_err();
+
+    assert!(error.to_string().contains("official HTTPS archive URL"));
+    assert!(!ctx.home.exists());
+}
+
+#[test]
+fn accepts_official_adoptium_binary_endpoint() {
+    let _guard = reset_guard();
+    let (mut ctx, _dir) = fixture();
+    ctx.os = "linux".into();
+    ctx.arch = "x86_64".into();
+    ctx.dry_run = true;
+    plan_metadata_with_link(
+        &"a".repeat(64),
+        "https://api.adoptium.net/v3/binary/latest/25/ga/linux/x64/jdk/hotspot/normal/eclipse",
+    );
+
+    update_java(&ctx).unwrap();
+
     assert!(!ctx.home.exists());
 }
 

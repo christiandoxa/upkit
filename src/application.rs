@@ -30,6 +30,25 @@ fn schedule_isolated_config(path: Option<&std::path::Path>, windows: bool) -> bo
     })
 }
 
+fn require_scheduled_artifact_cleanup_support(is_linux: bool) -> Result<()> {
+    if !is_linux {
+        bail!("scheduled artifact cleanup is supported only on Linux");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod scheduled_artifact_platform_tests {
+    use super::require_scheduled_artifact_cleanup_support;
+
+    #[test]
+    fn scheduled_artifact_cleanup_fails_closed_off_linux() {
+        let error = require_scheduled_artifact_cleanup_support(false).unwrap_err();
+        assert!(error.to_string().contains("supported only on Linux"));
+        assert!(require_scheduled_artifact_cleanup_support(true).is_ok());
+    }
+}
+
 /// Manage developer toolchains, workspace artifacts, and maintenance.
 #[derive(Parser, Debug)]
 #[command(name = "upkit")]
@@ -64,7 +83,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_progress: bool,
 
-    /// Disable network access (skip latest checks and downloads)
+    /// Skip Upkit network checks and downloads (external programs may use network)
     #[arg(long, global = true)]
     pub offline: bool,
 
@@ -348,6 +367,20 @@ pub enum SweepCommand {
         scope_token: String,
         #[arg(long)]
         authorize_scheduled_cleanup: bool,
+        #[arg(long)]
+        exclude: Vec<PathBuf>,
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
+    /// Run an explicitly approved scheduled artifact cleanup policy
+    #[command(hide = true)]
+    ScheduledCleanup {
+        #[arg(long)]
+        scope_token: String,
+        #[arg(long)]
+        authorize_scheduled_cleanup: bool,
+        #[arg(long)]
+        authorize_scheduled_artifact_cleanup: bool,
         #[arg(long)]
         exclude: Vec<PathBuf>,
         #[arg(required = true)]
@@ -1895,7 +1928,8 @@ pub fn main_with(cli: Cli) -> ExitCode {
                 },
         }) if interactive => None,
         Some(Commands::Sweep {
-            command: SweepCommand::ScheduledBytecodeCleanup { .. },
+            command:
+                SweepCommand::ScheduledBytecodeCleanup { .. } | SweepCommand::ScheduledCleanup { .. },
         }) => None,
         Some(Commands::Trash {
             command: TrashCommand::ScheduledRetention { .. },
@@ -1926,6 +1960,7 @@ pub fn main_with(cli: Cli) -> ExitCode {
             };
             Some((crate::tui::Start::Toolchains, selected))
         }
+        Some(Commands::SelfUpdate) if interactive => Some((crate::tui::Start::Toolchains, None)),
         Some(Commands::Tui) if interactive => Some((crate::tui::Start::Dashboard, None)),
         _ => None,
     };
@@ -2154,6 +2189,7 @@ pub fn main_with(cli: Cli) -> ExitCode {
                     _ => None,
                 },
                 managed_scope: managed_scope.clone(),
+                self_update_requested: matches!(&cli.cmd, Some(Commands::SelfUpdate)),
             },
         ) {
             Ok(()) => ExitCode::SUCCESS,
@@ -2984,8 +3020,12 @@ pub fn run(cli: &Cli, ctx: &mut Ctx) -> Result<()> {
                     info(
                         ctx,
                         format!(
-                            "{}  {}  {}  {}  target={}  duration={}ms",
-                            record.started_unix,
+                            "started={}  finished={}  {}  {}  {}  target={}  duration={}ms",
+                            crate::reports::format_timestamp(record.started_unix),
+                            record
+                                .finished_unix
+                                .map(crate::reports::format_timestamp)
+                                .unwrap_or_else(|| "unfinished".into()),
                             record.id,
                             record.operation,
                             record.outcome,
@@ -3992,7 +4032,7 @@ pub fn run(cli: &Cli, ctx: &mut Ctx) -> Result<()> {
                             "Names are a read-only snapshot; deletion dates and item actions are unavailable."
                         }
                         "windows" => {
-                            "Only the Recycle Bin item count is available; item-level actions are unsupported."
+                            "Recycle Bin sizes are estimates; item-level actions are unsupported."
                         }
                         _ => "Item-level Trash actions are unsupported on this platform.",
                     },
@@ -4931,7 +4971,8 @@ pub fn run(cli: &Cli, ctx: &mut Ctx) -> Result<()> {
                     &scope_token,
                     true,
                     &cancel,
-                )?
+                )
+                .map_err(|_| anyhow!("scheduled bytecode cleanup failed; details are redacted"))?
             } else {
                 let performed = crate::reports::perform_scheduled_cleanup(
                     &ctx.home,
@@ -4941,14 +4982,11 @@ pub fn run(cli: &Cli, ctx: &mut Ctx) -> Result<()> {
                     &scope_token,
                     &cancel,
                 );
-                history_warning = performed.history_warning;
-                performed.result.map_err(|error| {
-                    anyhow!(
-                        "{error}{}",
-                        history_warning
-                            .as_ref()
-                            .map_or(String::new(), |warning| format!("; {warning}"))
-                    )
+                history_warning = performed
+                    .history_warning
+                    .map(|_| "Local operation history may be incomplete; details are redacted.");
+                performed.result.map_err(|_| {
+                    anyhow!("scheduled bytecode cleanup failed; details are redacted")
                 })?
             };
             if cli.json {
@@ -4965,6 +5003,131 @@ pub fn run(cli: &Cli, ctx: &mut Ctx) -> Result<()> {
             }
             if !report.complete {
                 bail!("scheduled cleanup was incomplete; inspect the report and history");
+            }
+        }
+        Commands::Sweep {
+            command:
+                SweepCommand::ScheduledCleanup {
+                    paths,
+                    exclude,
+                    scope_token,
+                    authorize_scheduled_cleanup,
+                    authorize_scheduled_artifact_cleanup,
+                },
+        } => {
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (
+                    paths,
+                    exclude,
+                    scope_token,
+                    authorize_scheduled_cleanup,
+                    authorize_scheduled_artifact_cleanup,
+                );
+                return require_scheduled_artifact_cleanup_support(false);
+            }
+            #[cfg(target_os = "linux")]
+            {
+                require_scheduled_artifact_cleanup_support(true)?;
+                if !cli.non_interactive
+                    || !cli.offline
+                    || !ctx.yes
+                    || cli.config.as_deref() != Some(std::path::Path::new("/dev/null"))
+                    || cli.profile.is_some()
+                {
+                    bail!(
+                        "scheduled cleanup requires --non-interactive, --offline, --yes, --config /dev/null, and explicit authorization"
+                    );
+                }
+                let executable = env::current_exe()?.canonicalize()?;
+                let (bytecode, artifacts) = crate::schedule::scheduled_cleanup_modes(
+                    &executable,
+                    &paths,
+                    &exclude,
+                    &scope_token,
+                )?;
+                if !artifacts
+                    || bytecode != authorize_scheduled_cleanup
+                    || artifacts != authorize_scheduled_artifact_cleanup
+                {
+                    bail!("scheduled cleanup authorization does not match its policy token");
+                }
+                let cancel = std::sync::atomic::AtomicBool::new(false);
+                let mut artifact_report = if ctx.dry_run {
+                    crate::scheduled_cleanup::run_artifact_cleanup(
+                        &ctx.home,
+                        &executable,
+                        &paths,
+                        &exclude,
+                        &scope_token,
+                        true,
+                        &cancel,
+                    )?
+                } else {
+                    let performed = crate::reports::perform_scheduled_artifact_cleanup(
+                        &ctx.home,
+                        &executable,
+                        &paths,
+                        &exclude,
+                        &scope_token,
+                        &cancel,
+                    );
+                    performed.result.map_err(|_| {
+                        anyhow!("scheduled artifact cleanup failed; inspect the report and history")
+                    })?
+                };
+                let mut bytecode_report = None;
+                let mut bytecode_complete = true;
+                if artifact_report.continue_with_bytecode && bytecode {
+                    let report = if ctx.dry_run {
+                        crate::scheduled_cleanup::run(
+                            &ctx.home,
+                            &executable,
+                            &paths,
+                            &exclude,
+                            &scope_token,
+                            true,
+                            &cancel,
+                        )?
+                    } else {
+                        let performed = crate::reports::perform_scheduled_cleanup(
+                            &ctx.home,
+                            &executable,
+                            &paths,
+                            &exclude,
+                            &scope_token,
+                            &cancel,
+                        );
+                        performed.result.map_err(|_| {
+                            anyhow!(
+                                "scheduled bytecode cleanup failed; inspect the report and history"
+                            )
+                        })?
+                    };
+                    bytecode_complete = report.complete;
+                    bytecode_report =
+                        Some(crate::scheduled_cleanup::redacted_bytecode_report(&report));
+                }
+                let complete = artifact_report.complete && bytecode_complete;
+                if !artifact_report.continue_with_bytecode && bytecode {
+                    artifact_report.warnings.push(
+                        "Bytecode cleanup was not attempted because an artifact safety, history, or cancellation check did not complete.".into(),
+                    );
+                }
+                let output = serde_json::json!({
+                    "artifact_cleanup": artifact_report,
+                    "bytecode_cleanup": bytecode_report,
+                    "complete": complete,
+                    "dry_run": ctx.dry_run,
+                });
+                if cli.json {
+                    emit_json(ctx, output)?;
+                } else {
+                    info(ctx, serde_json::to_string_pretty(&output)?);
+                }
+                if !complete {
+                    bail!("scheduled cleanup was incomplete; inspect the report and history");
+                }
             }
         }
         Commands::Sweep {
@@ -5123,21 +5286,27 @@ pub fn run(cli: &Cli, ctx: &mut Ctx) -> Result<()> {
                     .map(|entry| {
                         serde_json::json!({
                             "label": entry.label,
-                            "dir": entry.dir.display().to_string(),
+                            "dir": crate::sweep::JsonPath(&entry.dir),
                             "configured": entry.configured,
                             "updated": entry.updated,
                         })
                     })
                     .collect::<Vec<_>>();
                 let payload = serde_json::json!({
-                    "home": ctx.home.display().to_string(),
-                    "bindir": ctx.bindir.display().to_string(),
+                    "home": crate::sweep::JsonPath(&ctx.home),
+                    "bindir": crate::sweep::JsonPath(&ctx.bindir),
                     "paths": paths,
                 });
                 emit_json(ctx, payload)?;
             } else {
-                info(ctx, format!("upkit home : {}", ctx.home.display()));
-                info(ctx, format!("upkit bindir: {}", ctx.bindir.display()));
+                info(
+                    ctx,
+                    format!("upkit home : {}", crate::sweep::display_path(&ctx.home)),
+                );
+                info(
+                    ctx,
+                    format!("upkit bindir: {}", crate::sweep::display_path(&ctx.bindir)),
+                );
                 if !ctx.dry_run {
                     info(ctx, "(created directories if missing)");
                 }
@@ -5153,7 +5322,11 @@ pub fn run(cli: &Cli, ctx: &mut Ctx) -> Result<()> {
                         } else {
                             "missing"
                         };
-                        let line = format!("- {status}: {} ({})", entry.label, entry.dir.display());
+                        let line = format!(
+                            "- {status}: {} ({})",
+                            entry.label,
+                            crate::sweep::display_path(&entry.dir)
+                        );
                         if entry.updated || entry.configured {
                             info(ctx, line);
                         } else {
@@ -5442,6 +5615,9 @@ fn run_guarded_clean(
             "managed cleanup preview changed or token does not match; review the complete selection again"
         );
     }
+    if !safety.preview {
+        preflight_managed_cleanup_batch(ctx, &targets, &plans, &cancel)?;
+    }
     let mut results = Vec::new();
     let mut failed = false;
     if !safety.preview {
@@ -5495,6 +5671,22 @@ fn run_guarded_clean(
     Ok(())
 }
 
+fn preflight_managed_cleanup_batch(
+    ctx: &Ctx,
+    targets: &[ToolKind],
+    plans: &[crate::managed_cleanup::CleanupPlan],
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
+    for (tool, plan) in targets.iter().zip(plans) {
+        let fresh = crate::managed_cleanup::preview_including_absent(ctx, *tool, cancel)?;
+        crate::managed_cleanup::validate_removal_plan(&fresh)?;
+        if fresh.preview_token != plan.preview_token {
+            bail!("managed paths changed after review; no cleanup was started");
+        }
+    }
+    Ok(())
+}
+
 fn revalidate_managed_absence(
     ctx: &Ctx,
     tool: ToolKind,
@@ -5515,7 +5707,7 @@ fn revalidate_managed_absence(
 mod managed_absence_revalidation_tests {
     use super::*;
     use crate::test_support::{TestPrompt, base_ctx};
-    use std::{fs, sync::Arc, sync::atomic::AtomicBool};
+    use std::{fs, os::unix::fs::PermissionsExt, sync::Arc, sync::atomic::AtomicBool};
 
     #[test]
     fn absent_target_is_rejected_if_it_appears_after_preview() {
@@ -5524,6 +5716,8 @@ mod managed_absence_revalidation_tests {
         let bindir = dir.path().join("bin");
         fs::create_dir(&home).unwrap();
         fs::create_dir(&bindir).unwrap();
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&bindir, fs::Permissions::from_mode(0o755)).unwrap();
         let ctx = base_ctx(home, bindir, Arc::new(TestPrompt::default()));
         let cancel = AtomicBool::new(false);
         let plan =
@@ -5545,6 +5739,25 @@ mod managed_absence_revalidation_tests {
             fs::read_to_string(root.join("appeared-after-preview")).unwrap(),
             "keep"
         );
+    }
+
+    #[test]
+    fn preflight_allows_a_shared_writable_target_with_no_eligible_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("managed");
+        let bindir = dir.path().join("bin");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&bindir).unwrap();
+        fs::set_permissions(&bindir, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o775)).unwrap();
+        let ctx = base_ctx(home, bindir, Arc::new(TestPrompt::default()));
+        let cancel = AtomicBool::new(false);
+        let plan =
+            crate::managed_cleanup::preview_including_absent(&ctx, ToolKind::Go, &cancel).unwrap();
+        assert!(plan.writable_by_others);
+        assert!(plan.selected_entries.is_empty() && plan.links.is_empty());
+
+        preflight_managed_cleanup_batch(&ctx, &[ToolKind::Go], &[plan], &cancel).unwrap();
     }
 }
 
@@ -5733,8 +5946,8 @@ pub fn ensure_dirs(ctx: &Ctx) -> Result<()> {
     if ctx.dry_run {
         return Ok(());
     }
-    fs::create_dir_all(&ctx.home)?;
-    fs::create_dir_all(&ctx.bindir)?;
+    crate::infrastructure::ensure_directory_tree(&ctx.home)?;
+    crate::infrastructure::ensure_directory_tree(&ctx.bindir)?;
     Ok(())
 }
 
@@ -6499,15 +6712,21 @@ pub(crate) fn diagnose_with_config(
     DoctorDiagnostics { issues, warnings }
 }
 
-pub fn run_self_update(ctx: &Ctx, json: bool) -> Result<()> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SelfUpdatePlan {
+    pub(crate) program: String,
+    pub(crate) program_path: PathBuf,
+    pub(crate) args: Vec<String>,
+    pub(crate) destination: PathBuf,
+    pub(crate) prompt: String,
+    pub(crate) description: String,
+    pub(crate) via: &'static str,
+    pub(crate) release_source: Option<OsString>,
+}
+
+pub(crate) fn self_update_plan(ctx: &Ctx) -> Result<SelfUpdatePlan> {
     if ctx.offline {
         bail!("offline mode enabled; self-update requires network access");
-    }
-    if json && !ctx.yes {
-        bail!("JSON mode requires --yes for self-update");
-    }
-    if !ctx.stdin_is_tty && !ctx.yes {
-        return Err(anyhow!("non-interactive mode: use --yes to proceed"));
     }
     let install_via_npm = matches!(get_env_var("UPKIT_INSTALLER").as_deref(), Some("npm"));
     let exe = env::current_exe().context("locate the running upkit binary")?;
@@ -6574,13 +6793,73 @@ pub fn run_self_update(ctx: &Ctx, json: bool) -> Result<()> {
             "github",
         )
     };
+    let program_path = which_or_none(&program)
+        .with_context(|| format!("{program} not found in PATH; reinstall manually"))?;
+    let release_source = if via == "github" {
+        env::var_os("UPKIT_RELEASE_BASE_URL").filter(|value| {
+            if ctx.os == "windows" {
+                !value.to_string_lossy().trim().is_empty()
+            } else {
+                !value.is_empty()
+            }
+        })
+    } else {
+        None
+    };
+    Ok(SelfUpdatePlan {
+        program,
+        program_path,
+        args,
+        destination: exe_dir.to_path_buf(),
+        prompt: prompt_text,
+        description: dry_run_text,
+        via,
+        release_source,
+    })
+}
+
+pub fn run_self_update(ctx: &Ctx, json: bool) -> Result<()> {
+    if ctx.offline {
+        bail!("offline mode enabled; self-update requires network access");
+    }
+    if json && !ctx.yes {
+        bail!("JSON mode requires --yes for self-update");
+    }
+    if !ctx.stdin_is_tty && !ctx.yes {
+        return Err(anyhow!("non-interactive mode: use --yes to proceed"));
+    }
+    let plan = self_update_plan(ctx)?;
     if !ctx.yes {
-        let ok = ctx.prompt.confirm(&prompt_text, false)?;
+        let ok = ctx.prompt.confirm(&plan.prompt, false)?;
         if !ok {
             info(ctx, "Canceled.");
             return Ok(());
         }
     }
+    execute_self_update(ctx, &plan, json, false)
+}
+
+pub(crate) fn run_approved_self_update(ctx: &Ctx, plan: &SelfUpdatePlan) -> Result<()> {
+    if &self_update_plan(ctx)? != plan {
+        bail!("self-update plan changed; review it again");
+    }
+    execute_self_update(ctx, plan, false, true)
+}
+
+fn execute_self_update(
+    ctx: &Ctx,
+    plan: &SelfUpdatePlan,
+    json: bool,
+    use_reviewed_program: bool,
+) -> Result<()> {
+    let SelfUpdatePlan {
+        program,
+        args,
+        destination,
+        description,
+        via,
+        ..
+    } = plan;
     if ctx.dry_run {
         if json {
             let payload = serde_json::json!({
@@ -6591,11 +6870,11 @@ pub fn run_self_update(ctx: &Ctx, json: bool) -> Result<()> {
             });
             emit_json(ctx, payload)?;
         } else {
-            info(ctx, format!("[dry-run] would run: {dry_run_text}"));
+            info(ctx, format!("[dry-run] would run: {description}"));
         }
         return Ok(());
     }
-    if via == "github" {
+    if *via == "github" {
         let windows = ctx.os == "windows";
         let installer = tempfile::tempdir()?;
         let installer_path =
@@ -6626,13 +6905,39 @@ pub fn run_self_update(ctx: &Ctx, json: bool) -> Result<()> {
             }
             .into(),
         );
-        args.push(exe_dir.as_os_str().to_owned());
+        args.push(destination.as_os_str().to_owned());
         args.push(if windows { "-Release" } else { "--release" }.into());
         args.push("latest".into());
-        run_capture(OsString::from(program), &args)
-            .map_err(|err| anyhow!("GitHub self-update failed: {err:#}"))?;
+        if use_reviewed_program {
+            let mut command = std::process::Command::new(&plan.program_path);
+            command.args(&args);
+            if let Some(source) = &plan.release_source {
+                command.env("UPKIT_RELEASE_BASE_URL", source);
+            } else {
+                command.env_remove("UPKIT_RELEASE_BASE_URL");
+            }
+            if windows {
+                command.env("UPKIT_NO_PATH_UPDATE", "1");
+            }
+            let output = command.output().context("start reviewed installer")?;
+            if !output.status.success() {
+                bail!(
+                    "GitHub self-update failed: installer exited with {}",
+                    output.status
+                );
+            }
+        } else {
+            run_capture(OsString::from(program), &args)
+                .map_err(|err| anyhow!("GitHub self-update failed: {err:#}"))?;
+        }
     } else {
-        let status = run_status(program, &args).context("failed to run self-update command")?;
+        let status = if use_reviewed_program {
+            let args = args.iter().map(OsString::from).collect::<Vec<_>>();
+            run_status(plan.program_path.as_os_str().to_owned(), &args)
+        } else {
+            run_status(program.clone(), args)
+        }
+        .context("failed to run self-update command")?;
         if !status.success() {
             bail!("self-update failed");
         }
@@ -6648,6 +6953,57 @@ pub fn run_self_update(ctx: &Ctx, json: bool) -> Result<()> {
         info(ctx, "upkit updated");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod self_update_review_tests {
+    use super::*;
+    use crate::test_support::{TestPrompt, base_ctx, reset_guard, set_env_var, set_which};
+    use std::sync::Arc;
+
+    #[test]
+    fn changed_self_update_plan_is_rejected_before_execution() {
+        let _guard = reset_guard();
+        let directory = tempfile::tempdir().unwrap();
+        let ctx = base_ctx(
+            directory.path().join("home"),
+            directory.path().join("bin"),
+            Arc::new(TestPrompt::default()),
+        );
+        set_env_var("UPKIT_INSTALLER", Some("npm".into()));
+        set_env_var("UPKIT_NPM_PACKAGE_NAME", Some("fixture-package".into()));
+        set_which("npm", Some(PathBuf::from("/fixture/bin/npm")));
+        let plan = self_update_plan(&ctx).unwrap();
+        set_env_var("UPKIT_NPM_PACKAGE_NAME", Some("other-package".into()));
+        let error = run_approved_self_update(&ctx, &plan).unwrap_err();
+        assert!(error.to_string().contains("plan changed"));
+        set_env_var("UPKIT_NPM_PACKAGE_NAME", Some("fixture-package".into()));
+        set_which("npm", Some(PathBuf::from("/fixture/other/npm")));
+        let error = run_approved_self_update(&ctx, &plan).unwrap_err();
+        assert!(error.to_string().contains("plan changed"));
+    }
+
+    #[test]
+    fn changed_release_source_invalidates_a_reviewed_plan() {
+        let _guard = reset_guard();
+        let directory = tempfile::tempdir().unwrap();
+        let mut ctx = base_ctx(
+            directory.path().join("home"),
+            directory.path().join("bin"),
+            Arc::new(TestPrompt::default()),
+        );
+        ctx.os = "linux".into();
+        set_env_var("UPKIT_INSTALLER", Some("standalone".into()));
+        set_which("sh", Some(PathBuf::from("/fixture/bin/sh")));
+        let mut plan = self_update_plan(&ctx).unwrap();
+        plan.release_source = if plan.release_source.is_some() {
+            None
+        } else {
+            Some("/fixture/other-release".into())
+        };
+        let error = run_approved_self_update(&ctx, &plan).unwrap_err();
+        assert!(error.to_string().contains("plan changed"));
+    }
 }
 
 pub fn run_version(ctx: &Ctx, json: bool) -> Result<()> {

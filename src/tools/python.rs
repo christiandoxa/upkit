@@ -9,8 +9,8 @@ use std::{
 };
 
 use crate::{
-    Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, download_to_temp, home_dir,
-    http_get_json, http_get_text, info, keep_latest_version, link_managed_tool_bins,
+    Ctx, Status, ToolKind, ToolReport, UpdateMethod, Version, download_to_temp, get_env_var,
+    home_dir, http_get_json, http_get_text, info, keep_latest_version, link_managed_tool_bins,
     maybe_path_hint_for_dir, prune_tool_versions, run_capture, run_output, sha256_file, warn,
     which_or_none,
 };
@@ -29,8 +29,7 @@ pub struct GhAsset {
 }
 
 const PIP_GLOBALS_SNAPSHOT: &str = "pip-globals.txt";
-const PYTHON_ASSET_VERSION_RE: &str =
-    r"^cpython-(\d+)\.(\d+)\.(\d+)([A-Za-z][0-9A-Za-z.-]*)?(?:\+[^-]+)?-[A-Za-z0-9_+-]+\.tar\.zst$";
+const PYTHON_ASSET_VERSION_RE: &str = r"^cpython-(\d+)\.(\d+)\.(\d+)([A-Za-z][0-9A-Za-z.-]*)?(?:\+[^-]+)?-[A-Za-z0-9_+-]+\.(?:tar\.zst|tar\.gz)$";
 const PYTHON_RELEASES_LATEST_URL: &str =
     "https://github.com/astral-sh/python-build-standalone/releases/latest";
 const PYTHON_RELEASES_API_URL: &str =
@@ -68,7 +67,7 @@ pub fn check_python(ctx: &Ctx) -> Result<ToolReport> {
     });
 
     let mut notes = vec![
-        "Uses astral-sh/python-build-standalone assets (.tar.zst).".into(),
+        "Uses astral-sh/python-build-standalone assets (.tar.gz or .tar.zst).".into(),
         "Archive installation requires a SHA-256 digest from GitHub release metadata.".into(),
     ];
     if ctx.os == "windows" {
@@ -77,6 +76,14 @@ pub fn check_python(ctx: &Ctx) -> Result<ToolReport> {
         );
         notes.push("Windows installation requires permission to create symbolic links.".into());
     }
+    let version_unverified = executable_found && installed.is_none();
+    if ctx.dry_run && executable_found {
+        notes.push(
+            "Dry-run found a Python executable; its version was not checked and is unknown.".into(),
+        );
+    } else if version_unverified {
+        notes.push("A Python executable was found, but its version could not be verified.".into());
+    }
     let latest = match python_latest(ctx) {
         Ok(version) => Some(version),
         Err(err) => {
@@ -84,17 +91,11 @@ pub fn check_python(ctx: &Ctx) -> Result<ToolReport> {
             None
         }
     };
-    let status = if ctx.dry_run && executable_found {
+    let status = if version_unverified {
         Status::Unknown
     } else {
         Status::from_versions(installed.as_ref(), latest.as_ref())
     };
-    if ctx.dry_run && executable_found {
-        notes.push(
-            "Dry-run found a Python executable; its version was not checked and is unknown.".into(),
-        );
-    }
-
     Ok(ToolReport {
         tool: ToolKind::Python,
         installed,
@@ -130,7 +131,7 @@ pub fn python_latest(ctx: &Ctx) -> Result<Version> {
 
     let mut best: Option<Version> = None;
     for a in &rel.assets {
-        if !a.name.ends_with(".tar.zst") {
+        if !python_asset_supported(&a.name) {
             continue;
         }
         if !python_asset_target_matches(&a.name, target) {
@@ -161,9 +162,9 @@ pub fn python_pick_asset(ctx: &Ctx, want: &Version) -> Result<GhAsset> {
         .assets
         .into_iter()
         .filter(|a| {
-            python_asset_matches(&re, &a.name, want)
+            python_asset_supported(&a.name)
+                && python_asset_matches(&re, &a.name, want)
                 && python_asset_target_matches(&a.name, target)
-                && a.name.ends_with(".tar.zst")
         })
         .collect::<Vec<_>>();
 
@@ -196,7 +197,12 @@ fn python_asset_target_matches(name: &str, target: &str) -> bool {
     name.strip_prefix("cpython-")
         .and_then(|name| name.split_once('-'))
         .and_then(|(_, suffix)| suffix.strip_prefix(target))
-        .is_some_and(|suffix| suffix.starts_with('-') || suffix == ".tar.zst")
+        .is_some_and(|suffix| suffix.starts_with('-') || matches!(suffix, ".tar.gz" | ".tar.zst"))
+}
+
+fn python_asset_supported(name: &str) -> bool {
+    // Upkit's Python toolchain uses the standard GIL ABI.
+    (name.ends_with(".tar.zst") || name.ends_with(".tar.gz")) && !name.contains("freethreaded")
 }
 
 fn python_asset_priority(name: &str) -> u8 {
@@ -242,7 +248,7 @@ fn python_release_assets_from_html(ctx: &Ctx) -> Result<GhRelease> {
     );
     let assets_page = http_get_text(ctx, &assets_url)?;
     let asset_re = Regex::new(
-        r#"/astral-sh/python-build-standalone/releases/download/([0-9A-Za-z._+-]+)/([^"<>]+\.tar\.zst)"#,
+        r#"/astral-sh/python-build-standalone/releases/download/([0-9A-Za-z._+-]+)/([^"<>]+\.(?:tar\.zst|tar\.gz))"#,
     )?;
     let mut assets = Vec::new();
     for captures in asset_re.captures_iter(&assets_page) {
@@ -326,7 +332,11 @@ pub fn update_python(ctx: &Ctx) -> Result<()> {
     let stage = crate::infrastructure::new_install_stage(&tool_root)?;
 
     // python-build-standalone archives are prefixed with "python/".
-    super::archive::unpack_tar_zst(tmp.path(), stage.path(), 1)?;
+    if asset.name.ends_with(".tar.gz") {
+        super::archive::unpack_tar_gz(tmp.path(), stage.path(), 1)?;
+    } else {
+        super::archive::unpack_tar_zst(tmp.path(), stage.path(), 1)?;
+    }
 
     if !fs::symlink_metadata(stage.path().join("python"))
         .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
@@ -339,7 +349,11 @@ pub fn update_python(ctx: &Ctx) -> Result<()> {
     let active = tool_root.join("active");
     let stage_python = stage.path().join("python");
     let subdir = if ctx.os == "windows" {
-        "install"
+        if stage_python.join("install/python.exe").is_file() {
+            "install"
+        } else {
+            ""
+        }
     } else if stage_python.join("install/bin").exists() {
         "install/bin"
     } else {
@@ -391,7 +405,7 @@ pub fn update_python(ctx: &Ctx) -> Result<()> {
     let extracted = ver_dir.join("python");
     crate::infrastructure::activate_managed_install(ctx, &tool_root, &extracted, ToolKind::Python)?;
 
-    // Link python + pip (the best effort; python-build-standalone uses install/bin).
+    // Link the launchers from the selected archive layout.
     let bin = active.join(subdir);
     link_managed_tool_bins(
         ctx,
@@ -496,6 +510,9 @@ fn write_pip_globals_snapshot(tool_root: &Path, packages: &[String]) -> Result<(
 }
 
 fn maybe_hint_python_bins(ctx: &Ctx, active: &Path) {
+    if get_env_var("UPKIT_NO_PATH_UPDATE").as_deref() == Some("1") {
+        return;
+    }
     let user_base = python_user_base(active).or_else(default_python_user_base);
     if let Some(base) = user_base {
         maybe_path_hint_for_dir(ctx, &base.join("bin"), "python user base bin");
@@ -505,6 +522,7 @@ fn maybe_hint_python_bins(ctx: &Ctx, active: &Path) {
 fn python_user_base(active: &Path) -> Option<PathBuf> {
     let python = python_executable(active)?;
     let args = [
+        OsStr::new("-B"),
         OsStr::new("-m"),
         OsStr::new("site"),
         OsStr::new("--user-base"),
@@ -542,6 +560,57 @@ fn python_executable(active: &Path) -> Option<PathBuf> {
     .iter()
     .map(|path| active.join(path))
     .find(|path| path.exists())
+}
+
+#[cfg(test)]
+mod user_base_probe_tests {
+    use super::*;
+    use crate::test_support::{
+        TestPrompt, base_ctx, output_with_status, reset_guard, set_env_var, set_run_output,
+        take_run_output,
+    };
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    #[test]
+    fn user_base_probe_disables_bytecode_and_respects_no_path_update() {
+        let _guard = reset_guard();
+        set_env_var("UPKIT_NO_PATH_UPDATE", None);
+        let dir = tempdir().unwrap();
+        let active = dir.path().join("active");
+        let python = active.join("install/bin/python3");
+        fs::create_dir_all(python.parent().unwrap()).unwrap();
+        fs::write(&python, b"fixture").unwrap();
+        let mut ctx = base_ctx(
+            dir.path().join("home"),
+            dir.path().join("bin"),
+            Arc::new(TestPrompt::default()),
+        );
+        ctx.quiet = true;
+
+        let args = ["-B", "-m", "site", "--user-base"];
+        let args_owned = args
+            .iter()
+            .map(|arg| (*arg).to_string())
+            .collect::<Vec<_>>();
+        let program = python.to_string_lossy().into_owned();
+        set_run_output(
+            &program,
+            &args,
+            output_with_status(0, b"/opt/python-user-base", b""),
+        );
+        maybe_hint_python_bins(&ctx, &active);
+        assert!(take_run_output(&program, &args_owned).is_none());
+
+        set_env_var("UPKIT_NO_PATH_UPDATE", Some("1".into()));
+        set_run_output(
+            &program,
+            &args,
+            output_with_status(0, b"/opt/python-user-base", b""),
+        );
+        maybe_hint_python_bins(&ctx, &active);
+        assert!(take_run_output(&program, &args_owned).is_some());
+    }
 }
 
 pub fn pip_global_packages(active: &Path) -> Result<Vec<String>> {

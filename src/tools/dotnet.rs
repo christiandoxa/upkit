@@ -62,6 +62,12 @@ struct Selected {
     asset: Asset,
 }
 
+enum InstalledSdk {
+    HostMissing,
+    Unknown,
+    Version(Version),
+}
+
 fn stable_version(value: &str) -> Option<Version> {
     let mut parts = value.split('.');
     let mut number = || {
@@ -150,10 +156,19 @@ fn release(ctx: &Ctx) -> Result<Selected> {
     if url.scheme() != "https"
         || !url.username().is_empty()
         || url.password().is_some()
+        || url.port().is_some_and(|port| port != 443)
+        || !matches!(
+            url.host_str(),
+            Some(
+                "builds.dotnet.microsoft.com"
+                    | "download.visualstudio.microsoft.com"
+                    | "dotnetcli.azureedge.net"
+            )
+        )
         || asset.hash.len() != 128
         || !asset.hash.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
-        bail!(".NET metadata lacks a valid HTTPS URL or SHA-512 hash");
+        bail!(".NET metadata lacks an official HTTPS archive URL or valid SHA-512 hash");
     }
     Ok(Selected {
         version,
@@ -162,36 +177,110 @@ fn release(ctx: &Ctx) -> Result<Selected> {
     })
 }
 
-fn installed(ctx: &Ctx) -> Option<Version> {
+fn installed(ctx: &Ctx) -> InstalledSdk {
     let managed = ctx.bindir.join(if ctx.os == "windows" {
         "dotnet.exe"
     } else {
         "dotnet"
     });
     let executable = if managed.is_file() {
-        managed
+        Some(managed)
     } else {
-        which_or_none("dotnet")?
+        which_or_none("dotnet")
     };
-    let resolved = executable.canonicalize().ok()?;
-    let sdk_dir = resolved.parent()?.join("sdk");
-    fs::read_dir(sdk_dir)
-        .ok()?
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            if !entry.path().is_dir() {
-                return None;
+    let Some(executable) = executable else {
+        return InstalledSdk::HostMissing;
+    };
+    let Ok(resolved) = executable.canonicalize() else {
+        return InstalledSdk::Unknown;
+    };
+    let Some(root) = resolved.parent() else {
+        return InstalledSdk::Unknown;
+    };
+    let sdk_dir = root.join("sdk");
+    let entries = match fs::read_dir(sdk_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return InstalledSdk::Unknown,
+        Err(_) => return InstalledSdk::Unknown,
+    };
+
+    let mut best: Option<Version> = None;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return InstalledSdk::Unknown;
+        };
+        let filename = entry.file_name();
+        let Some(version) = filename.to_str().and_then(stable_version) else {
+            continue;
+        };
+        let sdk_path = entry.path();
+        // A version-named directory link could make an older SDK appear current.
+        let is_directory = match fs::symlink_metadata(&sdk_path) {
+            Ok(metadata) => {
+                #[cfg(windows)]
+                let is_reparse_point = {
+                    use std::os::windows::fs::MetadataExt;
+                    metadata.file_attributes() & 0x400 != 0
+                };
+                #[cfg(not(windows))]
+                let is_reparse_point = false;
+                metadata.is_dir() && !metadata.file_type().is_symlink() && !is_reparse_point
             }
-            stable_version(entry.file_name().to_str()?)
-        })
-        .max()
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return InstalledSdk::Unknown,
+        };
+        if !is_directory {
+            continue;
+        }
+        let sdk_root = match sdk_path.canonicalize() {
+            Ok(path) if path.starts_with(root) && path != root => path,
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return InstalledSdk::Unknown,
+        };
+        let sdk_dll = match sdk_path.join("dotnet.dll").canonicalize() {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return InstalledSdk::Unknown,
+        };
+        let metadata = match fs::metadata(&sdk_dll) {
+            Ok(metadata) => metadata,
+            Err(_) => return InstalledSdk::Unknown,
+        };
+        if !sdk_dll.starts_with(&sdk_root) || !metadata.is_file() || metadata.len() == 0 {
+            continue;
+        }
+        best = Some(match best {
+            Some(current) => current.max(version),
+            None => version,
+        });
+    }
+
+    match best {
+        Some(version) => InstalledSdk::Version(version),
+        None => InstalledSdk::Unknown,
+    }
 }
 
 pub fn check_dotnet(ctx: &Ctx) -> Result<ToolReport> {
     let installed = installed(ctx);
+    let installed_version = match &installed {
+        InstalledSdk::Version(version) => Some(version),
+        _ => None,
+    };
     let latest = release(ctx).ok().map(|release| release.version);
-    let status = Status::from_versions(installed.as_ref(), latest.as_ref());
+    let status = if matches!(&installed, InstalledSdk::Unknown) {
+        Status::Unknown
+    } else {
+        Status::from_versions(installed_version, latest.as_ref())
+    };
     let mut notes = vec!["Targets the latest supported Microsoft .NET LTS SDK. Installed versions are inferred from SDK directories without running dotnet; DOTNET_ROOT is not changed.".into()];
+    if matches!(&installed, InstalledSdk::Unknown) {
+        notes.push(
+            "A dotnet host was found, but no complete stable SDK directory could be confirmed beside it; the layout may be incomplete, the SDK may be stored elsewhere, or only prerelease SDKs may be present.".into(),
+        );
+    }
+    notes.push("SDK detection checks layout and a nonempty dotnet.dll file; it does not verify SDK integrity.".into());
     if ctx.os == "windows" {
         notes.push("Windows installation requires permission to create symbolic links.".into());
     }
@@ -200,7 +289,7 @@ pub fn check_dotnet(ctx: &Ctx) -> Result<ToolReport> {
     }
     Ok(ToolReport {
         tool: ToolKind::Dotnet,
-        installed,
+        installed: installed_version.cloned(),
         latest,
         status,
         method: UpdateMethod::DirectDownload,
@@ -228,7 +317,9 @@ pub fn update_dotnet(ctx: &Ctx) -> Result<()> {
     }
     rid(ctx)?;
     let selected = release(ctx)?;
-    if installed(ctx).is_some_and(|version| version >= selected.version) && !ctx.force {
+    if matches!(installed(ctx), InstalledSdk::Version(version) if version >= selected.version)
+        && !ctx.force
+    {
         info(
             ctx,
             format!(".NET SDK is up-to-date ({})", selected.version),

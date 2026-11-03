@@ -343,14 +343,29 @@ fn timer_unavailable(detail: &str) -> TimerStatus {
 }
 
 fn parse_timer(output: &str) -> TimerStatus {
-    let fields: BTreeMap<_, _> = output
-        .lines()
-        .filter_map(|line| line.split_once('='))
-        .collect();
-    let Some(load) = fields.get("LoadState").copied() else {
+    let mut fields = BTreeMap::new();
+    for line in output.lines().filter(|line| !line.is_empty()) {
+        let Some((key, value)) = line.split_once('=') else {
+            return timer_unavailable("systemd returned a malformed property");
+        };
+        if key.is_empty() || fields.insert(key, value).is_some() {
+            return timer_unavailable("systemd returned an empty or duplicate property");
+        }
+    }
+    let Some(load) = fields
+        .get("LoadState")
+        .copied()
+        .filter(|value| !value.is_empty())
+    else {
         return timer_unavailable("systemd did not return a load state");
     };
     if load == "not-found" {
+        if fields
+            .get("ActiveState")
+            .is_some_and(|state| *state != "inactive")
+        {
+            return timer_unavailable("systemd returned inconsistent timer states");
+        }
         return TimerStatus {
             state: "not_found".into(),
             load_state: Some(load.into()),
@@ -360,7 +375,11 @@ fn parse_timer(output: &str) -> TimerStatus {
             detail: None,
         };
     }
-    let Some(active) = fields.get("ActiveState").copied() else {
+    let Some(active) = fields
+        .get("ActiveState")
+        .copied()
+        .filter(|value| !value.is_empty())
+    else {
         return timer_unavailable("systemd did not return an active state");
     };
     let value = |key| {
@@ -484,7 +503,11 @@ pub fn trim_status_with_dry_run(dry_run: bool) -> TrimStatus {
         {
             windows_trim_status(dry_run)
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "macos")]
+        {
+            macos_trim_status(dry_run)
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
             TrimStatus {
                 platform: std::env::consts::OS.into(),
@@ -499,6 +522,162 @@ pub fn trim_status_with_dry_run(dry_run: bool) -> TrimStatus {
             }
         }
     }
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_trim_status_with(
+    dry_run: bool,
+    inventory: impl FnOnce() -> (Vec<MountStatus>, bool),
+) -> TrimStatus {
+    let (capability, guidance, mounts_warning, mounts) = if dry_run {
+        (
+            "dry-run: filesystem inventory skipped; device TRIM support, execution, and scheduling are unverified.".into(),
+            "Upkit does not issue manual TRIM or change macOS storage settings.",
+            "Dry-run skipped filesystem inventory; device support, execution, and scheduling are unverified.".into(),
+            Vec::new(),
+        )
+    } else {
+        let (mounts, incomplete) = inventory();
+        let root = mounts
+            .iter()
+            .find(|mount| mount.mount_path == Path::new("/"));
+        let (capability, mut mounts_warning): (String, String) = match root
+            .map(|mount| mount.filesystem.as_str())
+        {
+            Some(filesystem) if filesystem != "unknown" => (
+                format!("unknown: root filesystem is {filesystem}; device TRIM support, execution, and scheduling are unverified."),
+        "Only the root and direct child mount points under /Volumes with a different device identity are listed. This is not a complete macOS mount table; other mount paths may be omitted. Device TRIM support, execution, and scheduling are unverified.".into(),
+            ),
+            Some(_) | None => (
+                "unknown: root filesystem type could not be inspected; device TRIM support, execution, and scheduling are unverified.".into(),
+            "The root mount could not be fully inspected. Only direct child mount points under /Volumes with a different device identity are listed; this is not a complete macOS mount table. Device TRIM support, execution, and scheduling are unverified.".into(),
+            ),
+        };
+        if incomplete {
+            mounts_warning.push_str(" Some /Volumes entries could not be inspected.");
+        }
+        (
+            capability,
+            "Upkit does not issue manual TRIM or change macOS storage settings.",
+            mounts_warning,
+            mounts,
+        )
+    };
+    TrimStatus {
+        platform: "macos".into(),
+        fstrim_available: false,
+        capability,
+        timer: timer_unavailable("Upkit does not inspect macOS background storage scheduling"),
+        guidance,
+        mounts,
+        mounts_warning: Some(mounts_warning),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_trim_status(dry_run: bool) -> TrimStatus {
+    macos_trim_status_with(dry_run, macos_mount_inventory)
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn macos_volume_mount_paths_with(
+    volumes: &Path,
+    mut device_id: impl FnMut(&Path) -> Option<u64>,
+) -> (Vec<std::path::PathBuf>, bool) {
+    let Ok(metadata) = std::fs::symlink_metadata(volumes) else {
+        return (Vec::new(), true);
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return (Vec::new(), true);
+    }
+    let Some(parent_device) = device_id(volumes) else {
+        return (Vec::new(), true);
+    };
+    let Ok(entries) = std::fs::read_dir(volumes) else {
+        return (Vec::new(), true);
+    };
+    let mut mounts = Vec::new();
+    let mut incomplete = false;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            incomplete = true;
+            continue;
+        };
+        let path = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            incomplete = true;
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        match device_id(&path) {
+            Some(device) if device != parent_device => mounts.push(path),
+            Some(_) => {}
+            None => incomplete = true,
+        }
+    }
+    mounts.sort();
+    mounts.dedup();
+    (mounts, incomplete)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_mount_inventory() -> (Vec<MountStatus>, bool) {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut mounts = vec![macos_mount_status(Path::new("/"))];
+    let (paths, incomplete) = macos_volume_mount_paths_with(Path::new("/Volumes"), |path| {
+        std::fs::symlink_metadata(path)
+            .ok()
+            .map(|metadata| metadata.dev())
+    });
+    mounts.extend(paths.iter().map(|path| macos_mount_status(path)));
+    mounts.sort_by(|left, right| left.mount_point.cmp(&right.mount_point));
+    (mounts, incomplete)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_mount_status(mount_path: &Path) -> MountStatus {
+    let filesystem = rustix::fs::statfs(mount_path)
+        .ok()
+        .and_then(|info| {
+            let bytes = info
+                .f_fstypename
+                .iter()
+                .map(|byte| *byte as u8)
+                .take_while(|byte| *byte != 0)
+                .collect::<Vec<_>>();
+            macos_filesystem_name(&bytes)
+        })
+        .unwrap_or_else(|| "unknown".into());
+    MountStatus {
+        mount_point: display_mount_path(mount_path),
+        mount_path: mount_path.to_path_buf(),
+        filesystem,
+        device: "not inspected".into(),
+        discard_max_bytes: None,
+        available_bytes: available_space(mount_path),
+        device_discard: "unknown",
+        filesystem_trim: "unknown: TRIM support and permissions not tested",
+        fstab_trim_exclusion: "unknown",
+        online_discard_option: "unknown",
+    }
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_filesystem_name(bytes: &[u8]) -> Option<String> {
+    let name = bytes.split(|byte| *byte == 0).next()?;
+    let name = std::str::from_utf8(name).ok()?;
+    if name.is_empty()
+        || name.len() > 15
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return None;
+    }
+    Some(name.to_ascii_lowercase())
 }
 
 #[cfg(any(test, target_os = "windows"))]
@@ -520,21 +699,161 @@ fn windows_trim_notification_status_with(
 
 #[cfg(target_os = "windows")]
 fn windows_trim_status(dry_run: bool) -> TrimStatus {
-    let capability = windows_trim_notification_status_with(dry_run, || {
-        let executable = windows_fsutil_executable()?;
-        query_fsutil_with(&executable)
-    });
+    windows_trim_status_with(
+        dry_run,
+        || {
+            let executable = windows_fsutil_executable()?;
+            query_fsutil_with(&executable)
+        },
+        windows_fixed_mounts,
+    )
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn windows_trim_status_with(
+    dry_run: bool,
+    query: impl FnOnce() -> Option<String>,
+    mount_query: impl FnOnce() -> (Vec<MountStatus>, bool),
+) -> TrimStatus {
+    let capability = windows_trim_notification_status_with(dry_run, query);
+    let (mounts, inventory_incomplete) = if dry_run {
+        (Vec::new(), false)
+    } else {
+        mount_query()
+    };
+    let mut mounts_warning = if dry_run {
+        "Dry-run skipped volume inventory; per-volume and storage-device TRIM support are not inspected.".to_owned()
+    } else {
+        "Only fixed volumes with drive letters are listed; mounted-folder volumes, removable drives, and network drives are omitted. Available space is the amount available to this user. Per-volume and storage-device TRIM support are not inspected.".to_owned()
+    };
+    if inventory_incomplete {
+        mounts_warning.push_str(" Some fixed-volume details could not be read.");
+    }
     TrimStatus {
         platform: std::env::consts::OS.into(),
         fstrim_available: false,
         capability,
         timer: timer_unavailable("systemd timer status is only available on Linux"),
         guidance: "fsutil reports Windows filesystem delete-notification settings, not SSD or storage-device TRIM support. Upkit does not run manual TRIM on Windows.",
-        mounts: Vec::new(),
-        mounts_warning: Some(
-            "per-volume and storage-device TRIM support were not inspected".into(),
-        ),
+        mounts,
+        mounts_warning: Some(mounts_warning),
     }
+}
+
+#[cfg(any(test, target_os = "windows"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowsDriveKind {
+    Fixed,
+    Other,
+    Unknown,
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn windows_drive_root(value: &str) -> Option<(usize, String)> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 3
+        || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':'
+        || !matches!(bytes[2], b'\\' | b'/')
+    {
+        return None;
+    }
+    let letter = bytes[0].to_ascii_uppercase();
+    Some((
+        usize::from(letter - b'A'),
+        format!("{}:\\", char::from(letter)),
+    ))
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn windows_filesystem_name(value: &str) -> Option<String> {
+    if value.is_empty()
+        || value.len() > 32
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return None;
+    }
+    Some(value.to_ascii_lowercase())
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn windows_fixed_mounts_with(
+    roots: Option<Vec<String>>,
+    mut drive_kind: impl FnMut(&str) -> Option<WindowsDriveKind>,
+    mut filesystem: impl FnMut(&str) -> Option<String>,
+    mut available: impl FnMut(&str) -> Option<u64>,
+) -> (Vec<MountStatus>, bool) {
+    let Some(roots) = roots else {
+        return (Vec::new(), true);
+    };
+    let mut mounts = Vec::new();
+    let mut incomplete = roots.len() > 26;
+    let mut seen = std::collections::BTreeSet::new();
+    for root in roots.into_iter().take(26) {
+        let Some((index, root)) = windows_drive_root(&root) else {
+            incomplete = true;
+            continue;
+        };
+        if !seen.insert(index) {
+            continue;
+        }
+        match drive_kind(&root) {
+            Some(WindowsDriveKind::Fixed) => {}
+            Some(WindowsDriveKind::Other) => continue,
+            Some(WindowsDriveKind::Unknown) | None => {
+                incomplete = true;
+                continue;
+            }
+        }
+        let filesystem = filesystem(&root)
+            .as_deref()
+            .and_then(windows_filesystem_name)
+            .unwrap_or_else(|| {
+                incomplete = true;
+                "unknown".into()
+            });
+        let available_bytes = available(&root).or_else(|| {
+            incomplete = true;
+            None
+        });
+        mounts.push(MountStatus {
+            mount_point: root.clone(),
+            mount_path: std::path::PathBuf::from(&root),
+            filesystem,
+            device: "not inspected".into(),
+            discard_max_bytes: None,
+            available_bytes,
+            device_discard: "unknown",
+            filesystem_trim: "unknown: TRIM support and permissions not tested",
+            fstab_trim_exclusion: "not applicable",
+            online_discard_option: "unknown",
+        });
+    }
+    (mounts, incomplete)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_fixed_mounts() -> (Vec<MountStatus>, bool) {
+    let roots = winsafe::GetLogicalDriveStrings().ok();
+    windows_fixed_mounts_with(
+        roots,
+        |root| match winsafe::GetDriveType(Some(root)) {
+            winsafe::co::DRIVE::FIXED => Some(WindowsDriveKind::Fixed),
+            winsafe::co::DRIVE::UNKNOWN | winsafe::co::DRIVE::NO_ROOT_DIR => {
+                Some(WindowsDriveKind::Unknown)
+            }
+            _ => Some(WindowsDriveKind::Other),
+        },
+        |root| {
+            let mut name = String::new();
+            winsafe::GetVolumeInformation(Some(root), None, None, None, None, Some(&mut name))
+                .ok()?;
+            Some(name)
+        },
+        |root| available_space(Path::new(root)),
+    )
 }
 
 #[cfg(any(test, target_os = "windows"))]
@@ -551,25 +870,47 @@ fn parse_windows_trim_notification_status(output: &str) -> String {
     let mut ntfs = None;
     let mut refs = None;
     for line in output.lines() {
-        let line = line.trim();
-        let lower = line.to_ascii_lowercase();
-        let (state, value) = if lower.starts_with("ntfs disabledeletenotify") {
-            (&mut ntfs, line)
-        } else if lower.starts_with("refs disabledeletenotify") {
-            (&mut refs, line)
+        let mut fields = line.split_whitespace();
+        let Some(filesystem) = fields.next() else {
+            continue;
+        };
+        let Some(setting) = fields.next() else {
+            continue;
+        };
+        let state = if filesystem.eq_ignore_ascii_case("NTFS")
+            && setting.eq_ignore_ascii_case("DisableDeleteNotify")
+        {
+            &mut ntfs
+        } else if filesystem.eq_ignore_ascii_case("ReFS")
+            && setting.eq_ignore_ascii_case("DisableDeleteNotify")
+        {
+            &mut refs
         } else {
             continue;
         };
-        let value = if lower.contains("is not currently set") {
-            "not explicitly set"
-        } else if let Some((_, value)) = value.split_once('=') {
-            match value.split_whitespace().next() {
-                Some("0") => "enabled",
-                Some("1") => "disabled",
-                _ => "unknown",
+        let remaining = fields.collect::<Vec<_>>();
+        let value = match remaining.as_slice() {
+            [is, not, currently, set]
+                if is.eq_ignore_ascii_case("is")
+                    && not.eq_ignore_ascii_case("not")
+                    && currently.eq_ignore_ascii_case("currently")
+                    && set.eq_ignore_ascii_case("set") =>
+            {
+                "not explicitly set"
             }
-        } else {
-            "unknown"
+            [equals, value] if *equals == "=" => match *value {
+                "0" => "enabled",
+                "1" => "disabled",
+                _ => "unknown",
+            },
+            [equals, value, label]
+                if *equals == "="
+                    && ((*value == "0" && label.eq_ignore_ascii_case("(Disabled)"))
+                        || (*value == "1" && label.eq_ignore_ascii_case("(Enabled)"))) =>
+            {
+                if *value == "0" { "enabled" } else { "disabled" }
+            }
+            _ => "unknown",
         };
         record(state, value);
     }
@@ -767,6 +1108,154 @@ mod tests {
     use super::*;
 
     #[test]
+    fn macos_trim_status_reports_root_mount_space_without_claiming_trim_support() {
+        fn mount(path: &str, filesystem: &str, available_bytes: Option<u64>) -> MountStatus {
+            MountStatus {
+                mount_point: path.into(),
+                mount_path: Path::new(path).to_path_buf(),
+                filesystem: filesystem.into(),
+                device: "not inspected".into(),
+                discard_max_bytes: None,
+                available_bytes,
+                device_discard: "unknown",
+                filesystem_trim: "unknown: TRIM support and permissions not tested",
+                fstab_trim_exclusion: "unknown",
+                online_discard_option: "unknown",
+            }
+        }
+
+        let apfs = macos_trim_status_with(false, || {
+            (
+                vec![
+                    mount("/", "apfs", Some(1234)),
+                    mount("/Volumes/External", "exfat", Some(5678)),
+                ],
+                false,
+            )
+        });
+        assert!(
+            apfs.capability
+                .starts_with("unknown: root filesystem is apfs")
+        );
+        assert!(
+            apfs.capability
+                .contains("device TRIM support, execution, and scheduling are unverified")
+        );
+        assert_eq!(apfs.platform, "macos");
+        assert_eq!(apfs.timer.state, "unavailable");
+        assert!(!apfs.fstrim_available);
+        assert_eq!(apfs.mounts.len(), 2);
+        assert_eq!(apfs.mounts[0].mount_point, "/");
+        assert_eq!(apfs.mounts[0].filesystem, "apfs");
+        assert_eq!(apfs.mounts[0].available_bytes, Some(1234));
+        assert_eq!(apfs.mounts[0].device_discard, "unknown");
+        assert_eq!(
+            apfs.mounts[0].filesystem_trim,
+            "unknown: TRIM support and permissions not tested"
+        );
+        assert_eq!(apfs.mounts[1].mount_point, "/Volumes/External");
+        assert_eq!(apfs.mounts[1].available_bytes, Some(5678));
+        assert!(
+            apfs.mounts_warning
+                .as_deref()
+                .unwrap()
+                .contains("not a complete macOS mount table")
+        );
+        assert!(apfs.guidance.contains("does not issue manual TRIM"));
+
+        let other = macos_trim_status_with(false, || (vec![mount("/", "hfs", Some(20))], false));
+        assert!(other.capability.contains("root filesystem is hfs"));
+        assert!(other.capability.starts_with("unknown"));
+
+        let missing = macos_trim_status_with(false, || (vec![mount("/", "unknown", None)], true));
+        assert!(
+            missing
+                .capability
+                .starts_with("unknown: root filesystem type")
+        );
+        assert_eq!(missing.mounts.len(), 1);
+        assert_eq!(missing.mounts[0].available_bytes, None);
+        assert!(
+            missing
+                .mounts_warning
+                .as_deref()
+                .unwrap()
+                .contains("Some /Volumes entries could not be inspected")
+        );
+
+        let dry_run =
+            macos_trim_status_with(true, || panic!("dry-run must skip filesystem inventory"));
+        assert!(dry_run.capability.starts_with("dry-run"));
+        assert!(dry_run.mounts.is_empty());
+        assert!(dry_run.guidance.contains("does not issue manual TRIM"));
+        assert!(
+            dry_run
+                .mounts_warning
+                .as_deref()
+                .unwrap()
+                .starts_with("Dry-run skipped filesystem inventory")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn macos_volume_discovery_only_lists_mount_device_directories_without_following_links() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let volumes = fixture.path().join("Volumes");
+        let mounted = volumes.join("External");
+        let ordinary = volumes.join("ordinary folder");
+        let link = volumes.join("linked volume");
+        std::fs::create_dir_all(&mounted).unwrap();
+        std::fs::create_dir(&ordinary).unwrap();
+        symlink(&mounted, &link).unwrap();
+
+        let (found, incomplete) = macos_volume_mount_paths_with(&volumes, |path| {
+            assert_ne!(
+                path,
+                link.as_path(),
+                "symlink entries must not be inspected"
+            );
+            if path == volumes.as_path() {
+                Some(1)
+            } else if path == mounted.as_path() {
+                Some(2)
+            } else {
+                Some(1)
+            }
+        });
+        assert_eq!(found, vec![mounted.clone()]);
+        assert!(!incomplete);
+
+        let (found, incomplete) = macos_volume_mount_paths_with(&volumes, |path| {
+            if path == volumes.as_path() {
+                Some(1)
+            } else if path == ordinary.as_path() {
+                None
+            } else {
+                Some(1)
+            }
+        });
+        assert!(found.is_empty());
+        assert!(incomplete);
+
+        let (found, incomplete) =
+            macos_volume_mount_paths_with(&fixture.path().join("missing"), |_| None);
+        assert!(found.is_empty());
+        assert!(incomplete);
+    }
+
+    #[test]
+    fn macos_filesystem_type_is_bounded_ascii_without_controls() {
+        assert_eq!(macos_filesystem_name(b"APFS"), Some("apfs".into()));
+        assert_eq!(macos_filesystem_name(b"APFS\0padding"), Some("apfs".into()));
+        assert_eq!(macos_filesystem_name(b"apfs\x1b"), None);
+        assert_eq!(macos_filesystem_name(b"filesystem-name-too-long"), None);
+        assert_eq!(macos_filesystem_name(b"\xff"), None);
+    }
+
+    #[test]
     fn windows_trim_notification_parser_reports_os_policy_without_claiming_device_support() {
         assert_eq!(
             parse_windows_trim_notification_status(
@@ -794,6 +1283,18 @@ mod tests {
             parse_windows_trim_notification_status("not localized output\n")
                 .contains("NTFS not reported")
         );
+        assert!(
+            parse_windows_trim_notification_status(
+                "NTFS DisableDeleteNotifyExtra = 0\nReFS DisableDeleteNotify = 0 (Enabled)\n"
+            )
+            .contains("NTFS not reported; ReFS unknown")
+        );
+        assert!(
+            parse_windows_trim_notification_status(
+                "NTFS DisableDeleteNotify = 0\nNTFS DisableDeleteNotify is not currently set\n"
+            )
+            .contains("NTFS ambiguous")
+        );
     }
 
     #[test]
@@ -802,6 +1303,107 @@ mod tests {
             panic!("dry-run must not resolve or execute fsutil")
         });
         assert!(status.contains("skipped by dry-run"));
+    }
+
+    #[test]
+    fn windows_mount_inventory_queries_only_fixed_letter_roots_and_keeps_partial_results() {
+        let mut classified = Vec::new();
+        let mut filesystem_queries = Vec::new();
+        let mut space_queries = Vec::new();
+        let (mounts, incomplete) = windows_fixed_mounts_with(
+            Some(vec![
+                "c:\\".into(),
+                "D:\\".into(),
+                "E:\\".into(),
+                "F:\\".into(),
+                "G:\\".into(),
+                "not-a-drive".into(),
+            ]),
+            |root| {
+                classified.push(root.to_owned());
+                match root {
+                    "C:\\" => Some(WindowsDriveKind::Fixed),
+                    "D:\\" | "E:\\" => Some(WindowsDriveKind::Other),
+                    "F:\\" => Some(WindowsDriveKind::Unknown),
+                    "G:\\" => Some(WindowsDriveKind::Fixed),
+                    _ => None,
+                }
+            },
+            |root| {
+                filesystem_queries.push(root.to_owned());
+                match root {
+                    "C:\\" => Some("NTFS".into()),
+                    "G:\\" => Some("FAT\n32".into()),
+                    _ => None,
+                }
+            },
+            |root| {
+                space_queries.push(root.to_owned());
+                (root == "C:\\").then_some(1234)
+            },
+        );
+
+        assert_eq!(classified, vec!["C:\\", "D:\\", "E:\\", "F:\\", "G:\\"]);
+        assert_eq!(filesystem_queries, vec!["C:\\", "G:\\"]);
+        assert_eq!(space_queries, vec!["C:\\", "G:\\"]);
+        assert!(incomplete);
+        assert_eq!(mounts.len(), 2);
+        assert_eq!(mounts[0].mount_point, "C:\\");
+        assert_eq!(mounts[0].filesystem, "ntfs");
+        assert_eq!(mounts[0].available_bytes, Some(1234));
+        assert_eq!(mounts[0].device_discard, "unknown");
+        assert_eq!(
+            mounts[0].filesystem_trim,
+            "unknown: TRIM support and permissions not tested"
+        );
+        assert_eq!(mounts[1].mount_point, "G:\\");
+        assert_eq!(mounts[1].filesystem, "unknown");
+        assert_eq!(mounts[1].available_bytes, None);
+    }
+
+    #[test]
+    fn windows_mount_inventory_marks_failed_enumeration_incomplete() {
+        let (mounts, incomplete) = windows_fixed_mounts_with(None, |_| None, |_| None, |_| None);
+        assert!(mounts.is_empty());
+        assert!(incomplete);
+    }
+
+    #[test]
+    fn windows_maintenance_status_lists_capacity_without_claiming_device_trim_support() {
+        let status = windows_trim_status_with(
+            false,
+            || Some("NTFS DisableDeleteNotify = 0\n".into()),
+            || (vec![], false),
+        );
+        assert!(status.capability.contains("NTFS enabled"));
+        assert!(
+            status
+                .capability
+                .contains("storage-device support is not verified")
+        );
+        assert!(status.guidance.contains("does not run manual TRIM"));
+        assert!(
+            status
+                .mounts_warning
+                .as_deref()
+                .unwrap()
+                .contains("mounted-folder volumes")
+        );
+        assert!(
+            status
+                .mounts_warning
+                .as_deref()
+                .unwrap()
+                .contains("TRIM support are not inspected")
+        );
+
+        let dry_run = windows_trim_status_with(
+            true,
+            || panic!("dry-run must skip the fsutil query"),
+            || panic!("dry-run must skip volume inventory"),
+        );
+        assert!(dry_run.mounts.is_empty());
+        assert!(dry_run.mounts_warning.unwrap().contains("Dry-run skipped"));
     }
 
     #[test]
@@ -977,6 +1579,30 @@ mod tests {
         assert_eq!(timer.next_trigger.as_deref(), Some("Tue 2026-01-02"));
         assert_eq!(parse_timer("LoadState=not-found\n").state, "not_found");
         assert_eq!(parse_timer("garbage").state, "unavailable");
+        assert_eq!(
+            parse_timer("LoadState=loaded\nLoadState=not-found\nActiveState=inactive\n").state,
+            "unavailable"
+        );
+        assert_eq!(
+            parse_timer("LoadState=not-found\nActiveState=active\n").state,
+            "unavailable"
+        );
+        assert_eq!(
+            parse_timer("LoadState=not-found\nActiveState=\n").state,
+            "unavailable"
+        );
+        assert_eq!(
+            parse_timer("LoadState=loaded\nActiveState=\n").state,
+            "unavailable"
+        );
+        assert_eq!(
+            parse_timer("LoadState=loaded\nActiveState=active\ninvalid property\n").state,
+            "unavailable"
+        );
+        assert_eq!(
+            parse_timer("LoadState=not-found\nActiveState=inactive\n").state,
+            "not_found"
+        );
         assert_eq!(
             parse_timer("LoadState=loaded\nActiveState=active\u{1b}[2J\n").state,
             "active\\u{1b}[2J"

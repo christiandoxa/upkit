@@ -29,6 +29,12 @@ pub struct ArtifactPlan {
     pub preview_token: String,
     #[cfg(target_os = "linux")]
     #[serde(skip)]
+    pub(crate) cargo_config_identity: Option<Box<crate::sweep::FileIdentityAtPath>>,
+    #[cfg(target_os = "linux")]
+    #[serde(skip)]
+    pub(crate) cargo_workspace_evidence: Option<Box<crate::sweep::WorkspaceEvidence>>,
+    #[cfg(target_os = "linux")]
+    #[serde(skip)]
     pub(crate) git_evidence_id: Option<String>,
     pub warning: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -238,18 +244,20 @@ mod linux {
         manifest: &Path,
         target: &Path,
         git_evidence_id: &str,
+        cargo_evidence: (Option<&crate::sweep::FileIdentityAtPath>, Option<&str>),
         opened: &Opened,
     ) -> Result<String> {
         let boot = fs::read("/proc/sys/kernel/random/boot_id").context("read boot identity")?;
         let mut hash = Sha256::new();
         for value in [
-            b"upkit-artifact-directory-v2".as_slice(),
+            b"upkit-artifact-directory-v5".as_slice(),
             &boot,
             &serde_json::to_vec(scope)?,
             &serde_json::to_vec(&crate::sweep::JsonPath(project))?,
             &serde_json::to_vec(&crate::sweep::JsonPath(manifest))?,
             &serde_json::to_vec(&crate::sweep::JsonPath(target))?,
             git_evidence_id.as_bytes(),
+            &serde_json::to_vec(&cargo_evidence)?,
             &serde_json::to_vec(&opened.fingerprints)?,
             opened.tree.digest.as_bytes(),
         ] {
@@ -345,6 +353,31 @@ mod linux {
     ) -> Result<ArtifactPlan> {
         let candidate = &item.candidate;
         let target = &candidate.target;
+        if candidate.ecosystem == "cargo"
+            && (candidate.classification != "rebuildable"
+                || target.as_path() != candidate.project_root.join("target").as_path())
+        {
+            bail!(
+                "custom or unresolved Cargo target directories are inspection-only until configuration identity is part of cleanup authorization"
+            );
+        }
+        if candidate.ecosystem == "go" && candidate.classification == "review" {
+            bail!(
+                "Go build and bin directories are inspection-only because their contents may be user data"
+            );
+        }
+        if candidate.ecosystem == "ninja" {
+            bail!(
+                "Ninja build directories are inspection-only because their contents may be user data"
+            );
+        }
+        if candidate.ecosystem == "javascript"
+            && target.file_name().is_some_and(|name| name == ".svelte-kit")
+        {
+            bail!(
+                "SvelteKit output is inspection-only because its contents are not verified as disposable"
+            );
+        }
         if !item.selected
             || !candidate.size_complete
             || candidate.nested_project_marker.is_some()
@@ -376,12 +409,48 @@ mod linux {
             .git_evidence_id
             .as_deref()
             .context("trusted Git evidence identity is unavailable")?;
+        let cargo_config_identity = if candidate.ecosystem == "cargo" {
+            crate::sweep::candidate_cargo_config_identity(candidate).map(Box::new)
+        } else {
+            None
+        };
+        let cargo_workspace_evidence = if candidate.ecosystem == "cargo" {
+            if !candidate.cargo_workspace.as_ref().is_some_and(|workspace| {
+                matches!(
+                    workspace.status,
+                    "standalone_package" | "workspace_manifest"
+                )
+            }) {
+                bail!("Cargo workspace ancestry is unresolved");
+            }
+            let expected = crate::sweep::candidate_cargo_workspace_proof(candidate)
+                .context("Cargo workspace ancestry proof is unavailable")?;
+            let current =
+                crate::sweep::inspect_cargo_workspace(scope, &candidate.project_root, cancel)?;
+            let current_proof = current
+                .proof()
+                .context("Cargo workspace ancestry could not be verified")?;
+            if current_proof != expected
+                || !matches!(current.status, "standalone_package" | "workspace_manifest")
+            {
+                bail!("Cargo workspace manifests changed during preview");
+            }
+            Some(Box::new(current))
+        } else {
+            None
+        };
         let preview_token = token(
             scope,
             &candidate.project_root,
             &manifest,
             target,
             git_evidence_id,
+            (
+                cargo_config_identity.as_deref(),
+                cargo_workspace_evidence
+                    .as_deref()
+                    .and_then(crate::sweep::WorkspaceEvidence::proof),
+            ),
             &opened,
         )?;
         let entries = opened
@@ -404,6 +473,8 @@ mod linux {
             logical_bytes: opened.tree.logical_bytes,
             entries,
             preview_token,
+            cargo_config_identity,
+            cargo_workspace_evidence,
             git_evidence_id: Some(git_evidence_id.to_owned()),
             warning: "Permanently deletes every listed entry and the selected directory, including any user data. Git and process checks are snapshots and cannot rule out all races or hidden processes. Failure can leave a partially removed directory in quarantine; reclaimed space is unknown.",
             reproduction_warning: crate::sweep::reproduction_warning(candidate),
@@ -423,7 +494,6 @@ mod linux {
         targets: &[PathBuf],
         cancel: &AtomicBool,
     ) -> Result<ArtifactBatchPlan> {
-        let targets = selected_targets(targets)?;
         let report = crate::sweep::scan_with_policy(
             &scope.roots,
             &scope.exclusions,
@@ -432,6 +502,18 @@ mod linux {
             cancel,
             |_| {},
         )?;
+        preview_batch_from_scan(scope, report, targets, cancel)
+    }
+    pub(super) fn preview_batch_from_scan(
+        scope: &crate::sweep::Scope,
+        report: crate::sweep::ScanReport,
+        targets: &[PathBuf],
+        cancel: &AtomicBool,
+    ) -> Result<ArtifactBatchPlan> {
+        let targets = selected_targets(targets)?;
+        if report.roots != scope.roots || !report.is_complete() {
+            bail!("artifact cleanup requires a complete scan of the approved roots");
+        }
         let plan = crate::sweep::preview_with_cancel(report, &targets, cancel)?;
         let mut items = plan
             .items
@@ -451,12 +533,29 @@ mod linux {
             warning: "Permanently deletes the listed artifact directories. All selections are revalidated before removal; each directory is quarantined and reported separately. A failure may leave other directories completed or leave a partial directory in quarantine. Reclaimed space is unknown.",
         })
     }
+    pub(super) fn remove_guarded(
+        scope: &crate::sweep::Scope,
+        target: &Path,
+        approved: &str,
+        cancel: &AtomicBool,
+        guard: &dyn Fn() -> Result<()>,
+    ) -> Result<&'static str> {
+        let plan = preview(scope, target, cancel)?;
+        if plan.preview_token != approved {
+            bail!("artifact preview changed; review it again");
+        }
+        let opened = open_approved(&plan, cancel)?;
+        guard()?;
+        remove_opened(&plan, opened, cancel, guard, || {}, || {})
+    }
     fn check_anchors(
         plan: &ArtifactPlan,
         parents: &[fs::File],
         fingerprints: &[Fingerprint],
         manifest: &fs::File,
     ) -> Result<()> {
+        check_cargo_config_identity(plan)?;
+        check_cargo_workspace_metadata(plan)?;
         let mut current = fs::File::from(openat2(
             rustix::fs::CWD,
             &plan.project,
@@ -504,6 +603,44 @@ mod linux {
         }
         Ok(())
     }
+    fn check_cargo_config_identity(plan: &ArtifactPlan) -> Result<()> {
+        if plan.ecosystem == "cargo" {
+            let current = crate::sweep::current_cargo_config_identity(&plan.project)?;
+            if current.as_ref() != plan.cargo_config_identity.as_deref() {
+                bail!("Cargo configuration changed after artifact preview");
+            }
+        }
+        Ok(())
+    }
+    fn check_cargo_workspace_identity(plan: &ArtifactPlan) -> Result<()> {
+        if plan.ecosystem == "cargo" {
+            let evidence = plan
+                .cargo_workspace_evidence
+                .as_deref()
+                .context("Cargo workspace ancestry proof is unavailable")?;
+            let expected = evidence
+                .proof()
+                .context("Cargo workspace ancestry proof is unavailable")?;
+            if !evidence.metadata_matches()
+                || crate::sweep::current_cargo_workspace_proof(&plan.scope, &plan.project)?
+                    != expected
+            {
+                bail!("Cargo workspace manifests changed after artifact preview");
+            }
+        }
+        Ok(())
+    }
+    fn check_cargo_workspace_metadata(plan: &ArtifactPlan) -> Result<()> {
+        if plan.ecosystem == "cargo"
+            && !plan
+                .cargo_workspace_evidence
+                .as_deref()
+                .is_some_and(crate::sweep::WorkspaceEvidence::metadata_matches)
+        {
+            bail!("Cargo workspace manifests changed after artifact preview");
+        }
+        Ok(())
+    }
     fn check_quarantine(
         parent: &fs::File,
         name: &str,
@@ -533,15 +670,14 @@ mod linux {
         approved: &str,
         cancel: &AtomicBool,
     ) -> Result<&'static str> {
-        let plan = preview(scope, target, cancel)?;
-        if plan.preview_token != approved {
-            bail!("artifact preview changed; review it again");
-        }
-        let opened = open_approved(&plan, cancel)?;
-        remove_opened(&plan, opened, cancel, || {}, || {})
+        remove_guarded(scope, target, approved, cancel, &|| Ok(()))
     }
     fn open_approved(plan: &ArtifactPlan, cancel: &AtomicBool) -> Result<Opened> {
+        check_cargo_config_identity(plan)?;
+        check_cargo_workspace_identity(plan)?;
         let opened = inspect(&plan.project, &plan.manifest, &plan.target, cancel)?;
+        check_cargo_config_identity(plan)?;
+        check_cargo_workspace_identity(plan)?;
         if token(
             &plan.scope,
             &plan.project,
@@ -550,6 +686,12 @@ mod linux {
             plan.git_evidence_id
                 .as_deref()
                 .context("trusted Git evidence identity is unavailable")?,
+            (
+                plan.cargo_config_identity.as_deref(),
+                plan.cargo_workspace_evidence
+                    .as_deref()
+                    .and_then(crate::sweep::WorkspaceEvidence::proof),
+            ),
             &opened,
         )? != plan.preview_token
         {
@@ -616,11 +758,18 @@ mod linux {
             let result = {
                 #[cfg(test)]
                 {
-                    remove_opened(&item, opened, cancel, || {}, &mut after_removed_entry)
+                    remove_opened(
+                        &item,
+                        opened,
+                        cancel,
+                        &|| Ok(()),
+                        || {},
+                        &mut after_removed_entry,
+                    )
                 }
                 #[cfg(not(test))]
                 {
-                    remove_opened(&item, opened, cancel, || {}, || {})
+                    remove_opened(&item, opened, cancel, &|| Ok(()), || {}, || {})
                 }
             };
             match result {
@@ -649,6 +798,7 @@ mod linux {
         plan: &ArtifactPlan,
         opened: Opened,
         cancel: &AtomicBool,
+        guard: &dyn Fn() -> Result<()>,
         after_staging: impl FnOnce(),
         mut after_removed_entry: impl FnMut(),
     ) -> Result<&'static str> {
@@ -737,6 +887,8 @@ mod linux {
             if cancel.load(Ordering::Relaxed) {
                 bail!("artifact removal cancelled");
             }
+            guard()?;
+            check_cargo_workspace_identity(plan)?;
             check_anchors(plan, &parents, &fingerprints, &manifest)?;
             check_quarantine(parent, &private, &quarantine, &q_identity)?;
             if fingerprint(&target.metadata()?) != *expected_target {
@@ -746,6 +898,7 @@ mod linux {
                 .context("quarantine artifact directory")?;
             staged = true;
             after_staging();
+            guard()?;
             check()?;
             let staged_dir = open(
                 &quarantine,
@@ -807,6 +960,9 @@ mod linux {
             {
                 bail!("quarantined artifact contents changed");
             }
+            guard()?;
+            check_cargo_workspace_identity(plan)?;
+            check_cargo_workspace_metadata(plan)?;
             crate::guarded_tree::remove(
                 &quarantine,
                 std::ffi::OsStr::new("root"),
@@ -917,7 +1073,11 @@ mod linux {
                 fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
             }
             let manifest = project.join("Cargo.toml");
-            fs::write(&manifest, "[package]\nname='fixture'\nversion='0.1.0'\n").unwrap();
+            fs::write(
+                &manifest,
+                "[package]\nname='fixture'\nversion='0.1.0'\n[workspace]\n",
+            )
+            .unwrap();
             fs::set_permissions(&manifest, fs::Permissions::from_mode(0o600)).unwrap();
             fs::write(target.join("debug/output"), "fixture").unwrap();
             fs::set_permissions(
@@ -937,6 +1097,10 @@ mod linux {
             )
             .unwrap()
             .map(|git| git.evidence_id());
+            let workspace =
+                crate::sweep::inspect_cargo_workspace(&scope, &project, &AtomicBool::new(false))
+                    .unwrap();
+            let cargo_workspace_evidence = Some(Box::new(workspace));
             let opened = inspect(&project, &manifest, &target, &AtomicBool::new(false)).unwrap();
             let preview_token = token(
                 &scope,
@@ -944,6 +1108,12 @@ mod linux {
                 &manifest,
                 &target,
                 git_evidence_id.as_deref().unwrap_or("test-git-unavailable"),
+                (
+                    None,
+                    cargo_workspace_evidence
+                        .as_deref()
+                        .and_then(crate::sweep::WorkspaceEvidence::proof),
+                ),
                 &opened,
             )
             .unwrap();
@@ -957,6 +1127,8 @@ mod linux {
                 logical_bytes: opened.tree.logical_bytes,
                 entries: vec![],
                 preview_token,
+                cargo_config_identity: None,
+                cargo_workspace_evidence,
                 git_evidence_id,
                 warning: "fixture",
                 reproduction_warning: None,
@@ -973,6 +1145,12 @@ mod linux {
                 &plan.manifest,
                 &plan.target,
                 "git-evidence-a",
+                (
+                    plan.cargo_config_identity.as_deref(),
+                    plan.cargo_workspace_evidence
+                        .as_deref()
+                        .and_then(crate::sweep::WorkspaceEvidence::proof),
+                ),
                 &opened,
             )
             .unwrap();
@@ -982,11 +1160,153 @@ mod linux {
                 &plan.manifest,
                 &plan.target,
                 "git-evidence-b",
+                (
+                    plan.cargo_config_identity.as_deref(),
+                    plan.cargo_workspace_evidence
+                        .as_deref()
+                        .and_then(crate::sweep::WorkspaceEvidence::proof),
+                ),
                 &opened,
             )
             .unwrap();
 
             assert_ne!(first, second);
+        }
+
+        #[test]
+        fn artifact_approval_rejects_changed_local_cargo_config() {
+            let (_dir, mut plan, _opened) = fixture();
+            if crate::sweep::current_cargo_config_identity(&plan.project).is_err() {
+                eprintln!("Cargo config environment is unresolved; local-config fixture skipped");
+                return;
+            }
+            let cargo_dir = plan.project.join(".cargo");
+            fs::create_dir(&cargo_dir).unwrap();
+            let config = cargo_dir.join("config.toml");
+            fs::write(&config, "[net]\noffline = true\n").unwrap();
+            plan.cargo_config_identity = crate::sweep::current_cargo_config_identity(&plan.project)
+                .unwrap()
+                .map(Box::new);
+            let opened = inspect(
+                &plan.project,
+                &plan.manifest,
+                &plan.target,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            plan.preview_token = token(
+                &plan.scope,
+                &plan.project,
+                &plan.manifest,
+                &plan.target,
+                plan.git_evidence_id
+                    .as_deref()
+                    .unwrap_or("test-git-unavailable"),
+                (
+                    plan.cargo_config_identity.as_deref(),
+                    plan.cargo_workspace_evidence
+                        .as_deref()
+                        .and_then(crate::sweep::WorkspaceEvidence::proof),
+                ),
+                &opened,
+            )
+            .unwrap();
+
+            fs::write(&config, "[net]\noffline = false\n").unwrap();
+
+            let error = open_approved(&plan, &AtomicBool::new(false))
+                .err()
+                .expect("changed Cargo config must invalidate the preview");
+            assert!(format!("{error:#}").contains("Cargo configuration changed"));
+        }
+
+        #[test]
+        fn artifact_approval_rejects_inherited_config_added_after_preview() {
+            let (_dir, plan, _opened) = fixture();
+            if crate::sweep::current_cargo_config_identity(&plan.project).is_err() {
+                eprintln!(
+                    "Cargo config environment is unresolved; inherited-config fixture skipped"
+                );
+                return;
+            }
+            let config_dir = plan.project.parent().unwrap().join(".cargo");
+            fs::create_dir(&config_dir).unwrap();
+            fs::write(config_dir.join("config.toml"), "not parsed by cleanup").unwrap();
+
+            let error = open_approved(&plan, &AtomicBool::new(false))
+                .err()
+                .expect("new inherited Cargo config must block cleanup");
+            assert!(format!("{error:#}").contains("Cargo output configuration is unresolved"));
+            assert!(plan.target.is_dir());
+            assert!(plan.target.join("debug/output").is_file());
+        }
+
+        #[test]
+        fn removal_rejects_workspace_membership_change_after_preview() {
+            let (_dir, mut plan, _old_opened) = fixture();
+            if crate::sweep::current_cargo_config_identity(&plan.project).is_err() {
+                eprintln!("Cargo config environment is unresolved; workspace fixture skipped");
+                return;
+            }
+            let git_evidence_id = "fixture-git-evidence";
+            plan.git_evidence_id = Some(git_evidence_id.to_owned());
+            fs::write(
+                &plan.manifest,
+                "[package]\nname='fixture'\nversion='0.1.0'\n[workspace]\nmembers=['member']\n",
+            )
+            .unwrap();
+            let opened = inspect(
+                &plan.project,
+                &plan.manifest,
+                &plan.target,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            plan.cargo_workspace_evidence = Some(Box::new(
+                crate::sweep::inspect_cargo_workspace(
+                    &plan.scope,
+                    &plan.project,
+                    &AtomicBool::new(false),
+                )
+                .unwrap(),
+            ));
+            plan.preview_token = token(
+                &plan.scope,
+                &plan.project,
+                &plan.manifest,
+                &plan.target,
+                git_evidence_id,
+                (
+                    plan.cargo_config_identity.as_deref(),
+                    plan.cargo_workspace_evidence
+                        .as_deref()
+                        .and_then(crate::sweep::WorkspaceEvidence::proof),
+                ),
+                &opened,
+            )
+            .unwrap();
+
+            fs::write(
+                &plan.manifest,
+                "[package]\nname='fixture'\nversion='0.1.0'\n[workspace]\nmembers=['member', 'other']\n",
+            )
+            .unwrap();
+
+            let error = remove_opened(
+                &plan,
+                opened,
+                &AtomicBool::new(false),
+                &|| Ok(()),
+                || {},
+                || {},
+            )
+            .expect_err("workspace membership change must block staging");
+            assert!(format!("{error:#}").contains("manifest"));
+            assert!(plan.target.is_dir());
+            assert_eq!(
+                fs::read(plan.target.join("debug/output")).unwrap(),
+                b"fixture"
+            );
         }
 
         #[test]
@@ -996,6 +1316,7 @@ mod linux {
                 &plan,
                 opened,
                 &AtomicBool::new(false),
+                &|| Ok(()),
                 || {
                     let quarantine = fs::read_dir(&plan.project)
                         .unwrap()
@@ -1027,6 +1348,7 @@ mod linux {
                 &plan,
                 opened,
                 &AtomicBool::new(false),
+                &|| Ok(()),
                 || {
                     fs::rename(&plan.manifest, plan.project.join("old-manifest")).unwrap();
                     fs::write(&plan.manifest, "replacement").unwrap();
@@ -1049,6 +1371,7 @@ mod linux {
                 &plan,
                 opened,
                 &cancelled,
+                &|| Ok(()),
                 || {
                     cancelled.store(true, Ordering::Relaxed);
                 },
@@ -1203,6 +1526,12 @@ mod linux {
                 &plan.manifest,
                 &plan.target,
                 plan.git_evidence_id.as_deref().unwrap(),
+                (
+                    plan.cargo_config_identity.as_deref(),
+                    plan.cargo_workspace_evidence
+                        .as_deref()
+                        .and_then(crate::sweep::WorkspaceEvidence::proof),
+                ),
                 &opened,
             )
             .unwrap();
@@ -1211,6 +1540,7 @@ mod linux {
                 &plan,
                 opened,
                 &cancel,
+                &|| Ok(()),
                 || {},
                 || {
                     if !injected {
@@ -1571,6 +1901,17 @@ pub fn preview_batch(
     }
 }
 
+/// Build a removal plan from the scan already used to select scheduled targets.
+#[cfg(target_os = "linux")]
+pub(crate) fn preview_batch_from_scan(
+    scope: &crate::sweep::Scope,
+    report: crate::sweep::ScanReport,
+    targets: &[PathBuf],
+    cancel: &AtomicBool,
+) -> Result<ArtifactBatchPlan> {
+    linux::preview_batch_from_scan(scope, report, targets, cancel)
+}
+
 /// Remove the previously reviewed directory after revalidation and explicit confirmation.
 pub fn remove(
     scope: &crate::sweep::Scope,
@@ -1587,6 +1928,18 @@ pub fn remove(
         let _ = (scope, target, token, cancel);
         bail!("artifact cleanup is supported only on Linux")
     }
+}
+
+/// Remove one approved artifact while rechecking a schedule policy before and after quarantine.
+#[cfg(target_os = "linux")]
+pub(crate) fn remove_guarded(
+    scope: &crate::sweep::Scope,
+    target: &Path,
+    token: &str,
+    cancel: &AtomicBool,
+    guard: &dyn Fn() -> Result<()>,
+) -> Result<&'static str> {
+    linux::remove_guarded(scope, target, token, cancel, guard)
 }
 
 /// Remove a reviewed batch after revalidating every target before the first mutation.

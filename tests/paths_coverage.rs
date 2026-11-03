@@ -7,6 +7,104 @@ use upkit::test_support::{
 };
 use upkit::{Cli, Ctx, Prompt, run};
 
+#[cfg(unix)]
+#[test]
+fn paths_json_round_trips_non_unicode_home_and_bin() {
+    use std::os::unix::ffi::OsStringExt;
+    use std::process::Command;
+
+    let dir = tempdir().unwrap();
+    let home = dir
+        .path()
+        .join(std::ffi::OsString::from_vec(b"home-\xff%".to_vec()));
+    let bin = dir
+        .path()
+        .join(std::ffi::OsString::from_vec(b"bin-\xfe%".to_vec()));
+    let output = Command::new(env!("CARGO_BIN_EXE_upkit"))
+        .args(["--non-interactive", "--dry-run", "--json", "--home"])
+        .arg(&home)
+        .arg("--bindir")
+        .arg(&bin)
+        .arg("paths")
+        .env("HOME", dir.path())
+        .env("PATH", "")
+        .env("CARGO_HOME", dir.path().join("cargo"))
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("UPKIT_NO_PATH_UPDATE", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let decode = |value: &serde_json::Value| {
+        assert_eq!(value["encoding"], "unix-percent-bytes");
+        let bytes = value["value"].as_str().unwrap().as_bytes();
+        let mut decoded = Vec::new();
+        let mut position = 0;
+        while position < bytes.len() {
+            if bytes[position] == b'%' {
+                decoded.push(
+                    u8::from_str_radix(
+                        std::str::from_utf8(&bytes[position + 1..position + 3]).unwrap(),
+                        16,
+                    )
+                    .unwrap(),
+                );
+                position += 3;
+            } else {
+                decoded.push(bytes[position]);
+                position += 1;
+            }
+        }
+        std::path::PathBuf::from(std::ffi::OsString::from_vec(decoded))
+    };
+    assert_eq!(decode(&report["home"]), home);
+    assert_eq!(decode(&report["bindir"]), bin);
+    let target = report["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["label"] == "upkit bin")
+        .unwrap();
+    assert_eq!(decode(&target["dir"]), bin);
+    assert_eq!(target["updated"], false);
+    assert!(!home.exists() && !bin.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn paths_text_escapes_terminal_control_characters() {
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("home\u{1b}[2J");
+    let bin = dir.path().join("bin\u{1b}[3J");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_upkit"))
+        .args(["--non-interactive", "--dry-run", "--home"])
+        .arg(&home)
+        .arg("--bindir")
+        .arg(&bin)
+        .arg("paths")
+        .env("HOME", dir.path())
+        .env("PATH", "")
+        .env("CARGO_HOME", dir.path().join("cargo"))
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for text in [&output.stdout, &output.stderr] {
+        assert!(!text.contains(&0x1b), "terminal escape in paths output");
+    }
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("home%1B[2J"));
+    assert!(stdout.contains("bin%1B[3J"));
+}
+
 fn ctx_from_cli(
     cli: &Cli,
     home: std::path::PathBuf,

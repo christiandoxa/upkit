@@ -4,9 +4,11 @@ import json
 import os
 import pathlib
 import platform
+import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import tomllib
 import unittest
 
@@ -16,6 +18,7 @@ VERSION = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]["version"]
 WINDOWS = os.name == "nt"
 EXTENSION = ".exe" if WINDOWS else ""
 BINARY = ROOT / "target" / "debug" / f"upkit{EXTENSION}"
+POWERSHELL = "powershell.exe" if WINDOWS else os.environ.get("UPKIT_PWSH") or shutil.which("pwsh")
 
 
 class Installers(unittest.TestCase):
@@ -56,13 +59,28 @@ class Installers(unittest.TestCase):
         self.env.update(
             HOME=str(self.root),
             USERPROFILE=str(self.root),
+            APPDATA=str(self.root / "appdata"),
             XDG_DATA_HOME=str(self.root / "data"),
+            XDG_CONFIG_HOME=str(self.root / "config"),
+            XDG_CACHE_HOME=str(self.root / "cache"),
+            XDG_STATE_HOME=str(self.root / "state"),
+            XDG_RUNTIME_DIR=str(self.root),
             LOCALAPPDATA=str(self.root / "local"),
+            CARGO_HOME=str(self.root / "cargo"),
+            RUSTUP_HOME=str(self.root / "rustup"),
+            TMP=str(self.root),
+            TEMP=str(self.root),
+            TMPDIR=str(self.root),
             UPKIT_INSTALLER="standalone",
             UPKIT_INSTALL_DIR=str(self.bin_dir),
             UPKIT_RELEASE_BASE_URL=f"http://127.0.0.1:{self.server.server_port}/release",
             UPKIT_NO_PATH_UPDATE="1",
         )
+        if WINDOWS:
+            self.env.update(
+                HOMEDRIVE=self.root.drive,
+                HOMEPATH=str(self.root)[len(self.root.drive):],
+            )
 
     def run_command(self, command):
         return subprocess.run(command, env=self.env, cwd=ROOT, capture_output=True, text=True, timeout=90)
@@ -74,11 +92,79 @@ class Installers(unittest.TestCase):
             command = ["sh", str(ROOT / "install.sh"), "--release", release]
         return self.run_command(command)
 
+    def powershell_installer_fixture(self, pause=False):
+        if not POWERSHELL:
+            self.skipTest("PowerShell is unavailable; set UPKIT_PWSH to run the isolated PowerShell fixture")
+
+        arch = "aarch64" if platform.machine().lower() in ("arm64", "aarch64") else "x86_64"
+        self.asset = f"upkit-{arch}-pc-windows-msvc.exe"
+        self.assets = {
+            self.asset: self.binary,
+            "SHA256SUMS": f"{hashlib.sha256(self.binary).hexdigest()}  {self.asset}\n".encode(),
+        }
+
+        script = ROOT / "install.ps1"
+        if not pause and WINDOWS:
+            return script
+
+        source = script.read_text()
+        if not WINDOWS:
+            download = "    Download-Asset $asset $download\n"
+            self.assertEqual(source.count(download), 1)
+            source = source.replace(download, download + "    & chmod +x $download\n", 1)
+        if pause:
+            commit = "        [System.IO.File]::Move($staged, $destination)\n"
+            self.assertEqual(source.count(commit), 1)
+            source = source.replace(
+                commit,
+                "        while (-not (Test-Path -LiteralPath $env:UPKIT_TEST_CONTINUE -PathType Leaf)) { Start-Sleep -Milliseconds 5 }\n" + commit,
+                1,
+            )
+        fixture = self.root / "install-fixture.ps1"
+        fixture.write_text(source)
+        return fixture
+
+    def install_powershell(self, script=None):
+        script = script or self.powershell_installer_fixture()
+        command = [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script), "-Release", VERSION, "-InstallDir", str(self.bin_dir)]
+        return self.run_command(command)
+
+    def install_powershell_at_commit(self, change_during_commit):
+        script = self.powershell_installer_fixture(pause=True)
+        continue_path = self.root / "continue-install"
+        self.env["UPKIT_TEST_CONTINUE"] = str(continue_path)
+        command = [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script), "-Release", VERSION, "-InstallDir", str(self.bin_dir)]
+        process = subprocess.Popen(command, env=self.env, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.monotonic() + 30
+            while not list(self.bin_dir.glob(".upkit-old-*.exe")):
+                if process.poll() is not None:
+                    stdout, stderr = process.communicate()
+                    self.fail(f"PowerShell installer exited before the commit barrier:\n{stdout}{stderr}")
+                if time.monotonic() >= deadline:
+                    self.fail("PowerShell installer did not reach the commit barrier")
+                time.sleep(0.01)
+            change_during_commit()
+            continue_path.touch()
+            stdout, stderr = process.communicate(timeout=90)
+            return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+            self.env.pop("UPKIT_TEST_CONTINUE", None)
+
     def existing(self, data=b"previous installation"):
         self.bin_dir.mkdir(parents=True)
         destination = self.bin_dir / f"upkit{EXTENSION}"
         destination.write_bytes(data)
         destination.chmod(0o755)
+        return destination
+
+    def existing_powershell(self, data=b"previous installation"):
+        self.bin_dir.mkdir(parents=True, exist_ok=True)
+        destination = self.bin_dir / "upkit.exe"
+        destination.write_bytes(data)
         return destination
 
     def assert_success(self, result):
@@ -92,6 +178,98 @@ class Installers(unittest.TestCase):
         self.assert_success(result)
         self.assertEqual(result.stdout.strip(), f"upkit {VERSION}")
         self.assertIn(f"/release/{self.asset}", self.requests)
+
+    @unittest.skipIf(WINDOWS, "POSIX installer")
+    def test_shell_rejects_directory_and_symlink_destination(self):
+        self.bin_dir.mkdir(parents=True)
+        destination = self.bin_dir / "upkit"
+        destination.mkdir()
+        marker = destination / "keep"
+        marker.write_text("preserve")
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(marker.read_text(), "preserve")
+        self.assertEqual(sorted(path.name for path in destination.iterdir()), ["keep"])
+
+        destination.rename(self.root / "existing-directory")
+        destination.symlink_to(self.root / "existing-directory", target_is_directory=True)
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(destination.is_symlink())
+        self.assertEqual(sorted(path.name for path in destination.iterdir()), ["keep"])
+        destination.unlink()
+        destination.symlink_to(self.root / "missing")
+        self.assertNotEqual(self.install().returncode, 0)
+        self.assertTrue(destination.is_symlink())
+        self.assertEqual(list(self.bin_dir.glob(".upkit.*")), [])
+
+    def test_install_preserves_unrelated_legacy_backup_file(self):
+        if not WINDOWS and not POWERSHELL:
+            self.skipTest("PowerShell is unavailable")
+        destination = self.existing_powershell()
+        unrelated_backup = self.bin_dir / "upkit.old.exe"
+        unrelated_backup.write_bytes(b"unrelated user file")
+
+        self.assert_success(self.install_powershell())
+        self.assertEqual(destination.read_bytes(), self.binary)
+        self.assertEqual(unrelated_backup.read_bytes(), b"unrelated user file")
+
+    @unittest.skipUnless(WINDOWS, "Windows PowerShell installer")
+    def test_install_refuses_reparse_point_destination(self):
+        self.bin_dir.mkdir()
+        target = self.root / "outside.exe"
+        target.write_bytes(b"outside fixture")
+        destination = self.bin_dir / "upkit.exe"
+        try:
+            destination.symlink_to(target)
+        except (NotImplementedError, OSError) as error:
+            self.skipTest(f"Windows symlinks unavailable: {error}")
+
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(destination.is_symlink())
+        self.assertEqual(target.read_bytes(), b"outside fixture")
+
+    @unittest.skipUnless(POWERSHELL, "PowerShell 7 fixture is not configured")
+    def test_powershell_failed_commit_restores_previous_binary(self):
+        original = b"previous installation"
+        destination = self.existing_powershell(original)
+        backup = self.bin_dir / "upkit.old.exe"
+        backup.write_bytes(b"unrelated user backup")
+
+        def remove_staged_file():
+            staged = [path for path in self.bin_dir.glob(".upkit-*.exe") if not path.name.startswith(".upkit-old-")]
+            self.assertEqual(len(staged), 1)
+            staged[0].unlink()
+
+        result = self.install_powershell_at_commit(remove_staged_file)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(destination.read_bytes(), original)
+        self.assertEqual(backup.read_bytes(), b"unrelated user backup")
+        self.assertEqual(list(self.bin_dir.glob(".upkit-old-*.exe")), [])
+        self.assertEqual([path for path in self.bin_dir.glob(".upkit-*.exe") if not path.name.startswith(".upkit-old-")], [])
+
+    @unittest.skipUnless(POWERSHELL, "PowerShell 7 fixture is not configured")
+    def test_powershell_concurrent_destination_change_keeps_backup(self):
+        original = b"previous installation"
+        concurrent = b"concurrent destination"
+        destination = self.existing_powershell(original)
+        unrelated_backup = self.bin_dir / "upkit.old.exe"
+        unrelated_backup.write_bytes(b"unrelated user backup")
+
+        def create_concurrent_destination():
+            destination.write_bytes(concurrent)
+
+        result = self.install_powershell_at_commit(create_concurrent_destination)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("previous binary remains at", result.stderr)
+        self.assertEqual(destination.read_bytes(), concurrent)
+        self.assertEqual(unrelated_backup.read_bytes(), b"unrelated user backup")
+        backups = list(self.bin_dir.glob(".upkit-old-*.exe"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), original)
+        self.assertIn(backups[0].name, result.stderr)
+        self.assertEqual([path for path in self.bin_dir.glob(".upkit-*.exe") if not path.name.startswith(".upkit-old-")], [])
 
     def test_latest(self):
         self.assert_success(self.install("latest"))

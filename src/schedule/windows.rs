@@ -821,10 +821,9 @@ pub(super) fn preview_scan(
     if roots.is_empty() {
         bail!("select at least one workspace root");
     }
-    if policy
-        .as_ref()
-        .is_some_and(|policy| policy.scheduled_bytecode_cleanup)
-    {
+    if policy.as_ref().is_some_and(|policy| {
+        policy.scheduled_bytecode_cleanup || policy.scheduled_artifact_cleanup
+    }) {
         bail!("Windows schedules support read-only scans only");
     }
     for root in roots {
@@ -1002,6 +1001,21 @@ function Test-UpkitTaskAcl([string]$sddl, [string]$sid) {
 "#;
 
 #[cfg(target_os = "windows")]
+const TASK_LOOKUP_FUNCTION: &str = r#"
+function Get-UpkitTask($folder) {
+    try { return $folder.GetTask('Upkit-Workspace-Scan') }
+    catch {
+        $exception = $_.Exception
+        while ($null -ne $exception) {
+            if ($exception.HResult -eq -2147024894) { return $null }
+            $exception = $exception.InnerException
+        }
+        throw
+    }
+}
+"#;
+
+#[cfg(target_os = "windows")]
 const TASK_SNAPSHOT_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
@@ -1009,22 +1023,23 @@ try {
     $sid = $env:UPKIT_TASK_SID
     $service = New-Object -ComObject 'Schedule.Service'
     $service.Connect()
-    $task = $service.GetFolder('\').GetTask('Upkit-Workspace-Scan')
-    $last = $null
-    $next = $null
-    if ($task.LastRunTime.Year -gt 1900) { $last = $task.LastRunTime.ToString('o') }
-    if ($task.NextRunTime.Year -gt 1900) { $next = $task.NextRunTime.ToString('o') }
-    $sddl = $task.GetSecurityDescriptor(7)
-    $security = [System.Security.AccessControl.RawSecurityDescriptor]::new($sddl)
-    $owner = if ($null -eq $security.Owner) { $null } else { $security.Owner.Value }
-    $value = @{present=$true;taskPath=$task.Path;state=[int]$task.State;enabled=[bool]$task.Enabled;lastRun=$last;nextRun=$next;securityOwner=$owner;securityDescriptor=$sddl;securitySafe=(Test-UpkitTaskAcl $sddl $sid)}
-} catch {
-    if ($_.Exception.HResult -eq -2147024894) {
+    $folder = $service.GetFolder('\')
+    $task = Get-UpkitTask $folder
+    if ($null -eq $task) {
         $value = @{present=$false;taskPath=$null;state=0;enabled=$false;lastRun=$null;nextRun=$null;securityOwner=$null;securityDescriptor=$null;securitySafe=$false}
     } else {
-        [Console]::Error.WriteLine('Task Scheduler query failed')
-        exit 2
+        $last = $null
+        $next = $null
+        if ($task.LastRunTime.Year -gt 1900) { $last = $task.LastRunTime.ToString('o') }
+        if ($task.NextRunTime.Year -gt 1900) { $next = $task.NextRunTime.ToString('o') }
+        $sddl = $task.GetSecurityDescriptor(7)
+        $security = [System.Security.AccessControl.RawSecurityDescriptor]::new($sddl)
+        $owner = if ($null -eq $security.Owner) { $null } else { $security.Owner.Value }
+        $value = @{present=$true;taskPath=$task.Path;state=[int]$task.State;enabled=[bool]$task.Enabled;lastRun=$last;nextRun=$next;securityOwner=$owner;securityDescriptor=$sddl;securitySafe=(Test-UpkitTaskAcl $sddl $sid)}
     }
+} catch {
+    [Console]::Error.WriteLine('Task Scheduler query failed')
+    exit 2
 }
 [Console]::Out.Write((ConvertTo-Json -InputObject $value -Compress))
 "#;
@@ -1434,10 +1449,9 @@ fn query_task_xml_with_cancel(cancel: &AtomicBool) -> Result<String> {
 fn verify_task_scope(definition: &TaskDefinition) -> Result<()> {
     let (roots, exclusions, token) = parse_scan_scope(&definition.arguments)?;
     let policy = super::policy_from_token(&token)?;
-    if policy
-        .as_ref()
-        .is_some_and(|policy| policy.scheduled_bytecode_cleanup)
-    {
+    if policy.as_ref().is_some_and(|policy| {
+        policy.scheduled_bytecode_cleanup || policy.scheduled_artifact_cleanup
+    }) {
         bail!("Windows only supports read-only scheduled scans");
     }
     let expected_scope = policy
@@ -1661,7 +1675,7 @@ if (-not (Test-UpkitTaskAcl $sddl $sid)) { exit 4 }
 
 #[cfg(target_os = "windows")]
 fn task_powershell_script(body: &str) -> String {
-    format!("{TASK_ACL_FUNCTION}\n{body}")
+    format!("{TASK_ACL_FUNCTION}\n{TASK_LOOKUP_FUNCTION}\n{body}")
 }
 
 #[cfg(target_os = "windows")]
@@ -2452,5 +2466,41 @@ if ($safe) { [Console]::Out.Write('SAFE') } else { [Console]::Out.Write('UNSAFE'
                 .env("UPKIT_TEST_SDDL", sddl);
             assert_eq!(run_command(command, None, 4096).unwrap(), expected);
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn powershell_task_lookup_only_maps_missing_task_to_absent() {
+        use std::process::Command;
+
+        let powershell = system_binary("WindowsPowerShell\\v1.0\\powershell.exe").unwrap();
+        let script = task_powershell_script(
+            r#"
+$missing = [pscustomobject]@{}
+$missing | Add-Member -MemberType ScriptMethod -Name GetTask -Value {
+    throw [System.Runtime.InteropServices.COMException]::new('missing fixture', -2147024894)
+}
+if ($null -ne (Get-UpkitTask $missing)) { exit 4 }
+$unreadable = [pscustomobject]@{}
+$unreadable | Add-Member -MemberType ScriptMethod -Name GetTask -Value {
+    throw [System.Runtime.InteropServices.COMException]::new('denied fixture', -2147024891)
+}
+try {
+    Get-UpkitTask $unreadable | Out-Null
+    [Console]::Out.Write('BAD')
+} catch {
+    [Console]::Out.Write('ERROR')
+}
+"#,
+        );
+        let mut command = Command::new(powershell);
+        command.args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &script,
+        ]);
+        assert_eq!(run_command(command, None, 4096).unwrap(), b"ERROR");
     }
 }

@@ -82,6 +82,43 @@ fn empty_reports_are_read_only_in_json_and_dry_run() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn human_report_shows_readable_start_and_finish_timestamps() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("upkit-data");
+    write_fixture(&home, 0, Some(2));
+    let output = Command::new(env!("CARGO_BIN_EXE_upkit"))
+        .args(["--non-interactive", "--home"])
+        .arg(&home)
+        .arg("report")
+        .env("HOME", dir.path())
+        .env("XDG_CONFIG_HOME", dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("started=1970-01-01 00:00:01 UTC"), "{text}");
+    assert!(text.contains("finished=1970-01-01 00:00:02 UTC"), "{text}");
+
+    let json = Command::new(env!("CARGO_BIN_EXE_upkit"))
+        .args(["--json", "--non-interactive", "--home"])
+        .arg(&home)
+        .arg("report")
+        .env("HOME", dir.path())
+        .env("XDG_CONFIG_HOME", dir.path())
+        .output()
+        .unwrap();
+    assert!(json.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(report["records"][0]["started_unix"], 1);
+    assert_eq!(report["records"][0]["finished_unix"], 2);
+}
+
 #[cfg(any(target_os = "macos", windows))]
 #[test]
 fn report_rejects_hard_linked_record() {
@@ -194,6 +231,157 @@ fn report_and_purge_preview_escape_bidi_controls_in_history_text() {
     let stored: serde_json::Value =
         serde_json::from_slice(&fs::read(record_path).unwrap()).unwrap();
     assert_eq!(stored["target"], "fixture_\u{202e}target");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn report_recovers_valid_staged_history_with_a_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("upkit-data");
+    write_fixture(&home, 0, Some(2));
+    let record = home.join("history/000.json");
+    let stage = home.join("history/.history-purge-123-0-0");
+    fs::rename(&record, &stage).unwrap();
+
+    let output = run_upkit(&home, &strings(&["report"]));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["records"].as_array().unwrap().len(), 1);
+    assert_eq!(report["records"][0]["id"], 0);
+    assert!(
+        report["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("interrupted during history purge")
+    );
+    assert!(!record.exists());
+    assert!(stage.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn report_fails_closed_on_a_staged_record_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("upkit-data");
+    write_fixture(&home, 0, Some(2));
+    let record = home.join("history/000.json");
+    let stage = home.join("history/.history-purge-123-0-0");
+    fs::copy(&record, &stage).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&stage, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let output = run_upkit(&home, &strings(&["report"]));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(report["records"].as_array().unwrap().is_empty());
+    assert_eq!(report["warnings"].as_array().unwrap().len(), 1);
+    assert!(record.exists());
+    assert!(stage.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn report_fails_closed_on_a_mismatched_final_and_reservation_pair() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("upkit-data");
+    write_fixture(&home, 0, Some(2));
+    let record = home.join("history/000.json");
+    let original = fs::read(&record).unwrap();
+    let reservation = home.join("history/000.reserve");
+    let pending = serde_json::json!({
+        "id": 0,
+        "started_unix": 1,
+        "finished_unix": null,
+        "duration_ms": 0,
+        "operation": "different_operation",
+        "target": "fixture_target",
+        "outcome": "in_progress",
+        "detail": null,
+        "estimated_bytes": null,
+        "verified_reclaimed_bytes": null,
+        "platform": "fixture"
+    });
+    fs::write(&reservation, serde_json::to_vec(&pending).unwrap()).unwrap();
+    fs::set_permissions(&reservation, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let output = run_upkit(&home, &strings(&["report"]));
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(report["records"].as_array().unwrap().is_empty());
+    assert!(
+        report["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("mismatched final and reservation pair")
+    );
+    assert_eq!(fs::read(&record).unwrap(), original);
+    assert_eq!(
+        fs::read(&reservation).unwrap(),
+        serde_json::to_vec(&pending).unwrap()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn report_does_not_recover_pending_reservation_through_linked_final_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("upkit-data");
+    let history = home.join("history");
+    fs::create_dir_all(&history).unwrap();
+    fs::set_permissions(&history, fs::Permissions::from_mode(0o700)).unwrap();
+    let outside = dir.path().join("outside.json");
+    fs::write(&outside, fixture_record(0, Some(2))).unwrap();
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+    let final_path = history.join("000.json");
+    fs::hard_link(&outside, &final_path).unwrap();
+    let reservation = history.join("000.reserve");
+    let pending = serde_json::json!({
+        "id": 0,
+        "started_unix": 1,
+        "finished_unix": null,
+        "duration_ms": 0,
+        "operation": "fixture_operation",
+        "target": "fixture_target",
+        "outcome": "in_progress",
+        "detail": null,
+        "estimated_bytes": null,
+        "verified_reclaimed_bytes": null,
+        "platform": "fixture"
+    });
+    fs::write(&reservation, serde_json::to_vec(&pending).unwrap()).unwrap();
+    fs::set_permissions(&reservation, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let output = run_upkit(&home, &strings(&["report"]));
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(report["records"].as_array().unwrap().is_empty());
+    assert!(
+        report["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("unverified final or reservation file")
+    );
+    assert_eq!(
+        fs::read(&outside).unwrap(),
+        fixture_record(0, Some(2)).into_bytes()
+    );
+    assert!(final_path.exists());
+    assert!(reservation.exists());
 }
 
 #[cfg(target_os = "linux")]
@@ -494,6 +682,178 @@ fn purge_preview_dry_run_authorization_and_token_revalidation_use_fixtures() {
     );
     assert!(home.join("history/001.json").exists());
     assert!(home.join("history/002.json").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn purge_reviews_and_resumes_a_valid_interrupted_stage() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("upkit-data");
+    write_fixture(&home, 0, Some(2));
+    let history = home.join("history");
+    let record = history.join("000.json");
+    let stage = history.join(".history-purge-123-0-0");
+    let renamed_stage = history.join(".history-purge-123-1-0");
+    fs::rename(&record, &stage).unwrap();
+
+    let preview = run_upkit(
+        &home,
+        &strings(&["report", "purge", "--older-than", "30d", "--preview"]),
+    );
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let preview: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert_eq!(preview["plan"]["candidates"].as_array().unwrap().len(), 1);
+    assert_eq!(preview["plan"]["candidates"][0]["id"], 0);
+    let token = preview["plan"]["preview_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(!record.exists());
+    assert!(stage.exists());
+
+    fs::rename(&stage, &renamed_stage).unwrap();
+    let mut stale_args = strings(&[
+        "--yes",
+        "report",
+        "purge",
+        "--authorize-history-purge",
+        "--older-than",
+        "30d",
+        "--run",
+        "--preview-token",
+    ]);
+    stale_args.push(token);
+    let stale = run_upkit(&home, &stale_args);
+    assert!(!stale.status.success());
+    assert!(renamed_stage.exists());
+    assert!(!record.exists());
+
+    fs::rename(&renamed_stage, &stage).unwrap();
+    let fresh_preview = run_upkit(
+        &home,
+        &strings(&["report", "purge", "--older-than", "30d", "--preview"]),
+    );
+    assert!(fresh_preview.status.success());
+    let fresh_preview: serde_json::Value = serde_json::from_slice(&fresh_preview.stdout).unwrap();
+    let token = fresh_preview["plan"]["preview_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut run_args = strings(&[
+        "--yes",
+        "report",
+        "purge",
+        "--authorize-history-purge",
+        "--older-than",
+        "30d",
+        "--run",
+        "--preview-token",
+    ]);
+    run_args.push(token);
+    let removed = run_upkit(&home, &run_args);
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    let removed: serde_json::Value = serde_json::from_slice(&removed.stdout).unwrap();
+    assert_eq!(removed["result"]["items"][0]["status"], "removed");
+    assert!(!stage.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn purge_preserves_partial_reservations_and_invalid_stages_without_reusing_slots() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("upkit-data");
+    write_fixture(&home, 2, Some(2));
+    let history = home.join("history");
+    let reservation = history.join("000.reserve");
+    let stage = history.join(".history-purge-123-0-1");
+    fs::write(&reservation, b"{\"id\":0").unwrap();
+    fs::set_permissions(&reservation, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(&stage, b"partial staged record").unwrap();
+    fs::set_permissions(&stage, fs::Permissions::from_mode(0o600)).unwrap();
+    let original_reservation = fs::read(&reservation).unwrap();
+
+    let preview = run_upkit(
+        &home,
+        &strings(&["report", "purge", "--older-than", "30d", "--preview"]),
+    );
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let preview: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert_eq!(preview["plan"]["candidates"].as_array().unwrap().len(), 1);
+    assert_eq!(preview["plan"]["candidates"][0]["id"], 2);
+    let token = preview["plan"]["preview_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let changed_stage = b"changed staged record";
+    fs::write(&stage, changed_stage).unwrap();
+    fs::set_permissions(&stage, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut stale_args = strings(&[
+        "--yes",
+        "report",
+        "purge",
+        "--authorize-history-purge",
+        "--older-than",
+        "30d",
+        "--run",
+        "--preview-token",
+    ]);
+    stale_args.push(token);
+    let stale = run_upkit(&home, &stale_args);
+    assert!(!stale.status.success());
+    assert!(history.join("002.json").exists());
+    assert_eq!(fs::read(&reservation).unwrap(), original_reservation);
+    assert_eq!(fs::read(&stage).unwrap(), changed_stage);
+
+    let fresh_preview = run_upkit(
+        &home,
+        &strings(&["report", "purge", "--older-than", "30d", "--preview"]),
+    );
+    assert!(fresh_preview.status.success());
+    let fresh_preview: serde_json::Value = serde_json::from_slice(&fresh_preview.stdout).unwrap();
+    let token = fresh_preview["plan"]["preview_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut run_args = strings(&[
+        "--yes",
+        "report",
+        "purge",
+        "--authorize-history-purge",
+        "--older-than",
+        "30d",
+        "--run",
+        "--preview-token",
+    ]);
+    run_args.push(token);
+    let removed = run_upkit(&home, &run_args);
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    let removed: serde_json::Value = serde_json::from_slice(&removed.stdout).unwrap();
+    assert_eq!(removed["result"]["items"][0]["status"], "removed");
+    assert_eq!(fs::read(&reservation).unwrap(), original_reservation);
+    assert_eq!(fs::read(&stage).unwrap(), changed_stage);
+    assert!(!history.join("000.json").exists());
+    assert!(!history.join("001.json").exists());
+    let summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(history.join("002.json")).unwrap()).unwrap();
+    assert_eq!(summary["operation"], "history_purge");
 }
 
 #[cfg(not(target_os = "linux"))]

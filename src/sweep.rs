@@ -20,6 +20,26 @@ struct Exclusions {
 }
 
 impl Exclusions {
+    fn new(roots: &[PathBuf], exclusions: &[PathBuf]) -> Result<Self> {
+        let mut result = Self::default();
+        for path in exclusions {
+            if let Some(pattern) = exclusion_pattern(path)? {
+                result
+                    .patterns
+                    .extend(roots.iter().map(|root| (root.clone(), pattern.clone())));
+            } else if path.is_absolute() {
+                result
+                    .paths
+                    .push(path.canonicalize().unwrap_or_else(|_| path.clone()));
+            } else {
+                result
+                    .paths
+                    .extend(roots.iter().map(|root| root.join(path)));
+            }
+        }
+        Ok(result)
+    }
+
     fn matches(&self, path: &Path) -> bool {
         self.paths.iter().any(|excluded| path.starts_with(excluded))
             || self.patterns.iter().any(|(root, pattern)| {
@@ -158,6 +178,7 @@ pub enum Ecosystem {
     Zig,
     Cmake,
     Meson,
+    Ninja,
     Gradle,
     Maven,
     Sbt,
@@ -179,6 +200,44 @@ pub struct Scope {
     pub enabled: Option<Vec<Ecosystem>>,
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn inspect_cargo_workspace(
+    scope: &Scope,
+    project: &Path,
+    cancel: &AtomicBool,
+) -> Result<WorkspaceEvidence> {
+    let mut roots = Vec::new();
+    for root in &scope.roots {
+        let metadata = fs::symlink_metadata(root)
+            .with_context(|| format!("inspect Cargo workspace scope {}", display_path(root)))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!("Cargo workspace scope must be a non-symlink directory");
+        }
+        let root = root.canonicalize()?;
+        if root.parent().is_none() {
+            bail!("refusing to use a filesystem root as a Cargo workspace scope");
+        }
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    let exclusions = Exclusions::new(&roots, &scope.exclusions)?;
+    Ok(crate::cargo_workspace::Inspector::new(&roots).inspect(
+        project,
+        |path| exclusions.matches(path),
+        cancel,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn current_cargo_workspace_proof(scope: &Scope, project: &Path) -> Result<String> {
+    let evidence = inspect_cargo_workspace(scope, project, &AtomicBool::new(false))?;
+    evidence
+        .proof()
+        .map(str::to_owned)
+        .context("Cargo workspace ancestry could not be verified")
+}
+
 impl Ecosystem {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -187,6 +246,7 @@ impl Ecosystem {
             Self::Zig => "zig",
             Self::Cmake => "cmake",
             Self::Meson => "meson",
+            Self::Ninja => "ninja",
             Self::Gradle => "gradle",
             Self::Maven => "maven",
             Self::Sbt => "sbt",
@@ -216,7 +276,7 @@ pub struct Candidate {
     pub operation: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reproduction_warning: Option<&'static str>,
-    /// Static manifest evidence only; Cargo configuration and dependency membership are not resolved.
+    /// Read-only manifest ancestry evidence; Cargo output configuration is checked separately.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cargo_workspace: Option<WorkspaceEvidence>,
     /// First recognized manifest found during measurement, not an exhaustive inventory.
@@ -225,7 +285,7 @@ pub struct Candidate {
     /// First nested version-control marker found during measurement.
     #[serde(serialize_with = "serialize_optional_path")]
     pub nested_vcs_marker: Option<PathBuf>,
-    /// First multiply linked regular file observed on Unix; other links may be outside the target.
+    /// First multiply linked regular file observed on Unix or Windows; other links may be outside the target.
     #[serde(serialize_with = "serialize_optional_path")]
     pub hard_link_marker: Option<PathBuf>,
     /// First symbolic link observed without following it.
@@ -236,6 +296,11 @@ pub struct Candidate {
 }
 
 fn reproduction_warning_for(ecosystem: &str, target: &Path) -> Option<&'static str> {
+    if ecosystem == "ninja" {
+        return Some(
+            "A Ninja log suggests build state, but the directory can contain user files; removal is unsupported.",
+        );
+    }
     if ecosystem == "cmake" {
         return Some(
             "CMakeCache.txt identifies a CMake build tree, but build trees can contain user files; inspect every entry before removal.",
@@ -252,7 +317,22 @@ fn reproduction_warning_for(ecosystem: &str, target: &Path) -> Option<&'static s
             .is_some_and(|name| name == ".parcel-cache")
     {
         return Some(
-            "This is Parcel's default cache name, but its name and package.json do not prove its contents are generated; inspect them before removal.",
+            "This is Parcel's default cache name, but the name and package.json do not prove its contents are generated; inspect them before removal.",
+        );
+    }
+    if ecosystem == "javascript" && target.file_name().is_some_and(|name| name == ".next") {
+        return Some(
+            "This is Next.js's default distDir name, but the name and package.json do not prove its contents are generated; distDir is configurable, so inspect every entry before removal.",
+        );
+    }
+    if ecosystem == "javascript" && target.file_name().is_some_and(|name| name == ".nuxt") {
+        return Some(
+            "This is Nuxt's default buildDir name, but the name and package.json do not prove its contents are generated; buildDir is configurable, so inspect every entry before removal.",
+        );
+    }
+    if ecosystem == "javascript" && target.file_name().is_some_and(|name| name == "coverage") {
+        return Some(
+            "A known coverage report filename suggests generated test output, but does not prove every entry is disposable; inspect all entries before removal.",
         );
     }
     if ecosystem == "javascript"
@@ -264,6 +344,22 @@ fn reproduction_warning_for(ecosystem: &str, target: &Path) -> Option<&'static s
     {
         return Some(
             "This is Vite's default cache location, but project settings can override it and the directory contents are not verified as generated; inspect them before removal.",
+        );
+    }
+    if ecosystem == "javascript" && target.file_name().is_some_and(|name| name == ".svelte-kit") {
+        return Some(
+            "SvelteKit's configurable outDir defaults to .svelte-kit, but Upkit cannot verify every entry is disposable; inspect its contents before removal.",
+        );
+    }
+    if ecosystem == "javascript"
+        && target.file_name().is_some_and(|name| name == "cache")
+        && target
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == ".angular")
+    {
+        return Some(
+            "Angular CLI's cache path is configurable in angular.json; inspect its contents before removal.",
         );
     }
     if ecosystem == "zig" && target.file_name().is_some_and(|name| name == "zig-out") {
@@ -279,6 +375,15 @@ fn reproduction_warning_for(ecosystem: &str, target: &Path) -> Option<&'static s
     if ecosystem == "sbt" && target.file_name().is_some_and(|name| name == "target") {
         return Some(
             "sbt's target directory contains generated build outputs and local state; inspect every entry before removal.",
+        );
+    }
+    if ecosystem == "go"
+        && target
+            .file_name()
+            .is_some_and(|name| matches!(name.to_str(), Some("build" | "bin")))
+    {
+        return Some(
+            "Go build and bin directories are only possible output locations; they may contain tracked or user-authored files. Upkit can inventory them, but removal is unsupported until their contents can be attributed safely.",
         );
     }
     if ecosystem != "python" {
@@ -325,14 +430,22 @@ pub(crate) fn candidate_manifest(candidate: &Candidate) -> Option<&Path> {
         .map(|snapshot| snapshot.manifest.as_path())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct FileIdentity {
     device: u64,
     inode: u64,
     size: u64,
-    modified: SystemTime,
+    modified_seconds: i64,
+    modified_nanos: i64,
     changed_seconds: i64,
     changed_nanos: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct FileIdentityAtPath {
+    #[serde(serialize_with = "serialize_path")]
+    path: PathBuf,
+    file: FileIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -341,6 +454,9 @@ struct ArtifactSnapshot {
     project: FileIdentity,
     manifest_identity: FileIdentity,
     target: FileIdentity,
+    cargo_config: Option<FileIdentityAtPath>,
+    cargo_workspace_manifest: Option<FileIdentityAtPath>,
+    cargo_workspace_proof: Option<String>,
 }
 
 #[cfg(unix)]
@@ -357,7 +473,8 @@ fn identity(path: &Path, directory: bool) -> Option<FileIdentity> {
         device: metadata.dev(),
         inode: metadata.ino(),
         size: metadata.len(),
-        modified: metadata.modified().ok()?,
+        modified_seconds: metadata.mtime(),
+        modified_nanos: metadata.mtime_nsec(),
         changed_seconds: metadata.ctime(),
         changed_nanos: metadata.ctime_nsec(),
     })
@@ -367,6 +484,40 @@ fn identity(path: &Path, directory: bool) -> Option<FileIdentity> {
 #[cfg(not(unix))]
 fn identity(_: &Path, _: bool) -> Option<FileIdentity> {
     None
+}
+
+fn identity_at(path: &Path) -> Option<FileIdentityAtPath> {
+    Some(FileIdentityAtPath {
+        path: path.to_owned(),
+        file: identity(path, false)?,
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn candidate_cargo_config_identity(candidate: &Candidate) -> Option<FileIdentityAtPath> {
+    candidate.snapshot.as_ref()?.cargo_config.clone()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn candidate_cargo_workspace_proof(candidate: &Candidate) -> Option<&str> {
+    candidate
+        .snapshot
+        .as_ref()?
+        .cargo_workspace_proof
+        .as_deref()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn current_cargo_config_identity(root: &Path) -> Result<Option<FileIdentityAtPath>> {
+    let project = project_at(root).context("Cargo project identity is unavailable")?;
+    if !project.cargo || project.cargo_target_dir_unresolved {
+        bail!("Cargo output configuration is unresolved");
+    }
+    project
+        .cargo_config
+        .as_deref()
+        .map(|path| identity_at(path).context("Cargo config identity is unavailable"))
+        .transpose()
 }
 
 #[derive(Debug, Serialize)]
@@ -394,9 +545,13 @@ impl ScanReport {
 struct Project {
     root: PathBuf,
     cargo: bool,
+    cargo_target_dir: Option<PathBuf>,
+    cargo_config: Option<PathBuf>,
+    cargo_target_dir_unresolved: bool,
     go: bool,
     cmake: bool,
     meson: bool,
+    ninja: bool,
     zig: bool,
     gradle: bool,
     maven: bool,
@@ -405,10 +560,398 @@ struct Project {
     flutter: bool,
     python: bool,
     javascript: bool,
+    angular: bool,
+    sveltekit: bool,
 }
 
 fn is_regular(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file())
+}
+
+fn is_dotnet_project_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            ["csproj", "fsproj", "vbproj"]
+                .iter()
+                .any(|expected| ext.eq_ignore_ascii_case(expected))
+        })
+}
+
+const MAX_PACKAGE_MANIFEST_BYTES: usize = 1024 * 1024;
+
+// shortcut: skip manifests over 1 MiB; use streaming JSON detection if real manifests exceed the cap.
+#[cfg(target_os = "linux")]
+fn package_manifest(path: &Path) -> Option<fs::File> {
+    use rustix::fs::{Mode, OFlags, ResolveFlags, openat2};
+
+    // shortcut: skip SvelteKit inventory when openat2 is unavailable; add a validated dirfd fallback for older kernels.
+    Some(fs::File::from(
+        openat2(
+            rustix::fs::CWD,
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+        )
+        .ok()?,
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn package_manifest(path: &Path) -> Option<fs::File> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    Some(fs::File::from(
+        open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .ok()?,
+    ))
+}
+
+#[cfg(windows)]
+fn package_manifest(path: &Path) -> Option<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::path::Component;
+
+    let path = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return None;
+    }
+    let expected = fs::symlink_metadata(&path).ok()?;
+    if is_reparse_point(&expected)
+        || !expected.is_file()
+        || expected.len() > MAX_PACKAGE_MANIFEST_BYTES as u64
+    {
+        return None;
+    }
+
+    let parent = path.parent()?;
+    let mut ancestors = parent.ancestors().collect::<Vec<_>>();
+    ancestors.reverse();
+    let mut volume = None;
+    for ancestor in ancestors {
+        let metadata = fs::symlink_metadata(ancestor).ok()?;
+        if is_reparse_point(&metadata) || !metadata.is_dir() {
+            return None;
+        }
+        let ancestor_volume = windows_volume(ancestor).ok()?;
+        if volume.is_some_and(|expected| expected != ancestor_volume) {
+            return None;
+        }
+        volume = Some(ancestor_volume);
+    }
+
+    // FILE_FLAG_OPEN_REPARSE_POINT only protects the final path component.
+    // shortcut: path checks can race; require handle-relative traversal before using this as deletion proof.
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        // Avoid hydrating offline data just to inspect a project manifest.
+        .custom_flags(
+            WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT | winsafe::co::FILE_FLAG::OPEN_NO_RECALL.raw(),
+        );
+    let file = options.open(&path).ok()?;
+    let metadata = file.metadata().ok()?;
+    let file_type = winapi_util::file::typ(&file).ok()?;
+    let information = winapi_util::file::information(&file).ok()?;
+    if !metadata.is_file()
+        || !file_type.is_disk()
+        || is_reparse_point(&metadata)
+        || has_windows_reparse_attribute(information.file_attributes())
+        || information.file_size() > MAX_PACKAGE_MANIFEST_BYTES as u64
+        || !volume.is_some_and(|volume| information.volume_serial_number() == volume)
+    {
+        return None;
+    }
+    Some(file)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn package_manifest(_: &Path) -> Option<fs::File> {
+    None
+}
+
+fn package_declares(path: &Path, package: &str) -> bool {
+    let Some(manifest) = read_json_manifest(&path.join("package.json")) else {
+        return false;
+    };
+    [
+        "dependencies",
+        "devDependencies",
+        "optionalDependencies",
+        "peerDependencies",
+    ]
+    .iter()
+    .any(|section| {
+        manifest
+            .get(*section)
+            .and_then(|dependencies| dependencies.get(package))
+            .is_some()
+    })
+}
+
+fn angular_workspace(path: &Path) -> bool {
+    read_json_manifest(&path.join("angular.json")).is_some_and(|manifest| {
+        manifest
+            .get("projects")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|projects| !projects.is_empty())
+    })
+}
+
+fn read_json_manifest(path: &Path) -> Option<serde_json::Value> {
+    let mut file = package_manifest(path)?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_PACKAGE_MANIFEST_BYTES as u64 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    use std::io::Read;
+    if file
+        .by_ref()
+        .take((MAX_PACKAGE_MANIFEST_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() > MAX_PACKAGE_MANIFEST_BYTES
+    {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
+}
+
+const MAX_CARGO_CONFIG_ANCESTORS: usize = 256;
+
+fn real_directory_path_exists(path: &Path) -> Result<bool> {
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        bail!("Cargo config directory path is not absolute");
+    }
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) => {
+                current.push(component.as_os_str());
+                continue;
+            }
+            Component::RootDir | Component::Normal(_) => current.push(component.as_os_str()),
+            Component::CurDir => continue,
+            Component::ParentDir => bail!("Cargo config directory path contains '..'"),
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.is_dir() && !is_reparse_point(&metadata) => {}
+            Ok(_) => bail!("Cargo config directory path contains a link or non-directory"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(_) => bail!("Cargo config directory path could not be inspected safely"),
+        }
+    }
+    Ok(true)
+}
+
+fn cargo_config_directory_has_config(directory: &Path) -> Result<bool> {
+    match fs::symlink_metadata(directory) {
+        Ok(metadata) if metadata.is_dir() && !is_reparse_point(&metadata) => {}
+        Ok(_) => bail!("Cargo config directory is a link or non-directory"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => bail!("Cargo config directory could not be inspected safely"),
+    }
+    for name in ["config", "config.toml"] {
+        match fs::symlink_metadata(directory.join(name)) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => bail!("Cargo config file status could not be inspected safely"),
+        }
+    }
+    Ok(false)
+}
+
+fn cargo_home_directory_from(
+    cargo_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf> {
+    if let Some(cargo_home) = cargo_home {
+        let path = PathBuf::from(cargo_home);
+        if !path.is_absolute() {
+            bail!("CARGO_HOME is not absolute");
+        }
+        return Ok(path);
+    }
+    let home = PathBuf::from(home.context("HOME is unavailable")?);
+    if !home.is_absolute() || !real_directory_path_exists(&home)? {
+        bail!("HOME is unavailable or cannot be inspected safely");
+    }
+    Ok(home.join(".cargo"))
+}
+
+fn cargo_home_directory() -> Result<PathBuf> {
+    let cargo_home = std::env::var_os("CARGO_HOME");
+    let home = std::env::var_os("HOME");
+    cargo_home_directory_from(cargo_home.as_deref(), home.as_deref())
+}
+
+fn inherited_cargo_config_present(root: &Path, cargo_home: &Path) -> Result<bool> {
+    if !real_directory_path_exists(root)? {
+        bail!("Cargo project directory is unavailable");
+    }
+    for (depth, ancestor) in root.ancestors().enumerate() {
+        if depth >= MAX_CARGO_CONFIG_ANCESTORS {
+            bail!("Cargo config ancestor limit reached");
+        }
+        if ancestor != root && cargo_config_directory_has_config(&ancestor.join(".cargo"))? {
+            return Ok(true);
+        }
+        if ancestor.parent().is_none() {
+            break;
+        }
+    }
+    if !cargo_home.is_absolute() {
+        bail!("CARGO_HOME is not absolute");
+    }
+    let cargo_home_exists = real_directory_path_exists(cargo_home)?;
+    if cargo_home_exists && cargo_config_directory_has_config(cargo_home)? {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+// shortcut: only the project-local config is parsed; inherited, global, CLI, and environment overrides remain unresolved.
+fn cargo_target_dir(root: &Path) -> (Option<PathBuf>, Option<PathBuf>, bool) {
+    if [
+        "CARGO_TARGET_DIR",
+        "CARGO_BUILD_TARGET_DIR",
+        "CARGO_BUILD_BUILD_DIR",
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some())
+    {
+        return (None, None, true);
+    }
+    let Ok(cargo_home) = cargo_home_directory() else {
+        return (None, None, true);
+    };
+    cargo_target_dir_with_home(root, &cargo_home)
+}
+
+fn cargo_target_dir_with_home(
+    root: &Path,
+    cargo_home: &Path,
+) -> (Option<PathBuf>, Option<PathBuf>, bool) {
+    match inherited_cargo_config_present(root, cargo_home) {
+        Ok(false) => {}
+        Ok(true) | Err(_) => return (None, None, true),
+    }
+    let cargo_dir = root.join(".cargo");
+    let cargo_meta = match fs::symlink_metadata(&cargo_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (None, None, false),
+        Err(_) => return (None, None, true),
+    };
+    let root_meta = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(_) => return (None, None, true),
+    };
+    if is_reparse_point(&cargo_meta)
+        || !cargo_meta.is_dir()
+        || !same_device(&cargo_meta, &root_meta)
+    {
+        return (None, None, true);
+    }
+
+    let modern_config = cargo_dir.join("config.toml");
+    let legacy = cargo_dir.join("config");
+    let toml_exists = match fs::symlink_metadata(&modern_config) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => return (None, None, true),
+    };
+    let legacy_exists = match fs::symlink_metadata(&legacy) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => return (None, None, true),
+    };
+    if toml_exists && legacy_exists {
+        return (None, None, true);
+    }
+    if !toml_exists && !legacy_exists {
+        return (None, None, false);
+    }
+    let config = if toml_exists && is_regular(&modern_config) {
+        modern_config
+    } else if legacy_exists && is_regular(&legacy) {
+        legacy
+    } else {
+        return (None, None, true);
+    };
+    let Some(mut file) = package_manifest(&config) else {
+        return (None, Some(config), true);
+    };
+    let Ok(metadata) = file.metadata() else {
+        return (None, Some(config), true);
+    };
+    if !metadata.is_file() || metadata.len() > MAX_PACKAGE_MANIFEST_BYTES as u64 {
+        return (None, Some(config), true);
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    use std::io::Read;
+    if file
+        .by_ref()
+        .take((MAX_PACKAGE_MANIFEST_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() > MAX_PACKAGE_MANIFEST_BYTES
+    {
+        return (None, Some(config), true);
+    }
+    let Ok(config_text) = std::str::from_utf8(&bytes) else {
+        return (None, Some(config), true);
+    };
+    let Ok(value) = toml::from_str::<toml::Value>(config_text) else {
+        return (None, Some(config), true);
+    };
+    if value.get("include").is_some() {
+        return (None, Some(config), true);
+    }
+    let build = value.get("build");
+    let Some(build) = build else {
+        return (None, Some(config), false);
+    };
+    let Some(build) = build.as_table() else {
+        return (None, Some(config), true);
+    };
+    if build.get("build-dir").is_some() {
+        return (None, Some(config), true);
+    }
+    let Some(target_dir) = build.get("target-dir") else {
+        return (None, Some(config), false);
+    };
+    let Some(target_dir) = target_dir.as_str() else {
+        return (None, Some(config), true);
+    };
+    let relative = Path::new(target_dir);
+    if target_dir.is_empty()
+        || relative.is_absolute()
+        || relative
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return (None, Some(config), true);
+    }
+    let target = root.join(relative);
+    if target == root || !target.starts_with(root) {
+        return (None, Some(config), true);
+    }
+    (Some(target), Some(config), false)
 }
 
 fn project_at(path: &Path) -> Option<Project> {
@@ -417,19 +960,28 @@ fn project_at(path: &Path) -> Option<Project> {
         .ok()?
         .filter_map(|entry| entry.ok())
         .any(|entry| {
-            entry
-                .path()
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| matches!(ext, "csproj" | "fsproj" | "vbproj"))
-                && is_regular(&entry.path())
+            let path = entry.path();
+            is_dotnet_project_file(&path) && is_regular(&path)
         });
+    let cargo = has("Cargo.toml");
+    let (cargo_target_dir, cargo_config, cargo_target_dir_unresolved) = if cargo {
+        cargo_target_dir(path)
+    } else {
+        (None, None, false)
+    };
     let project = Project {
         root: path.to_owned(),
-        cargo: has("Cargo.toml"),
-        go: has("go.mod"),
+        cargo,
+        cargo_target_dir,
+        cargo_config,
+        cargo_target_dir_unresolved,
+        go: has("go.mod") || has("go.work"),
         cmake: has("CMakeLists.txt"),
         meson: has("meson.build"),
+        ninja: has("build.ninja")
+            && !has("CMakeLists.txt")
+            && !has("meson.build")
+            && !has("CMakeCache.txt"),
         zig: has("build.zig"),
         gradle: has("build.gradle") || has("build.gradle.kts"),
         maven: has("pom.xml"),
@@ -441,11 +993,14 @@ fn project_at(path: &Path) -> Option<Project> {
             || has("setup.cfg")
             || has("requirements.txt"),
         javascript: has("package.json"),
+        angular: angular_workspace(path),
+        sveltekit: package_declares(path, "@sveltejs/kit"),
     };
     (project.cargo
         || project.go
         || project.cmake
         || project.meson
+        || project.ninja
         || project.zig
         || project.gradle
         || project.maven
@@ -569,13 +1124,26 @@ fn vite_cache_at(
 fn classify(project: &Project, path: &Path, name: &str) -> Vec<(&'static str, &'static str)> {
     let at_root = path.parent() == Some(project.root.as_path());
     let mut matches = Vec::new();
+    if project.cargo_target_dir.as_deref() == Some(path)
+        && path != project.root.join("target").as_path()
+    {
+        matches.push(("cargo", "review"));
+    }
     if at_root && project.python && name != ".egg-info" && name.ends_with(".egg-info") {
         matches.push(("python", "review"));
     }
     match name {
         "target" if at_root => {
             if project.cargo {
-                matches.push(("cargo", "rebuildable"));
+                if project.cargo_target_dir_unresolved {
+                    matches.push(("cargo", "review"));
+                } else if project
+                    .cargo_target_dir
+                    .as_deref()
+                    .is_none_or(|target_dir| target_dir == path)
+                {
+                    matches.push(("cargo", "rebuildable"));
+                }
             }
             if project.maven {
                 matches.push(("maven", "rebuildable"));
@@ -587,6 +1155,9 @@ fn classify(project: &Project, path: &Path, name: &str) -> Vec<(&'static str, &'
         ".zig-cache" if at_root && project.zig => matches.push(("zig", "rebuildable")),
         "zig-out" if at_root && project.zig => matches.push(("zig", "review")),
         "build" if at_root => {
+            if project.go {
+                matches.push(("go", "review"));
+            }
             if project.python {
                 matches.push(("python", "review"));
             }
@@ -596,9 +1167,20 @@ fn classify(project: &Project, path: &Path, name: &str) -> Vec<(&'static str, &'
             if project.gradle {
                 matches.push(("gradle", "review"));
             }
+            if project.ninja && is_regular(&path.join(".ninja_log")) {
+                matches.push(("ninja", "review"));
+            }
         }
         ".gradle" if at_root && project.gradle => matches.push(("gradle", "review")),
-        "bin" | "obj" if at_root && project.dotnet => matches.push(("dotnet", "review")),
+        "bin" if at_root => {
+            if project.go {
+                matches.push(("go", "review"));
+            }
+            if project.dotnet {
+                matches.push(("dotnet", "review"));
+            }
+        }
+        "obj" if at_root && project.dotnet => matches.push(("dotnet", "review")),
         ".hypothesis" if project.python => matches.push(("python", "review")),
         ".tox" | ".nox" if at_root && project.python => matches.push(("python", "review")),
         "dist" if at_root && project.python => matches.push(("python", "review")),
@@ -610,6 +1192,24 @@ fn classify(project: &Project, path: &Path, name: &str) -> Vec<(&'static str, &'
         ".dart_tool" if at_root && project.flutter => matches.push(("dart", "rebuildable")),
         ".next" | ".nuxt" | ".parcel-cache" if at_root && project.javascript => {
             matches.push(("javascript", "review"))
+        }
+        "coverage"
+            if at_root
+                && project.javascript
+                && ["lcov.info", "coverage-final.json", "clover.xml"]
+                    .iter()
+                    .any(|name| is_regular(&path.join(name))) =>
+        {
+            matches.push(("javascript", "review"));
+        }
+        ".svelte-kit" if at_root && project.sveltekit => matches.push(("javascript", "review")),
+        "cache"
+            if project.angular
+                && path
+                    .parent()
+                    .is_some_and(|parent| parent == project.root.join(".angular")) =>
+        {
+            matches.push(("javascript", "review"));
         }
         ".vite"
             if project.javascript
@@ -636,12 +1236,14 @@ fn classify(project: &Project, path: &Path, name: &str) -> Vec<(&'static str, &'
 fn manifest_for(project: &Project, ecosystem: &str) -> Option<PathBuf> {
     let names: &[&str] = match ecosystem {
         "cargo" => &["Cargo.toml"],
+        "go" => &["go.work", "go.mod"],
         "zig" => &["build.zig"],
         "maven" => &["pom.xml"],
         "sbt" => &["build.sbt"],
         "gradle" => &["build.gradle", "build.gradle.kts"],
         "cmake" => &["CMakeLists.txt"],
         "meson" => &["meson.build"],
+        "ninja" => &["build.ninja"],
         "dart" | "flutter" => &["pubspec.yaml"],
         "python" => &[
             "pyproject.toml",
@@ -654,12 +1256,7 @@ fn manifest_for(project: &Project, ecosystem: &str) -> Option<PathBuf> {
             let mut manifests = fs::read_dir(&project.root)
                 .ok()?
                 .filter_map(|entry| entry.ok().map(|e| e.path()))
-                .filter(|path| {
-                    path.extension()
-                        .and_then(|ext| ext.to_str())
-                        .is_some_and(|ext| matches!(ext, "csproj" | "fsproj" | "vbproj"))
-                        && is_regular(path)
-                })
+                .filter(|path| is_dotnet_project_file(path) && is_regular(path))
                 .take(2);
             let first = manifests.next()?;
             return if manifests.next().is_none() {
@@ -677,6 +1274,9 @@ fn manifest_for(project: &Project, ecosystem: &str) -> Option<PathBuf> {
 }
 
 fn snapshot(project: &Project, target: &Path, ecosystem: &str) -> Option<ArtifactSnapshot> {
+    if ecosystem == "cargo" && project.cargo_target_dir_unresolved {
+        return None;
+    }
     if project.root.canonicalize().ok()? != project.root || target.canonicalize().ok()? != target {
         return None;
     }
@@ -688,6 +1288,12 @@ fn snapshot(project: &Project, target: &Path, ecosystem: &str) -> Option<Artifac
         project: identity(&project.root, true)?,
         manifest_identity: identity(&manifest, false)?,
         target: identity(target, true)?,
+        cargo_config: match project.cargo_config.as_deref() {
+            Some(path) => Some(identity_at(path)?),
+            None => None,
+        },
+        cargo_workspace_manifest: None,
+        cargo_workspace_proof: None,
         manifest,
     })
 }
@@ -700,6 +1306,99 @@ fn same_device(meta: &fs::Metadata, root: &fs::Metadata) -> bool {
 #[cfg(not(unix))]
 fn same_device(_: &fs::Metadata, _: &fs::Metadata) -> bool {
     true
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn decode_macos_mount_name(bytes: &[u8]) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .context("macOS mount name is not NUL-terminated")?;
+    let mount = PathBuf::from(std::ffi::OsStr::from_bytes(&bytes[..end]));
+    if !mount.is_absolute() {
+        bail!("macOS mount name is not absolute");
+    }
+    Ok(mount)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_mount_point(path: &Path) -> Result<PathBuf> {
+    let stat = rustix::fs::statfs(path)
+        .with_context(|| format!("inspect filesystem mount for {}", display_path(path)))?;
+    let bytes = stat
+        .f_mntonname
+        .iter()
+        .map(|byte| *byte as u8)
+        .collect::<Vec<_>>();
+    decode_macos_mount_name(&bytes)
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn warn_if_mount_scan_cancelled(
+    path: &Path,
+    cancel: &AtomicBool,
+    warnings: &mut Vec<String>,
+) -> bool {
+    if cancel.load(Ordering::Relaxed) {
+        warnings.push(format!(
+            "{}: scan cancelled during mount inspection",
+            display_path(path)
+        ));
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(target_os = "macos")]
+// shortcut: path-based statfs checks can race concurrent remounts; keep macOS scans inspection-only.
+fn macos_mount_matches_root(
+    path: &Path,
+    root_mount: Option<&Path>,
+    cancel: &AtomicBool,
+    warnings: &mut Vec<String>,
+) -> bool {
+    if warn_if_mount_scan_cancelled(path, cancel, warnings) {
+        return false;
+    }
+    let Some(root_mount) = root_mount else {
+        warnings.push(format!(
+            "{}: root mount identity unavailable; skipped",
+            display_path(path)
+        ));
+        return false;
+    };
+    let mount = match macos_mount_point(path) {
+        Ok(mount) => mount,
+        Err(error) => {
+            if !warn_if_mount_scan_cancelled(path, cancel, warnings) {
+                warnings.push(format!(
+                    "{}: mount identity unavailable; skipped: {error:#}",
+                    display_path(path)
+                ));
+            }
+            return false;
+        }
+    };
+    if warn_if_mount_scan_cancelled(path, cancel, warnings) {
+        return false;
+    }
+    if is_macos_mount_boundary(root_mount, &mount) {
+        warnings.push(format!(
+            "{}: skipped filesystem boundary",
+            display_path(path)
+        ));
+        false
+    } else {
+        true
+    }
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn is_macos_mount_boundary(root_mount: &Path, current_mount: &Path) -> bool {
+    root_mount != current_mount
 }
 
 #[cfg(any(windows, test))]
@@ -737,6 +1436,33 @@ fn windows_volume_matches(current: Option<u64>, root: Option<u64>) -> bool {
 #[cfg(any(windows, test))]
 fn has_windows_reparse_attribute(attributes: u64) -> bool {
     attributes & WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(windows)]
+fn windows_file_link_count(path: &Path, expected: &fs::Metadata) -> Result<u64> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+
+    let mut options = fs::OpenOptions::new();
+    options
+        .access_mode(WINDOWS_FILE_READ_ATTRIBUTES)
+        .custom_flags(
+            WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT | winsafe::co::FILE_FLAG::OPEN_NO_RECALL.raw(),
+        );
+    // shortcut: this informational scan cannot bind the path lookup to a prior directory handle.
+    let file = options
+        .open(path)
+        .with_context(|| format!("open {} for hard-link inspection", display_path(path)))?;
+    let actual = file.metadata()?;
+    let information = winapi_util::file::information(&file)?;
+    if !actual.is_file()
+        || is_reparse_point(&actual)
+        || has_windows_reparse_attribute(information.file_attributes())
+        || actual.file_size() != expected.file_size()
+        || actual.file_attributes() != expected.file_attributes()
+    {
+        bail!("file changed or became a reparse point during inspection");
+    }
+    Ok(information.number_of_links())
 }
 
 #[cfg(windows)]
@@ -848,10 +1574,8 @@ pub(crate) fn is_project_marker(path: &Path) -> bool {
             | "setup.cfg"
             | "requirements.txt"
             | "package.json"
-    ) || path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| matches!(ext, "csproj" | "fsproj" | "vbproj"))
+            | "angular.json"
+    ) || is_dotnet_project_file(path)
 }
 
 pub(crate) fn measure_directory(
@@ -872,10 +1596,23 @@ pub(crate) fn measure_directory(
     #[cfg(not(target_os = "linux"))]
     let mounts: HashSet<PathBuf> = HashSet::new();
     let mut warnings = Vec::new();
+    #[cfg(target_os = "macos")]
+    let mount_root = match macos_mount_point(&canonical) {
+        Ok(mount) => Some(mount),
+        Err(error) => {
+            warnings.push(format!(
+                "{}: mount identity unavailable: {error:#}",
+                display_path(&canonical)
+            ));
+            None
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let mount_root: Option<PathBuf> = None;
     let measurement = size(
         &canonical,
         &meta,
-        &mounts,
+        (&mounts, mount_root.as_deref()),
         &Exclusions::default(),
         cancel,
         &mut |_| {},
@@ -897,12 +1634,15 @@ pub(crate) fn measure_directory(
 fn size<F: FnMut(&Path)>(
     path: &Path,
     root_meta: &fs::Metadata,
-    mounts: &HashSet<PathBuf>,
+    mount_info: (&HashSet<PathBuf>, Option<&Path>),
     exclusions: &Exclusions,
     cancel: &AtomicBool,
     progress: &mut F,
     warnings: &mut Vec<String>,
 ) -> Measurement {
+    let (mounts, mount_root) = mount_info;
+    #[cfg(not(target_os = "macos"))]
+    let _ = mount_root;
     let before = warnings.len();
     let mut bytes = 0u64;
     #[cfg(unix)]
@@ -916,7 +1656,9 @@ fn size<F: FnMut(&Path)>(
     let mut symlink_marker: Option<PathBuf> = None;
     #[cfg(unix)]
     let mut hard_link_marker: Option<PathBuf> = None;
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    let mut hard_link_marker: Option<PathBuf> = None;
+    #[cfg(not(any(unix, windows)))]
     let hard_link_marker: Option<PathBuf> = None;
     #[cfg(windows)]
     let root_volume = windows_volume(path).ok();
@@ -1014,6 +1756,26 @@ fn size<F: FnMut(&Path)>(
                             allocated = allocated.saturating_add(meta.blocks().saturating_mul(512));
                         }
                     }
+                    #[cfg(windows)]
+                    match windows_file_link_count(&path, &meta) {
+                        Ok(links)
+                            if links > 1
+                                && hard_link_marker
+                                    .as_ref()
+                                    .is_none_or(|current| path < *current) =>
+                        {
+                            hard_link_marker = Some(path.clone());
+                        }
+                        Ok(_) => {}
+                        Err(error) => warnings.push(format!(
+                            "{}: hard-link status unavailable: {error:#}",
+                            display_path(&path)
+                        )),
+                    }
+                    continue;
+                }
+                #[cfg(target_os = "macos")]
+                if !macos_mount_matches_root(&path, mount_root, cancel, warnings) {
                     continue;
                 }
                 progress(&path);
@@ -1022,6 +1784,10 @@ fn size<F: FnMut(&Path)>(
                     break;
                 }
                 let entries = children(&path, cancel, warnings);
+                #[cfg(target_os = "macos")]
+                if !macos_mount_matches_root(&path, mount_root, cancel, warnings) {
+                    continue;
+                }
                 #[cfg(windows)]
                 if !same_windows_volume(&path, root_volume) {
                     warnings.push(format!(
@@ -1127,7 +1893,7 @@ pub fn scan_with_policy<F: FnMut(&Path) + Send>(
     )?
     .into_iter()
     .collect();
-    // shortcut: macOS mount points are not enumerated; add platform mount-table support.
+    // shortcut: macOS path-based statfs checks can miss a concurrent remount during scanning.
     #[cfg(not(target_os = "linux"))]
     let mounts: HashSet<PathBuf> = HashSet::new();
     let mut normalized_roots = Vec::new();
@@ -1150,24 +1916,7 @@ pub fn scan_with_policy<F: FnMut(&Path) + Send>(
             normalized_roots.push(root);
         }
     }
-    let mut excluded = Exclusions::default();
-    for path in exclusions {
-        if let Some(pattern) = exclusion_pattern(path)? {
-            excluded.patterns.extend(
-                normalized_roots
-                    .iter()
-                    .map(|root| (root.clone(), pattern.clone())),
-            );
-        } else if path.is_absolute() {
-            excluded
-                .paths
-                .push(path.canonicalize().unwrap_or_else(|_| path.clone()));
-        } else {
-            excluded
-                .paths
-                .extend(normalized_roots.iter().map(|root| root.join(path)));
-        }
-    }
+    let excluded = Exclusions::new(&normalized_roots, exclusions)?;
     struct Job {
         root: usize,
         path: PathBuf,
@@ -1181,6 +1930,33 @@ pub fn scan_with_policy<F: FnMut(&Path) + Send>(
         .iter()
         .map(fs::metadata)
         .collect::<std::io::Result<Vec<_>>>()?;
+    #[cfg(target_os = "macos")]
+    let (root_mount_points, root_mount_warnings): (Vec<Option<PathBuf>>, Vec<String>) = {
+        let mut warnings = Vec::new();
+        let mount_points = normalized_roots
+            .iter()
+            .map(|root| {
+                if cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                match macos_mount_point(root) {
+                    Ok(mount) => Some(mount),
+                    Err(error) => {
+                        warnings.push(format!(
+                            "{}: mount identity unavailable: {error:#}",
+                            display_path(root)
+                        ));
+                        None
+                    }
+                }
+            })
+            .collect();
+        (mount_points, warnings)
+    };
+    #[cfg(not(target_os = "macos"))]
+    let root_mount_points: Vec<Option<PathBuf>> = vec![None; normalized_roots.len()];
+    #[cfg(not(target_os = "macos"))]
+    let root_mount_warnings: Vec<String> = Vec::new();
     #[cfg(windows)]
     let root_volumes = normalized_roots
         .iter()
@@ -1209,12 +1985,18 @@ pub fn scan_with_policy<F: FnMut(&Path) + Send>(
         warnings: vec![],
         cancelled: false,
     };
+    #[cfg(target_os = "macos")]
+    report.warnings.push(
+        "macOS mount boundaries use path-based statfs checks; a concurrent remount can affect scan estimates".into(),
+    );
+    report.warnings.extend(root_mount_warnings);
     let worker_results = std::thread::scope(|scope| {
         let mut workers = Vec::new();
         for _ in 0..4 {
             let queue = &queue;
             let progress = &progress;
             let roots = &normalized_roots;
+            let root_mount_points = &root_mount_points;
             let metadata = &root_metadata;
             #[cfg(windows)]
             let root_volumes = &root_volumes;
@@ -1279,6 +2061,15 @@ pub fn scan_with_policy<F: FnMut(&Path) + Send>(
                                 ));
                                 return vec![];
                             }
+                            #[cfg(target_os = "macos")]
+                            if !macos_mount_matches_root(
+                                path,
+                                root_mount_points[job.root].as_deref(),
+                                cancel,
+                                &mut warnings,
+                            ) {
+                                return vec![];
+                            }
                             #[cfg(windows)]
                             // shortcut: path traversal can race volume replacement; use handles before scan results authorize cleanup.
                             if !scan_directory_has_root_volume(
@@ -1301,6 +2092,16 @@ pub fn scan_with_policy<F: FnMut(&Path) + Send>(
                                 return vec![];
                             }
                             let project_here = project_at(path);
+                            if project_here.as_ref().is_some_and(|project| {
+                                project.cargo_target_dir_unresolved
+                            }) && enabled.is_none_or(|enabled| {
+                                enabled.contains(&Ecosystem::Cargo)
+                            }) {
+                                warnings.push(format!(
+                                    "{}: Cargo target-dir configuration or a known environment override is unresolved; Cargo target directories are review-only",
+                                    display_path(path)
+                                ));
+                            }
                             if project_here.is_none()
                                 && let Some((project, matches)) =
                                     job.inherited.iter().rev().find_map(|project| {
@@ -1343,7 +2144,7 @@ pub fn scan_with_policy<F: FnMut(&Path) + Send>(
                                 let measurement = size(
                                     path,
                                     &metadata[job.root],
-                                    mounts,
+                                    (mounts, root_mount_points[job.root].as_deref()),
                                     excluded,
                                     cancel,
                                     &mut notify,
@@ -1379,7 +2180,19 @@ pub fn scan_with_policy<F: FnMut(&Path) + Send>(
                                     modified_unix,
                                     classification,
                                     operation: "inspection only",
-                                    reproduction_warning: reproduction_warning_for(ecosystem, path),
+                                    reproduction_warning: if ecosystem == "cargo"
+                                        && project.cargo_target_dir_unresolved
+                                        && path == project.root.join("target").as_path()
+                                    {
+                                        Some("Cargo's project-local target-dir could not be resolved safely; this directory is shown for review only.")
+                                    } else if ecosystem == "cargo"
+                                        && project.cargo_target_dir.as_deref() == Some(path)
+                                        && path != project.root.join("target").as_path()
+                                    {
+                                        Some("Cargo's project-local target-dir points here, but this custom directory may contain user data; Upkit only inventories it for review.")
+                                    } else {
+                                        reproduction_warning_for(ecosystem, path)
+                                    },
                                     cargo_workspace: None,
                                     nested_project_marker: measurement.nested_project_marker,
                                     nested_vcs_marker: measurement.nested_vcs_marker,
@@ -1410,7 +2223,7 @@ pub fn scan_with_policy<F: FnMut(&Path) + Send>(
                                 let measurement = size(
                                     &vite_cache,
                                     &metadata[job.root],
-                                    mounts,
+                                    (mounts, root_mount_points[job.root].as_deref()),
                                     excluded,
                                     cancel,
                                     &mut notify,
@@ -1465,7 +2278,17 @@ pub fn scan_with_policy<F: FnMut(&Path) + Send>(
                             if let Some(project) = project_here {
                                 projects.push(project);
                             }
-                            children(path, cancel, &mut warnings)
+                            let children = children(path, cancel, &mut warnings);
+                            #[cfg(target_os = "macos")]
+                            if !macos_mount_matches_root(
+                                path,
+                                root_mount_points[job.root].as_deref(),
+                                cancel,
+                                &mut warnings,
+                            ) {
+                                return vec![];
+                            }
+                            children
                                 .into_iter()
                                 .map(|child| Job {
                                     root: job.root,
@@ -1517,11 +2340,48 @@ pub fn scan_with_policy<F: FnMut(&Path) + Send>(
             break;
         }
         if candidate.ecosystem == "cargo" {
-            candidate.cargo_workspace = Some(workspaces.inspect(
+            let workspace = workspaces.inspect(
                 &candidate.project_root,
                 |path| excluded.matches(path),
                 cancel,
-            ));
+            );
+            let workspace_manifest_identity = workspace
+                .workspace_root
+                .as_deref()
+                .and_then(|root| identity_at(&root.join("Cargo.toml")));
+            let workspace_proof = workspace.proof().map(str::to_owned);
+            let missing_workspace_identity =
+                workspace.workspace_root.is_some() && workspace_manifest_identity.is_none();
+            if let Some(snapshot) = candidate.snapshot.as_mut() {
+                snapshot.cargo_workspace_manifest = workspace_manifest_identity;
+                snapshot.cargo_workspace_proof = workspace_proof.clone();
+            }
+            if missing_workspace_identity || workspace_proof.is_none() {
+                candidate.snapshot = None;
+            }
+            if candidate.classification == "rebuildable"
+                && !matches!(
+                    workspace.status,
+                    "workspace_manifest" | "standalone_package"
+                )
+            {
+                candidate.classification = "review";
+                candidate.reproduction_warning = Some(match workspace.status {
+                    "member_pattern_match" => {
+                        "Cargo workspace member targets are review-only because Cargo may place their outputs under the workspace root."
+                    }
+                    "exclude_pattern_match" => {
+                        "Cargo explicitly excluded packages remain review-only because the workspace exclusion does not establish output ownership."
+                    }
+                    "manifest_unavailable" | "ancestor_limit_reached" | "outside_scan_scope" => {
+                        "Cargo workspace ancestry could not be inspected completely; this target is review-only."
+                    }
+                    _ => {
+                        "Cargo workspace membership could not be confirmed safely; this target is review-only."
+                    }
+                });
+            }
+            candidate.cargo_workspace = Some(workspace);
         }
     }
     report.cancelled = cancel.load(Ordering::Relaxed);
@@ -1531,6 +2391,166 @@ pub fn scan_with_policy<F: FnMut(&Path) + Send>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn macos_mount_names_decode_paths_and_reject_unverified_values() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().to_owned();
+        let child_mount = root.join("mounted");
+        let encode = |path: &Path| {
+            let mut bytes = path.as_os_str().as_bytes().to_vec();
+            bytes.push(0);
+            bytes
+        };
+        let root_mount = decode_macos_mount_name(&encode(&root)).unwrap();
+        let same_mount = decode_macos_mount_name(&encode(&root)).unwrap();
+        let nested_mount = decode_macos_mount_name(&encode(&child_mount)).unwrap();
+
+        assert_eq!(root_mount, root);
+        assert!(!is_macos_mount_boundary(&root_mount, &same_mount));
+        assert!(is_macos_mount_boundary(&root_mount, &nested_mount));
+        assert!(decode_macos_mount_name(b"relative\0").is_err());
+        assert!(decode_macos_mount_name(root.as_os_str().as_bytes()).is_err());
+
+        let mut warnings = Vec::new();
+        assert!(warn_if_mount_scan_cancelled(
+            &root,
+            &AtomicBool::new(true),
+            &mut warnings,
+        ));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("scan cancelled during mount inspection"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn package_declares_only_bounded_dependency_manifests() {
+        let fixture = tempfile::tempdir().unwrap();
+        let project = fixture.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let manifest = project.join("package.json");
+
+        fs::write(&manifest, br#"{"devDependencies":{"@sveltejs/kit":"^2"}}"#).unwrap();
+        #[cfg(target_os = "linux")]
+        if package_manifest(&manifest).is_none() {
+            eprintln!("Linux openat2 unavailable; package manifest reader test skipped");
+            return;
+        }
+        assert!(package_declares(&project, "@sveltejs/kit"));
+
+        fs::write(&manifest, br#"{"scripts":{"@sveltejs/kit":"^2"}}"#).unwrap();
+        assert!(!package_declares(&project, "@sveltejs/kit"));
+        fs::write(&manifest, b"not json").unwrap();
+        assert!(!package_declares(&project, "@sveltejs/kit"));
+        fs::write(&manifest, vec![b' '; MAX_PACKAGE_MANIFEST_BYTES + 1]).unwrap();
+        assert!(!package_declares(&project, "@sveltejs/kit"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_package_manifest_rejects_final_and_ancestor_reparse_points() {
+        use std::os::windows::fs::{symlink_dir, symlink_file};
+
+        let fixture = tempfile::tempdir().unwrap();
+        let project = fixture.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let manifest = project.join("package.json");
+        fs::write(&manifest, br#"{"dependencies":{"@sveltejs/kit":"^2"}}"#).unwrap();
+
+        let file_link_project = fixture.path().join("file-link-project");
+        fs::create_dir(&file_link_project).unwrap();
+        if let Err(error) = symlink_file(&manifest, file_link_project.join("package.json")) {
+            if error.raw_os_error() == Some(1314) {
+                eprintln!("Windows symlink privilege unavailable; reparse reader test skipped");
+                return;
+            }
+            panic!("create package manifest symlink fixture: {error}");
+        }
+        assert!(!package_declares(&file_link_project, "@sveltejs/kit"));
+
+        let directory_link = fixture.path().join("directory-link");
+        if let Err(error) = symlink_dir(&project, &directory_link) {
+            if error.raw_os_error() == Some(1314) {
+                eprintln!("Windows symlink privilege unavailable; ancestor reparse check skipped");
+                return;
+            }
+            panic!("create project directory symlink fixture: {error}");
+        }
+        assert!(!package_declares(&directory_link, "@sveltejs/kit"));
+    }
+
+    #[test]
+    fn cargo_inherited_and_home_configs_make_default_target_unresolved() {
+        let fixture = tempfile::tempdir().unwrap();
+        let base = fixture.path().canonicalize().unwrap();
+        let home = base.join("cargo-home");
+        let workspace = base.join("workspace");
+        let project = workspace.join("project");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
+
+        assert_eq!(
+            cargo_target_dir_with_home(&project, &home),
+            (None, None, false)
+        );
+
+        let ancestor_config = workspace.join(".cargo/config");
+        fs::create_dir_all(ancestor_config.parent().unwrap()).unwrap();
+        fs::write(&ancestor_config, "not parsed by the target resolver").unwrap();
+        assert_eq!(
+            cargo_target_dir_with_home(&project, &home),
+            (None, None, true),
+            "an ancestor config added after a preview makes the target unresolved"
+        );
+
+        fs::remove_file(&ancestor_config).unwrap();
+        fs::remove_dir(ancestor_config.parent().unwrap()).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let global_config = home.join("config.toml");
+        fs::write(&global_config, "also intentionally not parsed").unwrap();
+        assert_eq!(
+            cargo_target_dir_with_home(&project, &home),
+            (None, None, true),
+            "a Cargo home config added after a preview is an unresolved override"
+        );
+
+        fs::remove_file(global_config).unwrap();
+        fs::remove_dir(&home).unwrap();
+        #[cfg(unix)]
+        {
+            let outside = fixture.path().join("outside");
+            fs::create_dir(&outside).unwrap();
+            std::os::unix::fs::symlink(outside, workspace.join(".cargo")).unwrap();
+            assert_eq!(
+                cargo_target_dir_with_home(&project, &home),
+                (None, None, true),
+                "an uninspectable ancestor config directory fails closed"
+            );
+        }
+    }
+
+    #[test]
+    fn cargo_home_resolution_fails_closed_for_missing_or_relative_values() {
+        use std::ffi::OsStr;
+
+        assert!(cargo_home_directory_from(None, None).is_err());
+        assert!(cargo_home_directory_from(None, Some(OsStr::new("relative-home"))).is_err());
+        assert!(cargo_home_directory_from(Some(OsStr::new("relative-cargo")), None).is_err());
+
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().canonicalize().unwrap();
+        assert_eq!(
+            cargo_home_directory_from(None, Some(home.as_os_str())).unwrap(),
+            home.join(".cargo")
+        );
+        assert_eq!(
+            cargo_home_directory_from(Some(home.as_os_str()), None).unwrap(),
+            home
+        );
+    }
 
     #[cfg(unix)]
     #[test]
@@ -1696,10 +2716,14 @@ mod tests {
         fs::write(nested.join("file"), b"not counted").unwrap();
         let mounts = HashSet::from([nested]);
         let mut warnings = Vec::new();
+        #[cfg(target_os = "macos")]
+        let mount_root = Some(macos_mount_point(dir.path()).unwrap());
+        #[cfg(not(target_os = "macos"))]
+        let mount_root: Option<PathBuf> = None;
         let measurement = size(
             dir.path(),
             &fs::metadata(dir.path()).unwrap(),
-            &mounts,
+            (&mounts, mount_root.as_deref()),
             &Exclusions::default(),
             &AtomicBool::new(false),
             &mut |_| {},
@@ -1787,7 +2811,34 @@ fn identity_status(candidate: &Candidate) -> &'static str {
     if matches.len() != 1 || matches[0].0 != candidate.ecosystem {
         return "changed_or_unavailable";
     }
-    if snapshot(&project, &candidate.target, candidate.ecosystem).as_ref() == Some(expected) {
+    let Some(mut current) = snapshot(&project, &candidate.target, candidate.ecosystem) else {
+        return "changed_or_unavailable";
+    };
+    if candidate.ecosystem == "cargo" {
+        let Some(expected_proof) = expected.cargo_workspace_proof.as_deref() else {
+            return "changed_or_unavailable";
+        };
+        let roots = [candidate.project_root.clone()];
+        let evidence = crate::cargo_workspace::Inspector::new(&roots).inspect(
+            &candidate.project_root,
+            |_| false,
+            &AtomicBool::new(false),
+        );
+        let Some(current_proof) = evidence.proof() else {
+            return "changed_or_unavailable";
+        };
+        if current_proof != expected_proof {
+            return "changed_or_unavailable";
+        }
+        current.cargo_workspace_proof = Some(current_proof.to_owned());
+    }
+    if let Some(workspace_manifest) = &expected.cargo_workspace_manifest {
+        if identity_at(&workspace_manifest.path).as_ref() != Some(workspace_manifest) {
+            return "changed_or_unavailable";
+        }
+        current.cargo_workspace_manifest = Some(workspace_manifest.clone());
+    }
+    if &current == expected {
         "metadata_match"
     } else {
         "changed_or_unavailable"

@@ -1131,6 +1131,13 @@ fn scheduled_bytecode_policy_is_explicit_profile_scoped_and_age_bounded() {
     let global =
         preview_configured_install(&executable, Some(&config), None, Frequency::Daily).unwrap();
     assert!(global.scheduled_scope_token.starts_with("v3."));
+    assert!(!upkit::schedule::schedules_artifact_cleanup(&global));
+    assert!(
+        upkit::schedule::install_scan(&executable, &global, "stale", Frequency::Daily)
+            .unwrap_err()
+            .to_string()
+            .contains("preview token")
+    );
     assert!(
         global
             .service_unit
@@ -1150,6 +1157,13 @@ fn scheduled_bytecode_policy_is_explicit_profile_scoped_and_age_bounded() {
         preview_configured_install(&executable, Some(&config), Some("work"), Frequency::Daily)
             .unwrap();
     assert!(profile.scheduled_scope_token.starts_with("v2."));
+    assert!(!upkit::schedule::schedules_artifact_cleanup(&profile));
+    assert!(
+        upkit::schedule::install_scan(&executable, &profile, "stale", Frequency::Daily)
+            .unwrap_err()
+            .to_string()
+            .contains("preview token")
+    );
     assert!(profile.service_unit.contains("sweep scan"));
     write(false, true, "1d", "python");
     assert!(
@@ -1166,6 +1180,146 @@ fn scheduled_bytecode_policy_is_explicit_profile_scoped_and_age_bounded() {
         preview_configured_install(&executable, Some(&config), Some("work"), Frequency::Daily)
             .unwrap();
     assert!(profile.scheduled_scope_token.starts_with("v3."));
+    assert!(!upkit::schedule::schedules_artifact_cleanup(&profile));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn scheduled_artifact_policy_requires_explicit_ecosystems_and_thirty_days() {
+    use std::fs;
+    use upkit::schedule::{Frequency, preview_configured_install, schedules_artifact_cleanup};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("workspace");
+    let config = dir.path().join("settings.toml");
+    fs::create_dir(&root).unwrap();
+    let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+    let write = |retention: Option<&str>, ecosystems: Option<&str>| {
+        let mut text = format!(
+            "version = 1\nworkspace_roots = ['{}']\nscheduled_artifact_cleanup = true\n",
+            root.display()
+        );
+        if let Some(retention) = retention {
+            text.push_str(&format!("artifact_retention = '{retention}'\n"));
+        }
+        if let Some(ecosystems) = ecosystems {
+            text.push_str(&format!("enabled_ecosystems = {ecosystems}\n"));
+        }
+        fs::write(&config, text).unwrap();
+    };
+
+    write(Some("30d"), Some("['maven', 'zig', 'dart', 'python']"));
+    let plan =
+        preview_configured_install(&executable, Some(&config), None, Frequency::Daily).unwrap();
+    assert!(plan.scheduled_scope_token.starts_with("v4."));
+    assert!(schedules_artifact_cleanup(&plan));
+    assert!(plan.service_unit.contains("scheduled_artifact_cleanup=yes"));
+    assert!(
+        plan.service_unit
+            .contains("--yes --json --config /dev/null sweep scheduled-cleanup")
+    );
+    assert!(
+        plan.service_unit
+            .contains("--authorize-scheduled-artifact-cleanup")
+    );
+    assert!(
+        plan.service_unit
+            .contains("Description=Upkit scheduled workspace artifact cleanup")
+    );
+    assert!(plan.warning.contains("Preview only"));
+    assert!(plan.warning.contains("history attempt is reserved"));
+    assert!(plan.warning.contains("at most 8"));
+    assert!(
+        plan.warning
+            .contains("Cargo is excluded from scheduled cleanup")
+    );
+
+    let error = upkit::schedule::install_scan(&executable, &plan, "wrong-token", Frequency::Daily)
+        .unwrap_err();
+    assert!(error.to_string().contains("token"));
+
+    let installed = upkit::schedule::DisableSchedulePreview {
+        unit_directory: plan.unit_directory.clone(),
+        service_unit: plan.service_unit.clone(),
+        timer_unit: plan.timer_unit.clone(),
+        active_state: "inactive".into(),
+        unit_file_state: Some("disabled".into()),
+        preview_token: "fixture-disabled".into(),
+        warning: "fixture",
+    };
+    let enable = upkit::schedule::EnableSchedulePreview {
+        intended: plan.clone(),
+        installed: installed.clone(),
+        preview_token: "fixture-enable".into(),
+        warning: "fixture",
+    };
+    let error = upkit::schedule::enable_scan(&executable, &enable, "wrong-token", Frequency::Daily)
+        .unwrap_err();
+    assert!(error.to_string().contains("token"));
+
+    let edit = upkit::schedule::EditSchedulePreview {
+        previous: upkit::schedule::RemoveSchedulePreview {
+            existing: installed,
+            quarantine_paths: Vec::new(),
+            preview_token: "fixture-remove".into(),
+            warning: "fixture",
+        },
+        replacement: plan.clone(),
+        preview_token: "fixture-edit".into(),
+        warning: "fixture",
+    };
+    let error = upkit::schedule::edit_scan(&executable, &edit, "wrong-token", Frequency::Daily)
+        .unwrap_err();
+    assert!(error.to_string().contains("token"));
+
+    for (retention, ecosystems) in [
+        (Some("29d"), Some("['cargo']")),
+        (None, Some("['cargo']")),
+        (Some("30d"), None),
+        (Some("30d"), Some("[]")),
+        (Some("30d"), Some("['go']")),
+    ] {
+        write(retention, ecosystems);
+        assert!(
+            preview_configured_install(&executable, Some(&config), None, Frequency::Daily).is_err(),
+            "retention={retention:?}, ecosystems={ecosystems:?}"
+        );
+    }
+    write(Some("30d"), Some("['cargo']"));
+    let error =
+        preview_configured_install(&executable, Some(&config), None, Frequency::Daily).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Cargo is excluded from scheduled cleanup")
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn global_artifact_opt_in_does_not_enable_profiles_or_legacy_v2_v3_scopes() {
+    use std::fs;
+    use upkit::schedule::{Frequency, preview_configured_install, schedules_artifact_cleanup};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("workspace");
+    let config = dir.path().join("settings.toml");
+    fs::create_dir(&root).unwrap();
+    fs::write(
+        &config,
+        format!(
+            "version = 1\nworkspace_roots = ['{}']\nartifact_retention = '30d'\nenabled_ecosystems = ['python']\nscheduled_artifact_cleanup = true\n[profiles.work]\nworkspace_roots = ['{}']\nartifact_retention = '30d'\nenabled_ecosystems = ['python']\n",
+            root.display(),
+            root.display(),
+        ),
+    )
+    .unwrap();
+    let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+    let profile =
+        preview_configured_install(&executable, Some(&config), Some("work"), Frequency::Daily)
+            .unwrap();
+    assert!(profile.scheduled_scope_token.starts_with("v2."));
+    assert!(!schedules_artifact_cleanup(&profile));
 }
 
 #[cfg(target_os = "linux")]
@@ -1245,6 +1399,123 @@ fn configured_schedule_rejects_policy_and_profile_drift_before_activation_and_sc
             &plan.scheduled_scope_token
         )
         .is_err()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn scheduled_scan_and_bytecode_cleanup_leave_go_output_directories_untouched() {
+    use std::{
+        fs::{self, FileTimes},
+        time::{Duration, SystemTime},
+    };
+    use upkit::schedule::{Frequency, preview_configured_install, run_guarded_scan};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("workspace");
+    let config = dir.path().join("settings.toml");
+    let build = root.join("build");
+    let bin = root.join("bin");
+    let pycache = root.join("python/__pycache__");
+    let old = SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60);
+    fs::create_dir_all(&build).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&pycache).unwrap();
+    fs::write(
+        root.join("go.mod"),
+        "module example.invalid/service\ngo 1.22\n",
+    )
+    .unwrap();
+    fs::write(build.join("keep"), "Go build fixture").unwrap();
+    fs::write(bin.join("keep"), "Go bin fixture").unwrap();
+    fs::write(root.join("python/pyproject.toml"), "[project]\n").unwrap();
+    fs::write(
+        pycache.join("fixture.cpython-312.pyc"),
+        "Python bytecode fixture",
+    )
+    .unwrap();
+    for path in [
+        root.join("go.mod"),
+        build.join("keep"),
+        build.clone(),
+        bin.join("keep"),
+        bin.clone(),
+        root.join("python/pyproject.toml"),
+        pycache.join("fixture.cpython-312.pyc"),
+        pycache.clone(),
+    ] {
+        fs::File::open(path)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(old))
+            .unwrap();
+    }
+    fs::write(
+        &config,
+        format!(
+            "version = 1\nworkspace_roots = ['{}']\nartifact_retention = '0h'\nenabled_ecosystems = ['go', 'python']\n",
+            root.display()
+        ),
+    )
+    .unwrap();
+
+    let executable = std::env::current_exe().unwrap();
+    let plan =
+        preview_configured_install(&executable, Some(&config), None, Frequency::Daily).unwrap();
+    let report = run_guarded_scan(
+        &executable,
+        &plan.roots,
+        &plan.exclusions,
+        &plan.scheduled_scope_token,
+    )
+    .unwrap();
+    assert_eq!(report.candidates.len(), 3);
+    assert_eq!(
+        report
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.ecosystem == "go" && candidate.classification == "review")
+            .count(),
+        2
+    );
+
+    fs::write(
+        &config,
+        format!(
+            "version = 1\nworkspace_roots = ['{}']\nartifact_retention = '7d'\nenabled_ecosystems = ['go', 'python']\nscheduled_bytecode_cleanup = true\n",
+            root.display()
+        ),
+    )
+    .unwrap();
+    let cleanup_plan =
+        preview_configured_install(&executable, Some(&config), None, Frequency::Daily).unwrap();
+    let cleanup = upkit::scheduled_cleanup::run(
+        &dir.path().join("upkit-home"),
+        &executable,
+        &cleanup_plan.roots,
+        &cleanup_plan.exclusions,
+        &cleanup_plan.scheduled_scope_token,
+        true,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(cleanup.candidates, 1);
+    assert_eq!(cleanup.items.len(), 1);
+    assert_eq!(cleanup.items[0].status, "skipped_unverified");
+    assert_eq!(
+        cleanup.items[0].file,
+        pycache.join("fixture.cpython-312.pyc")
+    );
+    assert_eq!(
+        fs::read_to_string(build.join("keep")).unwrap(),
+        "Go build fixture"
+    );
+    assert_eq!(
+        fs::read_to_string(bin.join("keep")).unwrap(),
+        "Go bin fixture"
+    );
+    assert_eq!(
+        fs::read_to_string(pycache.join("fixture.cpython-312.pyc")).unwrap(),
+        "Python bytecode fixture"
     );
 }
 
@@ -2384,7 +2655,13 @@ esac
         cleanup_edit["warning"]
             .as_str()
             .unwrap()
-            .contains("automatic permanent bytecode cleanup")
+            .contains("automatic permanent cleanup")
+    );
+    assert!(
+        cleanup_edit["replacement"]["warning"]
+            .as_str()
+            .unwrap()
+            .contains("eligible Python bytecode")
     );
     assert!(
         cleanup_edit["replacement"]["service_unit"]
@@ -2427,7 +2704,13 @@ esac
         cleanup_enable["warning"]
             .as_str()
             .unwrap()
-            .contains("automatic permanent bytecode cleanup")
+            .contains("automatic permanent cleanup")
+    );
+    assert!(
+        cleanup_enable["intended"]["warning"]
+            .as_str()
+            .unwrap()
+            .contains("eligible Python bytecode")
     );
     let cleanup_enabled = json(&run(&[
         "schedule",

@@ -36,7 +36,29 @@ pub struct ScanSchedulePreview {
 
 /// Whether the reviewed plan runs the opt-in scheduled bytecode cleanup.
 pub fn schedules_bytecode_cleanup(plan: &ScanSchedulePreview) -> bool {
-    plan.scheduled_scope_token.starts_with("v3.")
+    policy_from_token(&plan.scheduled_scope_token)
+        .ok()
+        .flatten()
+        .is_some_and(|policy| policy.scheduled_bytecode_cleanup)
+}
+
+/// Whether the reviewed plan explicitly opts into bounded artifact cleanup.
+pub fn schedules_artifact_cleanup(plan: &ScanSchedulePreview) -> bool {
+    policy_from_token(&plan.scheduled_scope_token)
+        .ok()
+        .flatten()
+        .is_some_and(|policy| policy.scheduled_artifact_cleanup)
+}
+
+fn ensure_artifact_schedule_supported(plan: &ScanSchedulePreview) -> Result<()> {
+    if schedules_artifact_cleanup(plan) && !cfg!(target_os = "linux") {
+        bail!("scheduled artifact cleanup is supported only on Linux");
+    }
+    Ok(())
+}
+
+fn schedules_cleanup(plan: &ScanSchedulePreview) -> bool {
+    schedules_bytecode_cleanup(plan) || schedules_artifact_cleanup(plan)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -57,10 +79,44 @@ struct ScheduledScanPolicy {
     source: Option<ConfiguredSource>,
     #[serde(default, skip_serializing_if = "is_false")]
     scheduled_bytecode_cleanup: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    scheduled_artifact_cleanup: bool,
 }
 
 fn is_false(value: &bool) -> bool {
     !value
+}
+
+fn scheduled_artifact_ecosystem(ecosystem: crate::sweep::Ecosystem) -> bool {
+    matches!(
+        ecosystem,
+        crate::sweep::Ecosystem::Maven
+            | crate::sweep::Ecosystem::Zig
+            | crate::sweep::Ecosystem::Dart
+            | crate::sweep::Ecosystem::Python
+    )
+}
+
+fn validate_scheduled_artifact_policy(
+    older_than: Option<Duration>,
+    enabled: Option<&[crate::sweep::Ecosystem]>,
+) -> Result<()> {
+    const MIN_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+    if older_than.is_none_or(|age| age < MIN_RETENTION) {
+        bail!("scheduled artifact cleanup requires artifact_retention of at least 30 days");
+    }
+    let Some(enabled) = enabled.filter(|items| !items.is_empty()) else {
+        bail!("scheduled artifact cleanup requires an explicit nonempty enabled_ecosystems list");
+    };
+    if !enabled
+        .iter()
+        .any(|ecosystem| scheduled_artifact_ecosystem(*ecosystem))
+    {
+        bail!(
+            "scheduled artifact cleanup requires Maven, Zig, Dart, or Python enabled; Cargo is excluded from scheduled cleanup until target-directory safety can be verified"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -75,13 +131,16 @@ struct ConfiguredScanScope {
     older_than: Option<Duration>,
     enabled_ecosystems: Option<Vec<crate::sweep::Ecosystem>>,
     scheduled_bytecode_cleanup: bool,
+    scheduled_artifact_cleanup: bool,
     source: ConfiguredSource,
 }
 
 impl ConfiguredScanScope {
     fn policy(&self) -> ScheduledScanPolicy {
         ScheduledScanPolicy {
-            version: if self.scheduled_bytecode_cleanup {
+            version: if self.scheduled_artifact_cleanup {
+                4
+            } else if self.scheduled_bytecode_cleanup {
                 3
             } else {
                 2
@@ -91,6 +150,7 @@ impl ConfiguredScanScope {
             enabled_ecosystems: self.enabled_ecosystems.clone(),
             source: Some(self.source.clone()),
             scheduled_bytecode_cleanup: self.scheduled_bytecode_cleanup,
+            scheduled_artifact_cleanup: self.scheduled_artifact_cleanup,
         }
     }
 }
@@ -387,7 +447,8 @@ fn launchd_parse_scan_plist(plist: &str) -> Result<LaunchdScan> {
         .context("launchd property list has no scope token")?
         .to_owned();
     match policy_from_token(&scope_token)? {
-        Some(policy) if !policy.scheduled_bytecode_cleanup => {}
+        Some(policy)
+            if !policy.scheduled_bytecode_cleanup && !policy.scheduled_artifact_cleanup => {}
         Some(_) => bail!("launchd automatic cleanup is unsupported"),
         None if scope_token.len() == 64
             && scope_token.bytes().all(|byte| byte.is_ascii_hexdigit()) => {}
@@ -817,7 +878,8 @@ pub fn scheduled_scope_token(
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn policy_token(scope_token: String, policy: ScheduledScanPolicy) -> Result<String> {
     use sha2::{Digest, Sha256};
-    let cleanup = policy.scheduled_bytecode_cleanup;
+    let artifact_cleanup = policy.scheduled_artifact_cleanup;
+    let bytecode_cleanup = policy.scheduled_bytecode_cleanup;
     let payload = serde_json::to_vec(&ScheduledScanPolicy {
         scope_token,
         ..policy
@@ -826,7 +888,9 @@ fn policy_token(scope_token: String, policy: ScheduledScanPolicy) -> Result<Stri
         bail!("scheduled scan policy exceeds the supported size limit");
     }
     let mut hash = Sha256::new();
-    let (prefix, domain): (&str, &[u8]) = if cleanup {
+    let (prefix, domain): (&str, &[u8]) = if artifact_cleanup {
+        ("v4", b"upkit-scheduled-artifact-policy-v4\0")
+    } else if bytecode_cleanup {
         ("v3", b"upkit-scheduled-bytecode-policy-v3\0")
     } else {
         ("v2", b"upkit-scheduled-scan-policy-v2\0")
@@ -842,7 +906,7 @@ fn policy_token(scope_token: String, policy: ScheduledScanPolicy) -> Result<Stri
 }
 
 fn policy_from_token(token: &str) -> Result<Option<ScheduledScanPolicy>> {
-    if !token.starts_with("v2.") && !token.starts_with("v3.") {
+    if !token.starts_with("v2.") && !token.starts_with("v3.") && !token.starts_with("v4.") {
         return Ok(None);
     }
     if token.len() > 24_644 {
@@ -858,10 +922,10 @@ fn policy_from_token(token: &str) -> Result<Option<ScheduledScanPolicy>> {
     }
     use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();
-    hash.update(if prefix == "v3" {
-        &b"upkit-scheduled-bytecode-policy-v3\0"[..]
-    } else {
-        &b"upkit-scheduled-scan-policy-v2\0"[..]
+    hash.update(match prefix {
+        "v4" => &b"upkit-scheduled-artifact-policy-v4\0"[..],
+        "v3" => &b"upkit-scheduled-bytecode-policy-v3\0"[..],
+        _ => &b"upkit-scheduled-scan-policy-v2\0"[..],
     });
     hash.update((payload.len() as u64).to_be_bytes());
     hash.update(&payload);
@@ -870,8 +934,15 @@ fn policy_from_token(token: &str) -> Result<Option<ScheduledScanPolicy>> {
     }
     let policy: ScheduledScanPolicy =
         serde_json::from_slice(&payload).context("parse scheduled scan policy token")?;
-    if (prefix == "v2" && (policy.version != 2 || policy.scheduled_bytecode_cleanup))
-        || (prefix == "v3" && (policy.version != 3 || !policy.scheduled_bytecode_cleanup))
+    if (prefix == "v2"
+        && (policy.version != 2
+            || policy.scheduled_bytecode_cleanup
+            || policy.scheduled_artifact_cleanup))
+        || (prefix == "v3"
+            && (policy.version != 3
+                || !policy.scheduled_bytecode_cleanup
+                || policy.scheduled_artifact_cleanup))
+        || (prefix == "v4" && (policy.version != 4 || !policy.scheduled_artifact_cleanup))
         || policy.scope_token.len() != 64
         || !policy
             .scope_token
@@ -891,6 +962,15 @@ fn policy_from_token(token: &str) -> Result<Option<ScheduledScanPolicy>> {
                 .is_some_and(|enabled| !enabled.contains(&crate::sweep::Ecosystem::Python)))
     {
         bail!("invalid scheduled bytecode cleanup policy");
+    }
+    if policy.scheduled_artifact_cleanup {
+        if policy.source.is_none() {
+            bail!("scheduled artifact cleanup requires a configured scope policy");
+        }
+        validate_scheduled_artifact_policy(
+            policy.older_than_seconds.map(Duration::from_secs),
+            policy.enabled_ecosystems.as_deref(),
+        )?;
     }
     Ok(Some(policy))
 }
@@ -949,13 +1029,18 @@ fn schedule_policy_comment(policy: &ScheduledScanPolicy) -> Result<String> {
     } else {
         ""
     };
-    let kind = if policy.scheduled_bytecode_cleanup {
+    let artifact_cleanup = if policy.scheduled_artifact_cleanup {
+        "; scheduled_artifact_cleanup=yes"
+    } else {
+        ""
+    };
+    let kind = if policy.scheduled_bytecode_cleanup || policy.scheduled_artifact_cleanup {
         "Cleanup"
     } else {
         "Scan"
     };
     Ok(format!(
-        "# {kind} policy snapshot: older_than_seconds={}; enabled_ecosystems={enabled_ecosystems}; config_path={config_path}; config_required={config_required}; profile_present={profile_present}; profile={profile}{cleanup}\n",
+        "# {kind} policy snapshot: older_than_seconds={}; enabled_ecosystems={enabled_ecosystems}; config_path={config_path}; config_required={config_required}; profile_present={profile_present}; profile={profile}{cleanup}{artifact_cleanup}\n",
         policy
             .older_than_seconds
             .map_or_else(|| "all".to_owned(), |age| age.to_string()),
@@ -1054,8 +1139,8 @@ pub fn run_guarded_scan(
 ) -> Result<crate::sweep::ScanReport> {
     let actual = scheduled_scope_token(executable, roots, exclusions)?;
     let (older_than, enabled) = if let Some(policy) = policy_from_token(token)? {
-        if policy.scheduled_bytecode_cleanup {
-            bail!("scheduled bytecode cleanup requires its dedicated command");
+        if policy.scheduled_bytecode_cleanup || policy.scheduled_artifact_cleanup {
+            bail!("scheduled cleanup requires its dedicated command");
         }
         if policy.scope_token != actual {
             bail!("scheduled scan scope or executable changed; inspect and create a new schedule");
@@ -1102,6 +1187,50 @@ pub(crate) fn verified_bytecode_scope(
         older_than_seconds: policy.older_than_seconds,
         enabled: policy.enabled_ecosystems,
     })
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn verified_artifact_scope(
+    executable: &Path,
+    roots: &[PathBuf],
+    exclusions: &[PathBuf],
+    token: &str,
+) -> Result<crate::sweep::Scope> {
+    let policy = policy_from_token(token)?.context("scheduled cleanup requires a policy token")?;
+    if !policy.scheduled_artifact_cleanup {
+        bail!("scheduled artifact cleanup was not approved in this policy");
+    }
+    if policy.scope_token != scheduled_scope_token(executable, roots, exclusions)? {
+        bail!("scheduled cleanup scope or executable changed; inspect and create a new schedule");
+    }
+    verify_configured_source(&policy, roots, exclusions)?;
+    Ok(crate::sweep::Scope {
+        roots: roots.to_vec(),
+        exclusions: exclusions.to_vec(),
+        older_than_seconds: policy.older_than_seconds,
+        enabled: policy.enabled_ecosystems,
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn scheduled_cleanup_modes(
+    executable: &Path,
+    roots: &[PathBuf],
+    exclusions: &[PathBuf],
+    token: &str,
+) -> Result<(bool, bool)> {
+    let policy = policy_from_token(token)?.context("scheduled cleanup requires a policy token")?;
+    if !policy.scheduled_bytecode_cleanup && !policy.scheduled_artifact_cleanup {
+        bail!("scheduled cleanup was not approved in this policy");
+    }
+    if policy.scope_token != scheduled_scope_token(executable, roots, exclusions)? {
+        bail!("scheduled cleanup scope or executable changed; inspect and create a new schedule");
+    }
+    verify_configured_source(&policy, roots, exclusions)?;
+    Ok((
+        policy.scheduled_bytecode_cleanup,
+        policy.scheduled_artifact_cleanup,
+    ))
 }
 
 /// Render a platform schedule plan without writing it or calling the manager.
@@ -1205,9 +1334,13 @@ fn preview_scan_with_policy(
         scope_token
     };
     let decoded_policy = policy_from_token(&scheduled_scope_token)?;
-    let cleanup = decoded_policy
+    let bytecode_cleanup = decoded_policy
         .as_ref()
         .is_some_and(|policy| policy.scheduled_bytecode_cleanup);
+    let artifact_cleanup = decoded_policy
+        .as_ref()
+        .is_some_and(|policy| policy.scheduled_artifact_cleanup);
+    let cleanup = bytecode_cleanup || artifact_cleanup;
     #[cfg(target_os = "macos")]
     if cleanup {
         bail!("automatic scheduled cleanup is supported only on Linux");
@@ -1219,13 +1352,27 @@ fn preview_scan_with_policy(
         .transpose()?
         .unwrap_or_default();
     #[cfg(target_os = "linux")]
-    let (description, command) = if cleanup {
-        (
-            "Upkit scheduled Python bytecode cleanup",
-            "scheduled-bytecode-cleanup --authorize-scheduled-cleanup",
-        )
+    let description = if artifact_cleanup {
+        "Upkit scheduled workspace artifact cleanup"
+    } else if bytecode_cleanup {
+        "Upkit scheduled Python bytecode cleanup"
     } else {
-        ("Upkit workspace artifact scan", "scan")
+        "Upkit workspace artifact scan"
+    };
+    #[cfg(target_os = "linux")]
+    let command = if artifact_cleanup {
+        format!(
+            "scheduled-cleanup --authorize-scheduled-artifact-cleanup{}",
+            if bytecode_cleanup {
+                " --authorize-scheduled-cleanup"
+            } else {
+                ""
+            }
+        )
+    } else if bytecode_cleanup {
+        "scheduled-bytecode-cleanup --authorize-scheduled-cleanup".to_owned()
+    } else {
+        "scan".to_owned()
     };
     #[cfg(target_os = "linux")]
     let authorization = if cleanup { " --yes" } else { "" };
@@ -1274,6 +1421,8 @@ fn preview_scan_with_policy(
             } else {
                 "Preview only; no LaunchAgent is installed. After explicit confirmation, Upkit creates a private user-owned plist and enables it in the current user's GUI launchd domain. RunAtLoad is false; read-only scans run at 03:00 local time daily or Sunday weekly. The token is not authorization. Only the explicit roots and exclusions apply; configuration profiles, retention and ecosystem filters are not applied. Executable and workspace identities are checked before each scan; paths can change during traversal."
             }
+        } else if artifact_cleanup {
+            "Preview only; no timer is installed. After explicit authorization, scheduled cleanup can permanently remove at most 8 explicitly scoped rebuildable project artifacts per run after at least 30 days. The profile must list enabled ecosystems; only Maven targets, Zig cache, Dart generated state, and Python pytest/mypy caches qualify. Cargo is excluded from scheduled cleanup until target-directory configuration can be verified safely. A local history attempt is reserved before each removal; interrupted or failed writes may leave incomplete records. No project scripts run."
         } else if cleanup {
             "This timer automatically and permanently removes eligible Python bytecode in the listed workspaces after the configured retention period, at most 32 files per run. It excludes unchecked-hash caches and never removes Trash, shared caches, or artifact directories. Each file is rechecked against project, Git, process, path, source and configuration policy; header validation cannot prove bytecode matches source. The scan and removal results are written to the user journal, and Upkit attempts to record them in local history. Installation requires an existing private user unit directory and may run promptly. Concurrent changes can race the checks; interruption can leave a quarantine file."
         } else if configured {
@@ -1402,37 +1551,40 @@ fn launchd_status_with(executable: &Path) -> crate::maintenance::TimerStatus {
         Err(_) => return unavailable("could not start launchctl"),
     };
     let Some(mut stdout) = child.stdout.take() else {
-        stop_launchd_process_group(&mut child);
+        stop_child_process_group(&mut child);
         return unavailable("launchctl output unavailable");
     };
     if rustix::fs::fcntl_getfl(&stdout)
         .and_then(|flags| rustix::fs::fcntl_setfl(&stdout, flags | rustix::fs::OFlags::NONBLOCK))
         .is_err()
     {
-        stop_launchd_process_group(&mut child);
+        stop_child_process_group(&mut child);
         return unavailable("could not bound launchctl output reads");
     }
 
     let mut output = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(2);
     let result = loop {
-        let stdout_eof = match collect_launchd_pipe(&mut stdout, &mut output, OUTPUT_LIMIT) {
+        let stdout_eof = match collect_process_output(&mut stdout, &mut output, OUTPUT_LIMIT) {
             Ok(eof) => eof,
             Err(detail) => {
-                stop_launchd_process_group(&mut child);
+                stop_child_process_group(&mut child);
                 return unavailable(detail);
             }
         };
-        match child.try_wait() {
-            Ok(Some(status)) if stdout_eof => break status,
-            Ok(Some(_)) | Ok(None) if Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(10));
-            }
-            _ => {
-                stop_launchd_process_group(&mut child);
-                return unavailable("launchctl timed out or could not be monitored");
+        // Avoid reaping the group leader while its output is still open.
+        if stdout_eof {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(_) => return unavailable("launchctl could not be monitored"),
             }
         }
+        if Instant::now() >= deadline {
+            stop_child_process_group(&mut child);
+            return unavailable("launchctl timed out");
+        }
+        thread::sleep(Duration::from_millis(10));
     };
     if !result.success() {
         return unavailable("launchctl query failed; manager state is unavailable");
@@ -1456,8 +1608,8 @@ fn launchd_status_with(executable: &Path) -> crate::maintenance::TimerStatus {
     }
 }
 
-#[cfg(any(target_os = "macos", all(test, unix)))]
-fn collect_launchd_pipe(
+#[cfg(any(target_os = "linux", target_os = "macos", all(test, unix)))]
+fn collect_process_output(
     reader: &mut impl std::io::Read,
     output: &mut Vec<u8>,
     limit: usize,
@@ -1469,10 +1621,10 @@ fn collect_launchd_pipe(
             Ok(count) if output.len() + count <= limit => {
                 output.extend_from_slice(&buffer[..count]);
             }
-            Ok(_) => return Err("launchctl output exceeded limit"),
+            Ok(_) => return Err("process output exceeded limit"),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return Err("could not read launchctl output"),
+            Err(_) => return Err("could not read child process output"),
         }
     }
 }
@@ -1504,9 +1656,10 @@ fn launchd_list_has_label(output: &[u8], label: &str) -> Option<bool> {
 }
 
 #[cfg(any(target_os = "macos", all(test, unix)))]
-fn stop_launchd_process_group(child: &mut std::process::Child) {
+fn stop_child_process_group(child: &mut std::process::Child) {
     use rustix::process::{Pid, Signal, kill_process_group};
 
+    // shortcut: external child reaping can release this ID; use stable process handles if available.
     if let Some(pid) = i32::try_from(child.id()).ok().and_then(Pid::from_raw) {
         let _ = kill_process_group(pid, Signal::KILL);
     }
@@ -1593,18 +1746,33 @@ mod launchd_status_tests {
         assert_eq!(status.state, "unavailable");
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
+
+    #[test]
+    fn timeout_stops_pipe_holder_after_fake_manager_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = fake_launchctl(dir.path(), "( sleep 3; : > \"$0.marker\" ) &\nexit 0");
+        let status = launchd_status_with(&manager);
+        assert_eq!(status.state, "unavailable");
+        assert!(status.detail.unwrap().contains("timed out"));
+        std::thread::sleep(std::time::Duration::from_millis(1_200));
+        assert!(!manager.with_extension("marker").exists());
+    }
 }
 
 #[cfg(target_os = "linux")]
 fn systemctl(args: &[&str]) -> Result<String> {
-    use std::{
-        io::Read,
-        process::{Command, Stdio},
-        sync::mpsc,
-        thread,
-        time::{Duration, Instant},
-    };
     let executable = which::which("systemctl").context("systemctl not found")?;
+    systemctl_with(&executable, args, Duration::from_secs(10))
+}
+
+#[cfg(target_os = "linux")]
+fn systemctl_with(executable: &Path, args: &[&str], timeout: Duration) -> Result<String> {
+    use std::{
+        process::{Command, Stdio},
+        thread,
+        time::Instant,
+    };
+    const OUTPUT_LIMIT: usize = 65_536;
     let mut child = Command::new(executable)
         .arg("--user")
         .args(args)
@@ -1615,36 +1783,108 @@ fn systemctl(args: &[&str]) -> Result<String> {
         .stderr(Stdio::null())
         .spawn()
         .context("start systemctl")?;
-    let mut stdout = child.stdout.take().context("capture systemctl output")?;
-    let (tx, rx) = mpsc::sync_channel(1);
-    thread::spawn(move || {
-        let mut data = Vec::new();
-        let result = stdout.by_ref().take(65537).read_to_end(&mut data);
-        let _ = tx.send((result, data));
-    });
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("capture systemctl output; outcome may be unknown");
+    };
+    if rustix::fs::fcntl_getfl(&stdout)
+        .and_then(|flags| rustix::fs::fcntl_setfl(&stdout, flags | rustix::fs::OFlags::NONBLOCK))
+        .is_err()
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("could not bound systemctl output reads; outcome may be unknown");
+    }
+    let deadline = Instant::now() + timeout;
+    let mut data = Vec::new();
+    let mut child_status = None;
     let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
-            _ => {
+        if child_status.is_none() {
+            child_status = child
+                .try_wait()
+                .context("systemctl could not be monitored; outcome may be unknown")?;
+        }
+        let stdout_eof = match collect_process_output(&mut stdout, &mut data, OUTPUT_LIMIT) {
+            Ok(eof) => eof,
+            Err(error) => {
+                if child_status.is_none() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                bail!("{error}; systemctl outcome may be unknown");
+            }
+        };
+        if stdout_eof && let Some(status) = child_status.take() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            if child_status.is_none() {
                 let _ = child.kill();
                 let _ = child.wait();
-                bail!("systemctl timed out or could not be monitored; outcome may be unknown");
             }
+            bail!("systemctl timed out; outcome may be unknown");
         }
+        thread::sleep(Duration::from_millis(10));
     };
-    let (read, data) = rx
-        .recv_timeout(Duration::from_millis(100))
-        .context("systemctl output unavailable")?;
-    read.context("read systemctl output")?;
-    if data.len() > 65536 {
-        bail!("systemctl output exceeded limit");
-    }
     if !status.success() {
         bail!("systemctl failed; inspect user manager state before retrying");
     }
     String::from_utf8(data).context("systemctl output is not UTF-8")
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod systemctl_tests {
+    use super::systemctl_with;
+    use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
+
+    #[test]
+    fn reads_fake_manager_output() {
+        let fixture = tempfile::tempdir().unwrap();
+        let manager = fixture.path().join("systemctl");
+        fs::write(&manager, "#!/bin/sh\nprintf '%s' \"$1:$2\"\n").unwrap();
+        fs::set_permissions(&manager, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(
+            systemctl_with(&manager, &["show"], Duration::from_secs(2)).unwrap(),
+            "--user:show"
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_fake_manager_output() {
+        let fixture = tempfile::tempdir().unwrap();
+        let manager = fixture.path().join("systemctl");
+        fs::write(
+            &manager,
+            "#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 7000 ]; do printf '0123456789'; i=$((i + 1)); done\n",
+        )
+        .unwrap();
+        fs::set_permissions(&manager, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = systemctl_with(&manager, &["show"], Duration::from_secs(5)).unwrap_err();
+        assert!(error.to_string().contains("output exceeded limit"));
+        assert!(error.to_string().contains("outcome may be unknown"));
+    }
+
+    #[test]
+    fn timeout_returns_when_a_descendant_holds_stdout() {
+        let fixture = tempfile::tempdir().unwrap();
+        let manager = fixture.path().join("systemctl");
+        let marker = fixture.path().join("descendant-ran");
+        fs::write(&manager, "#!/bin/sh\n( sleep 1; : > \"$2\" ) &\nexit 0\n").unwrap();
+        fs::set_permissions(&manager, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = systemctl_with(
+            &manager,
+            &[marker.to_str().unwrap()],
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        std::thread::sleep(Duration::from_millis(1_100));
+        assert!(marker.exists());
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1890,36 +2130,38 @@ fn launchd_output_with(
         .spawn()
         .context("could not start launchctl")?;
     let Some(mut stdout) = child.stdout.take() else {
-        stop_launchd_process_group(&mut child);
+        stop_child_process_group(&mut child);
         bail!("launchctl output unavailable");
     };
     if rustix::fs::fcntl_getfl(&stdout)
         .and_then(|flags| rustix::fs::fcntl_setfl(&stdout, flags | rustix::fs::OFlags::NONBLOCK))
         .is_err()
     {
-        stop_launchd_process_group(&mut child);
+        stop_child_process_group(&mut child);
         bail!("could not bound launchctl output reads");
     }
     let mut output = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        let eof = match collect_launchd_pipe(&mut stdout, &mut output, OUTPUT_LIMIT) {
+        let eof = match collect_process_output(&mut stdout, &mut output, OUTPUT_LIMIT) {
             Ok(eof) => eof,
             Err(error) => {
-                stop_launchd_process_group(&mut child);
+                stop_child_process_group(&mut child);
                 bail!("{error}");
             }
         };
-        match child.try_wait() {
-            Ok(Some(status)) if eof => return Ok((status, output)),
-            Ok(Some(_)) | Ok(None) if Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(10));
-            }
-            _ => {
-                stop_launchd_process_group(&mut child);
-                bail!("launchctl timed out or could not be monitored");
+        if eof {
+            match child.try_wait() {
+                Ok(Some(status)) => return Ok((status, output)),
+                Ok(None) => {}
+                Err(_) => bail!("launchctl could not be monitored"),
             }
         }
+        if Instant::now() >= deadline {
+            stop_child_process_group(&mut child);
+            bail!("launchctl timed out");
+        }
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -1945,10 +2187,13 @@ fn launchd_run_with(executable: &Path, args: &[&str]) -> Result<()> {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
-            _ => {
-                stop_launchd_process_group(&mut child);
+            Ok(None) => {
+                stop_child_process_group(&mut child);
                 bail!("launchctl timed out; inspect user manager state before retrying");
             }
+            Err(_) => bail!(
+                "launchctl could not be monitored; inspect user manager state before retrying"
+            ),
         }
     };
     if !status.success() {
@@ -2045,6 +2290,7 @@ pub fn install_scan(
     token: &str,
     frequency: Frequency,
 ) -> Result<&'static str> {
+    ensure_artifact_schedule_supported(plan)?;
     install_scan_checked(executable, plan, token, frequency, || Ok(()))
 }
 
@@ -2055,6 +2301,7 @@ pub fn install_scan(
     token: &str,
     frequency: Frequency,
 ) -> Result<&'static str> {
+    ensure_artifact_schedule_supported(plan)?;
     launchd_install_scan_checked(executable, plan, token, frequency, || Ok(()))
 }
 
@@ -2065,6 +2312,7 @@ pub fn install_scan(
     token: &str,
     frequency: Frequency,
 ) -> Result<&'static str> {
+    ensure_artifact_schedule_supported(plan)?;
     windows::install_scan(executable, plan, token, frequency, || Ok(()))
 }
 
@@ -2465,21 +2713,26 @@ pub fn preview_disable() -> Result<DisableSchedulePreview> {
         .and_then(|(_, rest)| rest.split_whitespace().next())
         .unwrap_or_default();
     let service_policy = policy_from_token(service_token)?;
-    let cleanup = service_policy
+    let bytecode_cleanup = service_policy
         .as_ref()
         .is_some_and(|policy| policy.scheduled_bytecode_cleanup);
+    let artifact_cleanup = service_policy
+        .as_ref()
+        .is_some_and(|policy| policy.scheduled_artifact_cleanup);
+    let cleanup = bytecode_cleanup || artifact_cleanup;
     let description = if cleanup {
-        "Upkit scheduled Python bytecode cleanup"
+        if artifact_cleanup {
+            "Upkit scheduled workspace artifact cleanup"
+        } else {
+            "Upkit scheduled Python bytecode cleanup"
+        }
     } else {
         "Upkit workspace artifact scan"
     };
+    let service_description = format!("Description={description}");
     let service_prefix = [
         "[Unit]",
-        if cleanup {
-            "Description=Upkit scheduled Python bytecode cleanup"
-        } else {
-            "Description=Upkit workspace artifact scan"
-        },
+        service_description.as_str(),
         "",
         "[Service]",
         "Type=oneshot",
@@ -2494,10 +2747,27 @@ pub fn preview_disable() -> Result<DisableSchedulePreview> {
         }
         None => service_lines.len() == 6,
     };
+    let cleanup_command = if artifact_cleanup {
+        format!(
+            "sweep scheduled-cleanup --authorize-scheduled-artifact-cleanup{}",
+            if bytecode_cleanup {
+                " --authorize-scheduled-cleanup"
+            } else {
+                ""
+            }
+        )
+    } else if bytecode_cleanup {
+        "sweep scheduled-bytecode-cleanup --authorize-scheduled-cleanup".into()
+    } else {
+        "sweep scan".into()
+    };
     if !service_lines.starts_with(&service_prefix)
         || !valid_scope_token
         || !valid_policy_line
-        || !service_command.contains(if cleanup { " --non-interactive --offline --yes --json --config /dev/null sweep scheduled-bytecode-cleanup --authorize-scheduled-cleanup " } else { " --non-interactive --offline --json --config /dev/null sweep scan " })
+        || !service_command.contains(&format!(
+            " --non-interactive --offline{} --json --config /dev/null {cleanup_command} ",
+            if cleanup { " --yes" } else { "" }
+        ))
         || !["daily", "weekly"].iter().any(|frequency| units[1] == format!("[Unit]\nDescription={description} timer\n\n[Timer]\nOnCalendar={frequency}\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n")) {
         bail!("unit content does not match an Upkit-generated timer; refusing to disable it");
     }
@@ -2714,6 +2984,7 @@ fn configured_scan_scope_at(
         crate::config::profile_scan_options(&settings, profile, &[], &[], None)?;
     let enabled_ecosystems = crate::config::enabled_ecosystems(&settings, profile)?;
     let scheduled_bytecode_cleanup = crate::config::scheduled_bytecode_cleanup(&settings, profile)?;
+    let scheduled_artifact_cleanup = crate::config::scheduled_artifact_cleanup(&settings, profile)?;
     if scheduled_bytecode_cleanup {
         if older_than.is_none_or(|age| age < Duration::from_secs(7 * 24 * 60 * 60)) {
             bail!("scheduled bytecode cleanup requires artifact_retention of at least 7 days");
@@ -2724,6 +2995,9 @@ fn configured_scan_scope_at(
         {
             bail!("scheduled bytecode cleanup requires the Python ecosystem to be enabled");
         }
+    }
+    if scheduled_artifact_cleanup {
+        validate_scheduled_artifact_policy(older_than, enabled_ecosystems.as_deref())?;
     }
     let path = absolute_config_path(path)?;
     let source = ConfiguredSource {
@@ -2737,6 +3011,7 @@ fn configured_scan_scope_at(
         older_than,
         enabled_ecosystems,
         scheduled_bytecode_cleanup,
+        scheduled_artifact_cleanup,
         source,
     })
 }
@@ -2760,6 +3035,7 @@ pub fn configured_scan_scope(
     if scope.older_than.is_some()
         || scope.enabled_ecosystems.is_some()
         || scope.scheduled_bytecode_cleanup
+        || scope.scheduled_artifact_cleanup
     {
         bail!(
             "configured scan scope includes retention or ecosystem policies; use a configured schedule preview to preserve them"
@@ -2783,6 +3059,7 @@ fn verify_configured_source(
         || current.older_than.map(|age| age.as_secs()) != policy.older_than_seconds
         || current.enabled_ecosystems != policy.enabled_ecosystems
         || current.scheduled_bytecode_cleanup != policy.scheduled_bytecode_cleanup
+        || current.scheduled_artifact_cleanup != policy.scheduled_artifact_cleanup
     {
         bail!(
             "configured workspace scope or scan policy changed; inspect and create a new schedule"
@@ -2799,7 +3076,9 @@ fn policy_from_plan(plan: &ScanSchedulePreview) -> Result<Option<ScheduledScanPo
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn policy_matches_scope(policy: &ScheduledScanPolicy, scope: &ConfiguredScanScope) -> bool {
     policy.version
-        == if scope.scheduled_bytecode_cleanup {
+        == if scope.scheduled_artifact_cleanup {
+            4
+        } else if scope.scheduled_bytecode_cleanup {
             3
         } else {
             2
@@ -2807,6 +3086,7 @@ fn policy_matches_scope(policy: &ScheduledScanPolicy, scope: &ConfiguredScanScop
         && policy.older_than_seconds == scope.older_than.map(|age| age.as_secs())
         && policy.enabled_ecosystems == scope.enabled_ecosystems
         && policy.scheduled_bytecode_cleanup == scope.scheduled_bytecode_cleanup
+        && policy.scheduled_artifact_cleanup == scope.scheduled_artifact_cleanup
         && policy.source.as_ref() == Some(&scope.source)
 }
 
@@ -2869,6 +3149,7 @@ pub fn install_configured_scan(
     config: Option<&Path>,
     profile: Option<&str>,
 ) -> Result<&'static str> {
+    ensure_artifact_schedule_supported(plan)?;
     ensure_configured_scope(plan, config, profile, false)?;
     #[cfg(target_os = "linux")]
     return install_scan_checked(executable, plan, token, frequency, || {
@@ -3007,7 +3288,7 @@ fn schedule_enable_warning(backend: ScheduleBackend, cleanup: bool) -> &'static 
             "Enabling this LaunchAgent bootstraps it in the current user's GUI launchd domain. RunAtLoad is false; the read-only scan runs at its next 03:00 local daily or Sunday weekly trigger. It emits JSON to standard output, and Upkit attempts to record each run in local operation history. Workspace files are not cleaned. Paths and executable may change after revalidation."
         }
         ScheduleBackend::Systemd if cleanup => {
-            "Enabling this timer may promptly start automatic permanent bytecode cleanup under the listed policy. Results are written to the user journal, and Upkit attempts to record each run in local history; paths and executable may change after revalidation."
+            "Enabling this timer may promptly start automatic permanent cleanup under the approved policy. Results are written to the user journal, and Upkit attempts to record each run in local history; paths and executable may change after revalidation."
         }
         ScheduleBackend::Systemd => {
             "Enabling this timer may start the scan promptly. It reads the selected workspaces, writes JSON to the user journal, and Upkit attempts to record each run in local history; it does not clean files. Paths and executable may change after revalidation."
@@ -3027,7 +3308,7 @@ fn schedule_edit_warning(backend: ScheduleBackend, cleanup: bool) -> &'static st
             "Moves the verified disabled LaunchAgent plist to its shown quarantine path, then installs and bootstraps the replacement for its next 03:00 local daily or Sunday weekly trigger. The scan emits JSON to standard output, and Upkit attempts to record each run in local operation history. Failure may leave the old plist quarantined or the replacement partially installed; no automatic rollback is performed. Workspace files are not cleaned."
         }
         ScheduleBackend::Systemd if cleanup => {
-            "Permanently removes the old units, then installs a timer that may promptly start automatic permanent bytecode cleanup under the listed policy. Failure may leave old units removed, quarantined, or replacement units partially installed. No automatic rollback is performed."
+            "Permanently removes the old units, then installs a timer that may promptly start automatic permanent cleanup under the approved policy. Failure may leave old units removed, quarantined, or replacement units partially installed. No automatic rollback is performed."
         }
         ScheduleBackend::Systemd => {
             "Permanently removes the old units, then installs and enables the new timer; the scan may start promptly. Failure may leave old units removed, quarantined, or replacement units partially installed. No automatic rollback is performed. Workspace files are not deleted."
@@ -3060,6 +3341,11 @@ mod schedule_warning_tests {
         assert!(macos.contains("attempts to record each run in local operation history"));
         assert!(!macos.contains("journal"));
         assert!(!macos.contains("promptly"));
+
+        let systemd = schedule_enable_warning(ScheduleBackend::Systemd, true);
+        assert!(systemd.contains("automatic permanent cleanup"));
+        assert!(!systemd.contains("bytecode"));
+        assert!(!systemd.contains("does not clean"));
     }
 
     #[test]
@@ -3105,6 +3391,11 @@ mod schedule_warning_tests {
         assert!(macos.contains("standard output"));
         assert!(macos.contains("attempts to record each run in local operation history"));
         assert!(!macos.contains("journal"));
+
+        let systemd = schedule_edit_warning(ScheduleBackend::Systemd, true);
+        assert!(systemd.contains("automatic permanent cleanup"));
+        assert!(!systemd.contains("bytecode"));
+        assert!(!systemd.contains("Workspace files are not deleted"));
     }
 }
 
@@ -3154,7 +3445,7 @@ fn enable_preview_from_installed(
     hash.update(b"upkit-scan-enable-preview-v1\0");
     hash.update(intended.preview_token.as_bytes());
     hash.update(installed.preview_token.as_bytes());
-    let cleanup = schedules_bytecode_cleanup(&intended);
+    let cleanup = schedules_cleanup(&intended);
     Ok(EnableSchedulePreview {
         intended,
         installed,
@@ -3204,6 +3495,7 @@ pub fn enable_scan(
     token: &str,
     frequency: Frequency,
 ) -> Result<&'static str> {
+    ensure_artifact_schedule_supported(&plan.intended)?;
     enable_scan_checked(executable, plan, token, frequency, || Ok(()))
 }
 
@@ -3253,6 +3545,7 @@ pub fn enable_scan(
     token: &str,
     frequency: Frequency,
 ) -> Result<&'static str> {
+    ensure_artifact_schedule_supported(&plan.intended)?;
     launchd_enable_scan_checked(executable, plan, token, frequency, || Ok(()))
 }
 
@@ -3325,6 +3618,7 @@ pub fn enable_scan(
     token: &str,
     frequency: Frequency,
 ) -> Result<&'static str> {
+    ensure_artifact_schedule_supported(&plan.intended)?;
     windows::enable_scan(executable, plan, token, frequency, || Ok(()))
 }
 
@@ -3337,6 +3631,7 @@ pub fn enable_configured_scan(
     config: Option<&Path>,
     profile: Option<&str>,
 ) -> Result<&'static str> {
+    ensure_artifact_schedule_supported(&plan.intended)?;
     ensure_configured_scope(&plan.intended, config, profile, true)?;
     #[cfg(target_os = "linux")]
     return enable_scan_checked(executable, plan, token, frequency, || {
@@ -3718,7 +4013,7 @@ fn preview_edit_with_policy(
     hash.update(b"upkit-scan-edit-preview-v1\0");
     hash.update(previous.preview_token.as_bytes());
     hash.update(replacement.preview_token.as_bytes());
-    let cleanup = schedules_bytecode_cleanup(&replacement);
+    let cleanup = schedules_cleanup(&replacement);
     Ok(EditSchedulePreview {
         previous,
         replacement,
@@ -3751,6 +4046,7 @@ pub fn edit_scan(
     token: &str,
     frequency: Frequency,
 ) -> Result<&'static str> {
+    ensure_artifact_schedule_supported(&plan.replacement)?;
     edit_scan_checked(executable, plan, token, frequency, || Ok(()))
 }
 
@@ -3761,6 +4057,7 @@ pub fn edit_scan(
     token: &str,
     frequency: Frequency,
 ) -> Result<&'static str> {
+    ensure_artifact_schedule_supported(&plan.replacement)?;
     launchd_edit_scan_checked(executable, plan, token, frequency, || Ok(()))
 }
 
@@ -3841,6 +4138,7 @@ pub fn edit_scan(
     token: &str,
     frequency: Frequency,
 ) -> Result<&'static str> {
+    ensure_artifact_schedule_supported(&plan.replacement)?;
     windows::edit_scan(executable, plan, token, frequency, || Ok(()))
 }
 
@@ -3858,6 +4156,7 @@ pub fn edit_configured_scan(
     config: Option<&Path>,
     profile: Option<&str>,
 ) -> Result<&'static str> {
+    ensure_artifact_schedule_supported(&plan.replacement)?;
     ensure_configured_scope(&plan.replacement, config, profile, false)?;
     #[cfg(target_os = "linux")]
     return edit_scan_checked(executable, plan, token, frequency, || {
@@ -4002,6 +4301,7 @@ mod configured_enable_compat_tests {
             older_than_seconds: None,
             enabled_ecosystems: None,
             scheduled_bytecode_cleanup: false,
+            scheduled_artifact_cleanup: false,
             source: Some(ConfiguredSource {
                 path: encode_config_path(std::path::Path::new("/tmp/upkit;config=source")).unwrap(),
                 required: true,

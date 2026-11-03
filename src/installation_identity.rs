@@ -26,7 +26,7 @@ use crate::ToolKind;
 #[cfg(unix)]
 const INSTALL_MARKER: &str = ".upkit-install.json";
 #[cfg(unix)]
-const LINK_RECEIPTS: &str = ".upkit-managed-links";
+pub(crate) const LINK_RECEIPTS: &str = ".upkit-managed-links";
 #[cfg(unix)]
 const MAX_MARKER_BYTES: u64 = 4096;
 #[cfg(unix)]

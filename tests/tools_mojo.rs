@@ -63,6 +63,34 @@ fn mojo_check_not_installed() {
 }
 
 #[test]
+fn mojo_found_but_unverifiable_is_unknown_not_not_installed() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = ctx_with_dirs();
+    set_which("mojo", Some(PathBuf::from("/fixture/mojo")));
+    set_run_output(
+        "mojo",
+        &["--version"],
+        output_with_status(1, b"", b"fixture failure"),
+    );
+    let page = releases_page("1.0.0");
+    set_http_plan(
+        RELEASES_URL,
+        vec![Ok(MockResponse::new(page.into_bytes(), None))],
+    );
+
+    let report = check_mojo(&ctx).unwrap();
+
+    assert!(report.installed.is_none());
+    assert_eq!(report.status, Status::Unknown);
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|note| note.contains("could not be verified"))
+    );
+}
+
+#[test]
 fn dry_run_does_not_execute_a_mojo_wrapper() {
     use upkit::test_support::take_run_output;
 

@@ -735,6 +735,36 @@ fn go_check_statuses() {
 }
 
 #[test]
+fn go_found_but_unverifiable_is_unknown_not_not_installed() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = ctx_with_dirs();
+    set_which("go", Some(PathBuf::from("/fixture/go")));
+    set_run_output(
+        "go",
+        &["version"],
+        output_with_status(1, b"", b"fixture failure"),
+    );
+    set_http_plan(
+        "https://go.dev/dl/?mode=json",
+        vec![Ok(MockResponse::new(
+            br#"[{"version":"go1.2.3","stable":true,"files":[]}]"#.to_vec(),
+            None,
+        ))],
+    );
+
+    let report = check_go(&ctx).unwrap();
+
+    assert!(report.installed.is_none());
+    assert_eq!(report.status, Status::Unknown);
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|note| note.contains("could not be verified"))
+    );
+}
+
+#[test]
 fn go_check_uses_bindir() {
     let _guard = reset_guard();
     let (ctx, _dir) = ctx_with_dirs();

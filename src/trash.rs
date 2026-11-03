@@ -2394,11 +2394,47 @@ pub struct TrashReport {
     pub cancelled: bool,
 }
 
+// shortcut: cap size walks at 100,000 items; paginate inventory before raising the limit.
 #[cfg(any(test, target_os = "windows"))]
-const WINDOWS_RECYCLE_BIN_SCRIPT: &str = "$ErrorActionPreference = 'Stop'; try { $shellType = [Type]::GetTypeFromProgID('Shell.Application'); if ($null -eq $shellType) { throw 'Recycle Bin Shell type unavailable' }; $shell = [Activator]::CreateInstance($shellType); if ($null -eq $shell) { throw 'Recycle Bin Shell activation failed' }; $bin = $shell.NameSpace(10); if ($null -eq $bin) { throw 'Recycle Bin Shell folder unavailable' }; $count = [int64]$bin.Items().Count; [Console]::Out.WriteLine($count.ToString([Globalization.CultureInfo]::InvariantCulture)) } catch { exit 1 }";
+const WINDOWS_RECYCLE_BIN_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
+try {
+    $shellType = [Type]::GetTypeFromProgID('Shell.Application')
+    if ($null -eq $shellType) { throw 'Recycle Bin Shell type unavailable' }
+    $shell = [Activator]::CreateInstance($shellType)
+    if ($null -eq $shell) { throw 'Recycle Bin Shell activation failed' }
+    $bin = $shell.NameSpace(10)
+    if ($null -eq $bin) { throw 'Recycle Bin Shell folder unavailable' }
+    $items = $bin.Items()
+    $count = [int64]$items.Count
+    $scanned = [int64]0
+    $total = [decimal]0
+    $complete = $count -le 100000
+    foreach ($item in $items) {
+        if ($scanned -ge 100000) { break }
+        $scanned++
+        if ($item.IsFolder) { $complete = $false; continue }
+        $size = $item.Size
+        if ($null -eq $size -or $size -isnot [ValueType] -or $size -is [bool]) {
+            $complete = $false
+            continue
+        }
+        try { $bytes = [decimal]$size } catch { $complete = $false; continue }
+        if ($bytes -lt 0 -or [decimal]::Truncate($bytes) -ne $bytes) {
+            $complete = $false
+            continue
+        }
+        $total += $bytes
+        if ($total -gt [decimal]([uint64]::MaxValue)) { $complete = $false }
+    }
+    if ($scanned -ne $count) { $complete = $false }
+    $sizeText = if ($total -gt [decimal]([uint64]::MaxValue)) { '-' } else { $total.ToString([Globalization.CultureInfo]::InvariantCulture) }
+    $countText = $count.ToString([Globalization.CultureInfo]::InvariantCulture)
+    $completeText = if ($complete) { '1' } else { '0' }
+    [Console]::Out.WriteLine($countText + "`t" + $sizeText + "`t" + $completeText)
+} catch { exit 1 }"#;
 
 #[cfg(any(test, target_os = "windows"))]
-const WINDOWS_QUERY_OUTPUT_LIMIT: usize = 32;
+const WINDOWS_QUERY_OUTPUT_LIMIT: usize = 64;
 
 #[cfg(any(test, target_os = "windows"))]
 static WINDOWS_RECYCLE_BIN_QUERY_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -2430,20 +2466,41 @@ impl Drop for WindowsRecycleBinQueryGuard {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WindowsRecycleBinSummary {
     item_count: u64,
+    logical_bytes: Option<u64>,
+    size_complete: bool,
 }
 
 #[cfg(any(test, target_os = "windows"))]
-fn parse_windows_recycle_bin_count(output: &[u8]) -> anyhow::Result<WindowsRecycleBinSummary> {
+fn parse_windows_recycle_bin_summary(output: &[u8]) -> anyhow::Result<WindowsRecycleBinSummary> {
     let text = std::str::from_utf8(output)?;
-    let count = text
+    let text = text
         .strip_suffix("\r\n")
         .or_else(|| text.strip_suffix('\n'))
         .unwrap_or(text);
-    if count.is_empty() || !count.bytes().all(|byte| byte.is_ascii_digit()) {
-        anyhow::bail!("PowerShell returned an invalid Recycle Bin item count");
+    let mut fields = text.split('\t');
+    let count = fields.next().unwrap_or_default();
+    let bytes = fields.next().unwrap_or_default();
+    let complete = fields.next().unwrap_or_default();
+    let digits_only =
+        |value: &str| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit());
+    if fields.next().is_some() || !digits_only(count) || !matches!(complete, "0" | "1") {
+        anyhow::bail!("PowerShell returned an invalid Recycle Bin summary");
+    }
+    let logical_bytes = if bytes == "-" {
+        None
+    } else if digits_only(bytes) {
+        Some(bytes.parse()?)
+    } else {
+        anyhow::bail!("PowerShell returned an invalid Recycle Bin size");
+    };
+    let size_complete = complete == "1";
+    if size_complete && logical_bytes.is_none() {
+        anyhow::bail!("PowerShell marked an unknown Recycle Bin size complete");
     }
     Ok(WindowsRecycleBinSummary {
         item_count: count.parse()?,
+        logical_bytes,
+        size_complete,
     })
 }
 
@@ -2651,7 +2708,7 @@ fn query_windows_recycle_bin_with_executable(
             if !status.success() {
                 anyhow::bail!("PowerShell Recycle Bin query exited with {status}");
             }
-            return parse_windows_recycle_bin_count(output).map(Some);
+            return parse_windows_recycle_bin_summary(output).map(Some);
         }
         if Instant::now() >= deadline {
             stop(&mut child);
@@ -2701,22 +2758,29 @@ fn windows_recycle_bin_report(
             .push("Windows Recycle Bin inventory was cancelled.".into());
     } else {
         match summary {
-            Ok(summary) => report.locations.push(TrashLocation {
-                path: PathBuf::new(),
-                kind: "Windows Recycle Bin (virtual)",
-                item_count: Some(summary.item_count),
-                logical_bytes: None,
-                allocated_bytes: None,
-                size_complete: false,
-                warnings: vec![
-                    "Only the Recycle Bin item count is available. Its filesystem path, size, item names, and deletion dates are unknown; item-level actions are unsupported.".into(),
-                ],
-                items: vec![],
-                items_complete: false,
-            }),
-            Err(error) => report
-                .warnings
-                .push(format!("Windows Recycle Bin inventory unavailable: {error:#}")),
+            Ok(summary) => {
+                let warning = if summary.size_complete {
+                    "The Windows Shell measured every Recycle Bin file item; its filesystem path, item names, and deletion dates are unknown, and item-level actions are unsupported."
+                } else if summary.logical_bytes.is_some() {
+                    "Recycle Bin size is a partial sum of measurable file items; directories, unmeasured entries, or entries beyond the 100,000-item scan limit are omitted. Its filesystem path, item names, and deletion dates are unknown; item-level actions are unsupported."
+                } else {
+                    "Recycle Bin size is unavailable or exceeded the supported range; directory entries and scans above 100,000 items cannot be fully measured. Its filesystem path, item names, and deletion dates are unknown; item-level actions are unsupported."
+                };
+                report.locations.push(TrashLocation {
+                    path: PathBuf::new(),
+                    kind: "Windows Recycle Bin (virtual)",
+                    item_count: Some(summary.item_count),
+                    logical_bytes: summary.logical_bytes,
+                    allocated_bytes: None,
+                    size_complete: summary.size_complete,
+                    warnings: vec![warning.into()],
+                    items: vec![],
+                    items_complete: false,
+                });
+            }
+            Err(error) => report.warnings.push(format!(
+                "Windows Recycle Bin inventory unavailable: {error:#}"
+            )),
         }
     }
     report
@@ -3375,9 +3439,7 @@ fn macos_trash_measure_directory(
                     }
                 };
                 let child_matches_entry = child.metadata().is_ok_and(|metadata| {
-                    metadata.is_dir()
-                        && metadata.dev() == device
-                        && u64::try_from(entry.st_ino).ok() == Some(metadata.ino())
+                    metadata.is_dir() && metadata.dev() == device && entry.st_ino == metadata.ino()
                 });
                 if !child_matches_entry {
                     macos_trash_size_warning(
@@ -3465,6 +3527,56 @@ fn macos_trash_size(
 }
 
 #[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
+fn macos_trash_location_from_directory(
+    path: &Path,
+    kind: &'static str,
+    directory: &std::fs::File,
+    cancel: &AtomicBool,
+    limit: u64,
+    size_limit: usize,
+) -> anyhow::Result<(TrashLocation, usize)> {
+    let (names, exceeded) = macos_trash_names(
+        directory,
+        cancel,
+        usize::try_from(limit).unwrap_or(usize::MAX),
+    )?;
+    if exceeded {
+        anyhow::bail!("Trash exceeds the {limit}-item inventory limit");
+    }
+    let count = u64::try_from(names.len()).unwrap_or(u64::MAX);
+    let items = names
+        .iter()
+        .map(|name| TrashItem {
+            name: display_item_name(name),
+            deletion_date: None,
+            #[cfg(target_os = "linux")]
+            identity: None,
+        })
+        .collect();
+    let size = macos_trash_size(directory, names, cancel, size_limit)?;
+    let mut warnings = vec![
+        "Entry count includes any metadata files and may differ from Finder; entries may change during inspection.".into(),
+        "Size estimation checks device IDs but does not detect same-device mounts.".into(),
+    ];
+    warnings.extend(size.warnings);
+    let discovered = size.discovered;
+    Ok((
+        TrashLocation {
+            path: path.to_path_buf(),
+            kind,
+            item_count: Some(count),
+            logical_bytes: Some(size.logical_bytes),
+            allocated_bytes: None,
+            size_complete: size.complete,
+            warnings,
+            items,
+            items_complete: true,
+        },
+        discovered,
+    ))
+}
+
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
 fn macos_home_trash_report(home: &Path, cancel: &AtomicBool, limit: u64) -> TrashReport {
     use rustix::fs::{Mode, OFlags, open};
 
@@ -3472,38 +3584,27 @@ fn macos_home_trash_report(home: &Path, cancel: &AtomicBool, limit: u64) -> Tras
     let mut report = TrashReport {
         platform: "macos",
         locations: vec![],
-        warnings: vec!["Only the current user's home Trash is inspected; Trash on other volumes is not included. Names are a read-only snapshot; deletion dates and item actions are unavailable.".into()],
+        warnings: vec!["Trash names are a read-only snapshot; deletion dates and item actions are unavailable.".into()],
         cancelled: cancel.load(Ordering::Relaxed),
     };
     if report.cancelled {
         return report;
     }
-    let inventory = (|| -> anyhow::Result<(u64, Vec<TrashItem>, MacHomeTrashSize)> {
+    let inventory = (|| -> anyhow::Result<TrashLocation> {
         let directory = std::fs::File::from(open(
             &path,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )?);
-        let (names, exceeded) = macos_trash_names(
+        macos_trash_location_from_directory(
+            &path,
+            "macOS home Trash",
             &directory,
             cancel,
-            usize::try_from(limit).unwrap_or(usize::MAX),
-        )?;
-        if exceeded {
-            anyhow::bail!("home Trash exceeds the {limit}-item inventory limit");
-        }
-        let count = u64::try_from(names.len()).unwrap_or(u64::MAX);
-        let items = names
-            .iter()
-            .map(|name| TrashItem {
-                name: display_item_name(name),
-                deletion_date: None,
-                #[cfg(target_os = "linux")]
-                identity: None,
-            })
-            .collect();
-        let size = macos_trash_size(&directory, names, cancel, MACOS_HOME_TRASH_SIZE_ENTRY_LIMIT)?;
-        Ok((count, items, size))
+            limit,
+            MACOS_HOME_TRASH_SIZE_ENTRY_LIMIT,
+        )
+        .map(|(location, _)| location)
     })();
     report.cancelled = cancel.load(Ordering::Relaxed);
     if report.cancelled {
@@ -3512,28 +3613,294 @@ fn macos_home_trash_report(home: &Path, cancel: &AtomicBool, limit: u64) -> Tras
             .push("Trash inventory was cancelled.".into());
     } else {
         match inventory {
-            Ok((count, items, size)) => {
-                let mut warnings = vec![
-                    "Entry count includes any metadata files and may differ from Finder; entries may change during inspection.".into(),
-                    "Size estimation checks device IDs but does not detect same-device mounts.".into(),
-                ];
-                warnings.extend(size.warnings);
-                report.locations.push(TrashLocation {
-                    path,
-                    kind: "macOS home Trash",
-                    item_count: Some(count),
-                    logical_bytes: Some(size.logical_bytes),
-                    allocated_bytes: None,
-                    size_complete: size.complete,
-                    warnings,
-                    items,
-                    items_complete: true,
-                });
-            }
+            Ok(location) => report.locations.push(location),
             Err(error) => report
                 .warnings
                 .push(format!("Home Trash inventory unavailable: {error:#}")),
         }
+    }
+    report
+}
+
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
+// shortcut: scan at most 256 /Volumes entries; raise the cap if users need larger mount inventories.
+const MACOS_VOLUME_ENTRY_LIMIT: usize = 256;
+
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
+#[cfg_attr(all(test, target_os = "linux"), allow(clippy::useless_conversion))]
+fn macos_open_directory_at(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+) -> anyhow::Result<Option<std::fs::File>> {
+    use anyhow::bail;
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags, openat, statat};
+
+    let before = match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(metadata) => metadata,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if FileType::from_raw_mode(before.st_mode) != FileType::Directory {
+        bail!("expected a directory");
+    }
+    let directory = std::fs::File::from(openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?);
+    let opened = directory.metadata()?;
+    if !opened.is_dir()
+        || u64::try_from(before.st_dev).ok() != Some(std::os::unix::fs::MetadataExt::dev(&opened))
+        || before.st_ino != std::os::unix::fs::MetadataExt::ino(&opened)
+    {
+        bail!("directory changed while being opened");
+    }
+    Ok(Some(directory))
+}
+
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
+fn macos_volume_trash_locations_with(
+    volumes: &Path,
+    uid: u32,
+    cancel: &AtomicBool,
+    limit: u64,
+    size_limit: usize,
+    mut device_id: impl FnMut(&std::fs::File) -> Option<u64>,
+) -> (Vec<TrashLocation>, Vec<String>, bool) {
+    use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, open, statat};
+    use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+
+    let mut locations = Vec::new();
+    let mut incomplete = false;
+    let mut cancelled = cancel.load(Ordering::Relaxed);
+    let volumes_directory = if cancelled {
+        None
+    } else {
+        match open(
+            volumes,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(directory) => Some(std::fs::File::from(directory)),
+            Err(_) => {
+                incomplete = true;
+                None
+            }
+        }
+    };
+    let Some(volumes_directory) = volumes_directory else {
+        let warnings = if incomplete {
+            vec!["Mounted-volume Trash inventory is incomplete because /Volumes could not be inspected.".into()]
+        } else {
+            vec![]
+        };
+        return (locations, warnings, cancelled);
+    };
+    let Some(volumes_device) = device_id(&volumes_directory) else {
+        return (
+            locations,
+            vec!["Mounted-volume Trash inventory is incomplete because /Volumes identity could not be inspected.".into()],
+            cancelled,
+        );
+    };
+    let entries = match Dir::read_from(&volumes_directory) {
+        Ok(entries) => entries,
+        Err(_) => {
+            return (
+                locations,
+                vec!["Mounted-volume Trash inventory is incomplete because /Volumes could not be read.".into()],
+                cancelled,
+            );
+        }
+    };
+    let uid_name = uid.to_string();
+    let mut inspected_entries = 0usize;
+    let mut total_items = 0u64;
+    let mut total_size_entries = 0usize;
+    for entry in entries {
+        if cancel.load(Ordering::Relaxed) {
+            cancelled = true;
+            break;
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                incomplete = true;
+                continue;
+            }
+        };
+        let name = std::ffi::OsStr::from_bytes(entry.file_name().to_bytes());
+        if matches!(name.as_bytes(), b"." | b"..") {
+            continue;
+        }
+        if inspected_entries == MACOS_VOLUME_ENTRY_LIMIT {
+            incomplete = true;
+            break;
+        }
+        inspected_entries += 1;
+        let mount_metadata = match statat(&volumes_directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(metadata) => metadata,
+            Err(rustix::io::Errno::NOENT) => {
+                incomplete = true;
+                continue;
+            }
+            Err(_) => {
+                incomplete = true;
+                continue;
+            }
+        };
+        if FileType::from_raw_mode(mount_metadata.st_mode) != FileType::Directory {
+            if FileType::from_raw_mode(mount_metadata.st_mode) == FileType::Symlink {
+                incomplete = true;
+            }
+            continue;
+        }
+        let volume_directory = match macos_open_directory_at(&volumes_directory, name) {
+            Ok(Some(directory)) => directory,
+            Ok(None) | Err(_) => {
+                incomplete = true;
+                continue;
+            }
+        };
+        let Some(volume_device) = device_id(&volume_directory) else {
+            incomplete = true;
+            continue;
+        };
+        if volume_device == volumes_device {
+            continue;
+        }
+        let volume_metadata = match volume_directory.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                incomplete = true;
+                continue;
+            }
+        };
+        let trash_root =
+            match macos_open_directory_at(&volume_directory, std::ffi::OsStr::new(".Trashes")) {
+                Ok(Some(directory)) => directory,
+                Ok(None) => continue,
+                Err(_) => {
+                    incomplete = true;
+                    continue;
+                }
+            };
+        let trash_root_metadata = match trash_root.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                incomplete = true;
+                continue;
+            }
+        };
+        let shared_root_safe = (trash_root_metadata.uid() == 0 || trash_root_metadata.uid() == uid)
+            && (trash_root_metadata.mode() & 0o022 == 0
+                || (trash_root_metadata.uid() == 0 && trash_root_metadata.mode() & 0o1000 != 0));
+        if !shared_root_safe || trash_root_metadata.dev() != volume_metadata.dev() {
+            incomplete = true;
+            continue;
+        }
+        let user_trash = match macos_open_directory_at(&trash_root, std::ffi::OsStr::new(&uid_name))
+        {
+            Ok(Some(directory)) => directory,
+            Ok(None) => continue,
+            Err(_) => {
+                incomplete = true;
+                continue;
+            }
+        };
+        let user_trash_metadata = match user_trash.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                incomplete = true;
+                continue;
+            }
+        };
+        if user_trash_metadata.uid() != uid
+            || user_trash_metadata.mode() & 0o022 != 0
+            || user_trash_metadata.dev() != volume_metadata.dev()
+        {
+            incomplete = true;
+            continue;
+        }
+        let path = volumes.join(name).join(".Trashes").join(&uid_name);
+        let remaining_items = limit.saturating_sub(total_items);
+        let remaining_size_entries = size_limit.saturating_sub(total_size_entries);
+        match macos_trash_location_from_directory(
+            &path,
+            "macOS volume Trash",
+            &user_trash,
+            cancel,
+            remaining_items,
+            remaining_size_entries,
+        ) {
+            Ok((location, discovered_size_entries)) => {
+                total_items = total_items.saturating_add(location.item_count.unwrap_or_default());
+                total_size_entries = total_size_entries.saturating_add(discovered_size_entries);
+                locations.push(location);
+            }
+            Err(_) if cancel.load(Ordering::Relaxed) => {
+                cancelled = true;
+                break;
+            }
+            Err(_) => {
+                incomplete = true;
+                break;
+            }
+        }
+    }
+    let warnings = if incomplete {
+        vec!["Mounted-volume Trash inventory is incomplete; inaccessible, changing, linked, or over-limit /Volumes entries were skipped.".into()]
+    } else {
+        vec![]
+    };
+    (locations, warnings, cancelled)
+}
+
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
+fn macos_trash_status_with(
+    home: Option<&Path>,
+    volumes: &Path,
+    uid: u32,
+    cancel: &AtomicBool,
+    limit: u64,
+    device_id: impl FnMut(&std::fs::File) -> Option<u64>,
+) -> TrashReport {
+    let mut report = match home {
+        Some(home) => macos_home_trash_report(home, cancel, limit),
+        None => TrashReport {
+            platform: "macos",
+            locations: vec![],
+            warnings: vec!["Home Trash inventory unavailable: home directory is unknown".into()],
+            cancelled: cancel.load(Ordering::Relaxed),
+        },
+    };
+    report.warnings.insert(0, format!("Trash status is read-only. It inventories the current user's home Trash and direct mounted volumes under /Volumes; volume Trash lookup uses the undocumented .Trashes/<effective UID> layout as a heuristic, so this is not a complete Finder inventory. Volume scanning is capped at {MACOS_VOLUME_ENTRY_LIMIT} /Volumes entries, {limit} listed items, and {MACOS_HOME_TRASH_SIZE_ENTRY_LIMIT} size-walk entries total across mounted-volume locations. Same-device mounts and other mount locations may be omitted. Deletion dates and item actions are unavailable."));
+    if !report.cancelled {
+        let (locations, warnings, cancelled) = macos_volume_trash_locations_with(
+            volumes,
+            uid,
+            cancel,
+            limit,
+            MACOS_HOME_TRASH_SIZE_ENTRY_LIMIT,
+            device_id,
+        );
+        report.locations.extend(locations);
+        report.warnings.extend(warnings);
+        if cancelled {
+            report.warnings.push(
+                "Mounted-volume Trash inventory was cancelled; results may be partial.".into(),
+            );
+        }
+        report.cancelled |= cancelled;
+    } else if !report
+        .warnings
+        .iter()
+        .any(|warning| warning.to_ascii_lowercase().contains("cancel"))
+    {
+        report
+            .warnings
+            .push("Trash inventory was cancelled.".into());
     }
     report
 }
@@ -3559,17 +3926,16 @@ pub fn status(cancel: &AtomicBool) -> TrashReport {
     }
     #[cfg(target_os = "macos")]
     {
-        match dirs::home_dir() {
-            Some(home) => macos_home_trash_report(&home, cancel, 10_000),
-            None => TrashReport {
-                platform: "macos",
-                locations: vec![],
-                warnings: vec![
-                    "Home Trash inventory unavailable: home directory is unknown".into(),
-                ],
-                cancelled: cancel.load(Ordering::Relaxed),
-            },
-        }
+        use std::os::unix::fs::MetadataExt;
+
+        macos_trash_status_with(
+            dirs::home_dir().as_deref(),
+            Path::new("/Volumes"),
+            rustix::process::geteuid().as_raw(),
+            cancel,
+            10_000,
+            |directory| directory.metadata().ok().map(|metadata| metadata.dev()),
+        )
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
@@ -3591,6 +3957,207 @@ mod macos_home_trash_tests {
         fs,
         os::unix::{ffi::OsStringExt, fs::symlink},
     };
+
+    #[test]
+    fn macos_status_includes_only_verified_volume_trash_without_following_links() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let uid = rustix::process::geteuid().as_raw();
+        let home = tempfile::tempdir().unwrap();
+        let home_trash = home.path().join(".Trash");
+        fs::create_dir(&home_trash).unwrap();
+        fs::write(home_trash.join("home-item"), b"home fixture").unwrap();
+
+        let volumes = tempfile::tempdir().unwrap();
+        let mounted_name = std::ffi::OsString::from_vec(b"Disk-\xff".to_vec());
+        let mounted = volumes.path().join(&mounted_name);
+        let mounted_shared_trash = mounted.join(".Trashes");
+        let mounted_trash = mounted_shared_trash.join(uid.to_string());
+        fs::create_dir_all(&mounted_trash).unwrap();
+        for path in [&mounted_shared_trash, &mounted_trash] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::write(mounted_trash.join("volume-item"), b"volume fixture").unwrap();
+
+        let ordinary = volumes.path().join("ordinary-directory");
+        let ordinary_shared_trash = ordinary.join(".Trashes");
+        let ordinary_trash = ordinary_shared_trash.join(uid.to_string());
+        fs::create_dir_all(&ordinary_trash).unwrap();
+        for path in [&ordinary_shared_trash, &ordinary_trash] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::write(ordinary_trash.join("not-a-mount"), b"must not list").unwrap();
+
+        let outside = tempfile::tempdir().unwrap();
+        let outside_shared_trash = outside.path().join(".Trashes");
+        let outside_trash = outside_shared_trash.join(uid.to_string());
+        fs::create_dir_all(&outside_trash).unwrap();
+        for path in [&outside_shared_trash, &outside_trash] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::write(outside_trash.join("outside-item"), b"must not follow").unwrap();
+        let linked_volume = volumes.path().join("linked-volume");
+        symlink(outside.path(), &linked_volume).unwrap();
+
+        let unsafe_mount = volumes.path().join("unsafe-mount");
+        fs::create_dir(&unsafe_mount).unwrap();
+        symlink(outside.path(), unsafe_mount.join(".Trashes")).unwrap();
+
+        let root_device = fs::metadata(volumes.path()).unwrap().dev();
+        let mounted_inodes = [
+            fs::metadata(&mounted).unwrap().ino(),
+            fs::metadata(&unsafe_mount).unwrap().ino(),
+        ];
+        let report = macos_trash_status_with(
+            Some(home.path()),
+            volumes.path(),
+            uid,
+            &AtomicBool::new(false),
+            10,
+            |directory| {
+                let metadata = directory.metadata().ok()?;
+                Some(if mounted_inodes.contains(&metadata.ino()) {
+                    root_device.wrapping_add(1)
+                } else {
+                    metadata.dev()
+                })
+            },
+        );
+
+        assert_eq!(report.locations.len(), 2);
+        assert!(report.locations.iter().any(|location| {
+            location.kind == "macOS home Trash"
+                && location.items.iter().any(|item| item.name == "home-item")
+        }));
+        let volume_location = report
+            .locations
+            .iter()
+            .find(|location| location.kind == "macOS volume Trash")
+            .unwrap();
+        assert_eq!(volume_location.item_count, Some(1));
+        assert!(volume_location.items_complete);
+        assert!(
+            volume_location
+                .items
+                .iter()
+                .any(|item| item.name == "volume-item")
+        );
+        assert!(!report.locations.iter().any(|location| {
+            location
+                .items
+                .iter()
+                .any(|item| matches!(item.name.as_str(), "not-a-mount" | "outside-item"))
+        }));
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("not a complete Finder inventory"))
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("incomplete"))
+        );
+        assert_eq!(
+            fs::read(mounted_trash.join("volume-item")).unwrap(),
+            b"volume fixture"
+        );
+        assert_eq!(
+            fs::read(outside_trash.join("outside-item")).unwrap(),
+            b"must not follow"
+        );
+    }
+
+    #[test]
+    fn macos_volume_item_and_size_budgets_are_shared_and_cancellable() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let uid = rustix::process::geteuid().as_raw();
+        let volumes = tempfile::tempdir().unwrap();
+        let mut mount_inodes = Vec::new();
+        let mut items = Vec::new();
+        for name in ["disk-a", "disk-b"] {
+            let mount = volumes.path().join(name);
+            let shared_trash = mount.join(".Trashes");
+            let trash = shared_trash.join(uid.to_string());
+            fs::create_dir_all(&trash).unwrap();
+            for path in [&shared_trash, &trash] {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let item = trash.join(format!("{name}-item"));
+            fs::write(&item, b"fixture").unwrap();
+            mount_inodes.push(fs::metadata(&mount).unwrap().ino());
+            items.push(item);
+        }
+        let root_device = fs::metadata(volumes.path()).unwrap().dev();
+        let fake_device = |directory: &std::fs::File| {
+            let metadata = directory.metadata().ok()?;
+            Some(if mount_inodes.contains(&metadata.ino()) {
+                root_device.wrapping_add(1)
+            } else {
+                metadata.dev()
+            })
+        };
+
+        let (limited, warnings, cancelled) = macos_volume_trash_locations_with(
+            volumes.path(),
+            uid,
+            &AtomicBool::new(false),
+            1,
+            100,
+            |directory| fake_device(directory),
+        );
+        assert!(!cancelled);
+        assert_eq!(limited.len(), 1);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("incomplete"))
+        );
+
+        let (sized, warnings, cancelled) = macos_volume_trash_locations_with(
+            volumes.path(),
+            uid,
+            &AtomicBool::new(false),
+            10,
+            1,
+            |directory| fake_device(directory),
+        );
+        assert!(!cancelled);
+        assert_eq!(sized.len(), 2);
+        assert!(warnings.is_empty());
+        assert_eq!(
+            sized
+                .iter()
+                .filter(|location| location.size_complete)
+                .count(),
+            1
+        );
+        assert_eq!(
+            sized
+                .iter()
+                .filter(|location| !location.size_complete)
+                .count(),
+            1
+        );
+
+        let cancel = AtomicBool::new(false);
+        let (cancelled_locations, _, cancelled) =
+            macos_volume_trash_locations_with(volumes.path(), uid, &cancel, 10, 100, |directory| {
+                let metadata = directory.metadata().ok()?;
+                if mount_inodes.contains(&metadata.ino()) {
+                    cancel.store(true, Ordering::Relaxed);
+                    Some(root_device.wrapping_add(1))
+                } else {
+                    Some(metadata.dev())
+                }
+            });
+        assert!(cancelled);
+        assert!(cancelled_locations.is_empty());
+        assert!(items.iter().all(|item| item.exists()));
+    }
 
     #[test]
     fn macos_home_trash_lists_top_level_items_without_touching_them() {
@@ -3786,16 +4353,19 @@ mod windows_inventory_tests {
     }
 
     #[test]
-    fn windows_recycle_bin_fake_shell_count_is_inventory_only_and_uses_an_isolated_home() {
+    fn windows_recycle_bin_fake_shell_inventory_uses_an_isolated_home() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("isolated-home");
         std::fs::create_dir(&home).unwrap();
         let executable = fake_powershell(
             dir.path(),
-            "[ \"$1\" = \"-NoLogo\" ] || exit 11\n[ \"$2\" = \"-NoProfile\" ] || exit 12\n[ \"$3\" = \"-NonInteractive\" ] || exit 13\n[ \"$4\" = \"-Sta\" ] || exit 14\n[ \"$5\" = \"-Command\" ] || exit 15\nprintf '23\\n'",
+            "[ \"$1\" = \"-NoLogo\" ] || exit 11\n[ \"$2\" = \"-NoProfile\" ] || exit 12\n[ \"$3\" = \"-NonInteractive\" ] || exit 13\n[ \"$4\" = \"-Sta\" ] || exit 14\n[ \"$5\" = \"-Command\" ] || exit 15\nprintf '23\\t456\\t1\\n'",
         );
         assert!(WINDOWS_RECYCLE_BIN_SCRIPT.contains("NameSpace(10)"));
-        assert!(WINDOWS_RECYCLE_BIN_SCRIPT.contains("Items().Count"));
+        assert!(WINDOWS_RECYCLE_BIN_SCRIPT.contains("$items = $bin.Items()"));
+        assert!(WINDOWS_RECYCLE_BIN_SCRIPT.contains("$item.Size"));
+        assert!(WINDOWS_RECYCLE_BIN_SCRIPT.contains("$item.IsFolder"));
+        assert!(WINDOWS_RECYCLE_BIN_SCRIPT.contains("$scanned -ge 100000"));
         assert!(
             WINDOWS_RECYCLE_BIN_SCRIPT.contains("[Type]::GetTypeFromProgID('Shell.Application')")
         );
@@ -3819,9 +4389,9 @@ mod windows_inventory_tests {
         assert!(location.path.as_os_str().is_empty());
         assert_eq!(location.kind, "Windows Recycle Bin (virtual)");
         assert_eq!(location.item_count, Some(23));
-        assert_eq!(location.logical_bytes, None);
+        assert_eq!(location.logical_bytes, Some(456));
         assert_eq!(location.allocated_bytes, None);
-        assert!(!location.size_complete);
+        assert!(location.size_complete);
         assert!(location.items.is_empty());
         assert!(!location.items_complete);
         assert!(location.warnings[0].contains("deletion dates are unknown"));
@@ -3834,7 +4404,7 @@ mod windows_inventory_tests {
         let home = dir.path().join("isolated-home");
         std::fs::create_dir(&home).unwrap();
 
-        let oversized = fake_powershell(dir.path(), "printf '%040d\\n' 1\nwhile :; do :; done");
+        let oversized = fake_powershell(dir.path(), "printf '%080d\\n' 1\nwhile :; do :; done");
         let error = query_windows_recycle_bin_with_executable(
             &oversized,
             &AtomicBool::new(false),
@@ -5750,13 +6320,41 @@ mod windows_recycle_bin_tests {
     use super::*;
 
     #[test]
-    fn windows_recycle_bin_count_parser_accepts_fixture_without_item_data() {
+    fn windows_recycle_bin_summary_parser_distinguishes_complete_partial_and_unknown_sizes() {
         assert_eq!(
-            parse_windows_recycle_bin_count(b"42\r\n").unwrap(),
-            WindowsRecycleBinSummary { item_count: 42 }
+            parse_windows_recycle_bin_summary(b"42\t1234\t1\r\n").unwrap(),
+            WindowsRecycleBinSummary {
+                item_count: 42,
+                logical_bytes: Some(1234),
+                size_complete: true,
+            }
         );
-        assert!(parse_windows_recycle_bin_count(b"42 items\n").is_err());
-        assert!(parse_windows_recycle_bin_count(b"").is_err());
+        assert_eq!(
+            parse_windows_recycle_bin_summary(b"42\t1234\t0\n").unwrap(),
+            WindowsRecycleBinSummary {
+                item_count: 42,
+                logical_bytes: Some(1234),
+                size_complete: false,
+            }
+        );
+        assert_eq!(
+            parse_windows_recycle_bin_summary(b"42\t-\t0\n").unwrap(),
+            WindowsRecycleBinSummary {
+                item_count: 42,
+                logical_bytes: None,
+                size_complete: false,
+            }
+        );
+        for invalid in [
+            b"42 items\n".as_slice(),
+            b"42\t1,234\t1\n",
+            b"42\t-\t1\n",
+            b"42\t1234\t2\n",
+            b"42\t1234\t0\textra\n",
+            b"",
+        ] {
+            assert!(parse_windows_recycle_bin_summary(invalid).is_err());
+        }
     }
 
     #[test]
@@ -5812,24 +6410,47 @@ mod windows_recycle_bin_tests {
     }
 
     #[test]
-    fn windows_recycle_bin_report_serializes_only_the_known_count() {
-        let report =
-            windows_recycle_bin_report(Ok(WindowsRecycleBinSummary { item_count: 17 }), false);
+    fn windows_recycle_bin_report_serializes_partial_size_as_incomplete() {
+        let report = windows_recycle_bin_report(
+            Ok(WindowsRecycleBinSummary {
+                item_count: 17,
+                logical_bytes: Some(1536),
+                size_complete: false,
+            }),
+            false,
+        );
         let location = &report.locations[0];
         assert!(location.path.as_os_str().is_empty());
         assert_eq!(location.item_count, Some(17));
-        assert_eq!(location.logical_bytes, None);
+        assert_eq!(location.logical_bytes, Some(1536));
         assert_eq!(location.allocated_bytes, None);
         assert!(!location.size_complete);
         assert!(location.items.is_empty());
         assert!(!location.items_complete);
         assert!(location.warnings[0].contains("deletion dates are unknown"));
+        assert!(location.warnings[0].contains("partial sum"));
 
         let json = serde_json::to_value(&report).unwrap();
         assert!(json["locations"][0]["path"].is_null());
         assert_eq!(json["locations"][0]["item_count"], 17);
-        assert!(json["locations"][0]["logical_bytes"].is_null());
+        assert_eq!(json["locations"][0]["logical_bytes"], 1536);
+        assert_eq!(json["locations"][0]["size_complete"], false);
         assert_eq!(json["locations"][0]["items"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn windows_recycle_bin_report_keeps_an_unrepresentable_size_unknown() {
+        let report = windows_recycle_bin_report(
+            Ok(WindowsRecycleBinSummary {
+                item_count: 17,
+                logical_bytes: None,
+                size_complete: false,
+            }),
+            false,
+        );
+        assert_eq!(report.locations[0].logical_bytes, None);
+        assert!(!report.locations[0].size_complete);
+        assert!(report.locations[0].warnings[0].contains("size is unavailable"));
     }
 
     #[test]
@@ -5838,8 +6459,14 @@ mod windows_recycle_bin_tests {
         assert!(failed.locations.is_empty());
         assert!(failed.warnings[0].contains("inventory unavailable"));
 
-        let cancelled =
-            windows_recycle_bin_report(Ok(WindowsRecycleBinSummary { item_count: 17 }), true);
+        let cancelled = windows_recycle_bin_report(
+            Ok(WindowsRecycleBinSummary {
+                item_count: 17,
+                logical_bytes: Some(0),
+                size_complete: true,
+            }),
+            true,
+        );
         assert!(cancelled.cancelled);
         assert!(cancelled.locations.is_empty());
         assert!(cancelled.warnings[0].contains("cancelled"));

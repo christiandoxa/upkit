@@ -501,8 +501,14 @@ fn preview_with_activity(
         .iter()
         .map(|item| item.path.clone())
         .collect::<Vec<_>>();
-    let statuses = inspect_activity(&activity_paths, cancel);
+    let mut statuses = inspect_activity(&activity_paths, cancel);
     let mut eligible = Vec::new();
+    if statuses.len() != approved.len() {
+        complete = false;
+        warnings
+            .push("process activity inspection returned an unexpected number of results".into());
+        statuses = vec!["activity_unknown"; approved.len()];
+    }
     for (item, status) in approved.into_iter().zip(statuses) {
         let candidate = candidates
             .iter_mut()
@@ -709,9 +715,8 @@ fn remove_one_inner(
         bail!("staging contents changed since preview");
     }
     drop(original);
-    if inspect_activity(std::slice::from_ref(&item.path), cancel)[0]
-        != "no_open_handles_or_cwd_observed"
-    {
+    let activity = inspect_activity(std::slice::from_ref(&item.path), cancel);
+    if activity.len() != 1 || activity[0] != "no_open_handles_or_cwd_observed" {
         bail!("process activity was observed or could not be ruled out");
     }
 
@@ -809,9 +814,8 @@ fn remove_one_inner(
             bail!("quarantined staging contents changed");
         }
         drop(staged_root);
-        if inspect_activity(&[quarantine_path.join("root")], cancel)[0]
-            != "no_open_handles_or_cwd_observed"
-        {
+        let activity = inspect_activity(&[quarantine_path.join("root")], cancel);
+        if activity.len() != 1 || activity[0] != "no_open_handles_or_cwd_observed" {
             bail!("process activity was observed after quarantine");
         }
         check_quarantine(
@@ -1153,6 +1157,69 @@ mod tests {
         let result = run_with_activity(&plan, &plan.preview_token, &cancel, no_activity).unwrap();
         assert_eq!(result.items[0].status, "failed");
         assert!(active.exists());
+    }
+
+    #[test]
+    fn incomplete_activity_results_disable_selection_and_removal() {
+        let (_dir, home, bindir) = fixture();
+        let target = stale_link(&bindir, &home, "short-activity-fixture");
+        let cancel = AtomicBool::new(false);
+        let missing_activity = |_: &[PathBuf], _: &AtomicBool| Vec::new();
+
+        let inventory =
+            preview_with_activity(&home, &bindir, &[], &cancel, missing_activity).unwrap();
+        assert!(!inventory.complete);
+        assert_eq!(inventory.selected_count, 0);
+        assert_eq!(inventory.candidates[0].status, "activity_unknown");
+        assert!(
+            inventory
+                .warnings
+                .iter()
+                .any(|warning| { warning.contains("unexpected number of results") })
+        );
+        assert!(target.join("link").is_symlink());
+        assert!(
+            preview_with_activity(
+                &home,
+                &bindir,
+                std::slice::from_ref(&target),
+                &cancel,
+                missing_activity,
+            )
+            .is_err()
+        );
+
+        let no_activity = |paths: &[PathBuf], _: &AtomicBool| {
+            vec!["no_open_handles_or_cwd_observed"; paths.len()]
+        };
+        let plan = preview_with_activity(
+            &home,
+            &bindir,
+            std::slice::from_ref(&target),
+            &cancel,
+            no_activity,
+        )
+        .unwrap();
+        let result =
+            run_with_activity(&plan, &plan.preview_token, &cancel, missing_activity).unwrap();
+        assert_eq!(result.outcome, "failed");
+        assert_eq!(result.items[0].status, "failed");
+        assert!(target.join("link").is_symlink());
+
+        let mut calls = 0;
+        let result = run_with_activity(&plan, &plan.preview_token, &cancel, |paths, _| {
+            calls += 1;
+            if calls == 1 {
+                vec!["no_open_handles_or_cwd_observed"; paths.len()]
+            } else {
+                Vec::new()
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(result.outcome, "failed");
+        assert_eq!(result.items[0].status, "failed");
+        assert!(target.join("link").is_symlink());
     }
 
     #[test]

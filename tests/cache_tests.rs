@@ -54,12 +54,78 @@ fn isolated_upkit_command(source: &std::path::Path) -> std::process::Command {
             "--mount-proc",
             "/bin/sh",
             "-c",
-            "/usr/bin/mount --make-rprivate / && /usr/bin/mount --bind \"$1\" /etc/opt && shift && exec \"$@\"",
+            "/usr/bin/mount --make-rprivate / && /usr/bin/mount --bind \"$1\" /etc/opt && shift && if [ \"${UPKIT_TEST_SKIP_NPM_GLOBALCONFIG:-}\" = 1 ]; then unset NPM_CONFIG_GLOBALCONFIG; elif [ \"${NPM_CONFIG_GLOBALCONFIG+x}\" != x ]; then export NPM_CONFIG_GLOBALCONFIG=\"$HOME/upkit-cache-test-global.npmrc\"; fi && unset UPKIT_TEST_SKIP_NPM_GLOBALCONFIG && exec \"$@\"",
             "sh",
         ])
         .arg(source)
         .arg(env!("CARGO_BIN_EXE_upkit"));
+    command.current_dir(source.parent().unwrap());
     command
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cache_preview_fails_closed_without_npm_global_config_location() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(isolated_opt) = isolated_machine_config_dir(dir.path()) else {
+        return;
+    };
+    let home = dir.path().join("home");
+    let target = home.join(".cargo/registry");
+    let prefix = home.join("npm-prefix");
+    let possible_npm_cache = home.join("npm-cache");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::create_dir_all(prefix.join("etc")).unwrap();
+    std::fs::create_dir_all(possible_npm_cache.join("_cacache")).unwrap();
+    std::fs::write(
+        prefix.join("etc/npmrc"),
+        format!("cache={}\n", possible_npm_cache.display()),
+    )
+    .unwrap();
+
+    let status = isolated_upkit_command(&isolated_opt)
+        .args(["--json", "cache", "status"])
+        .current_dir(dir.path())
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", "/usr/bin:/bin")
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("NPM_CONFIG_PREFIX", &prefix)
+        .env("UPKIT_TEST_SKIP_NPM_GLOBALCONFIG", "1")
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let possible_cache_path = possible_npm_cache.join("_cacache");
+    assert!(status["entries"].as_array().unwrap().iter().any(|entry| {
+        entry["name"] == "npm configured cache (possible)"
+            && entry["path"] == possible_cache_path.to_str().unwrap()
+    }));
+
+    let output = isolated_upkit_command(&isolated_opt)
+        .args(["--json", "sweep", "run", "--scope", "cache", "--select"])
+        .arg(&target)
+        .arg("--preview")
+        .current_dir(dir.path())
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", "/usr/bin:/bin")
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("NPM_CONFIG_PREFIX", &prefix)
+        .env("UPKIT_TEST_SKIP_NPM_GLOBALCONFIG", "1")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let output = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.contains("npm global config location is unverified"));
 }
 
 #[cfg(target_os = "linux")]
@@ -348,6 +414,7 @@ fn cache_status_reports_fixture_sizes_without_mutating_files() {
     fs::write(registry.join("fixture"), b"cargo").unwrap();
     fs::write(modules.join("fixture"), b"modules").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_upkit"))
+        .current_dir(dir.path())
         .args(["--json", "cache", "status"])
         .env_clear()
         .env("HOME", &home)
@@ -387,6 +454,142 @@ fn cache_status_reports_fixture_sizes_without_mutating_files() {
     assert_eq!(fs::read(registry.join("fixture")).unwrap(), b"cargo");
     assert_eq!(fs::read(modules.join("fixture")).unwrap(), b"modules");
     assert!(!home.join(".bashrc").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cache_status_warns_when_cache_estimates_overlap() {
+    use std::fs;
+
+    let dir = tempfile::tempdir().unwrap();
+    let Some(isolated_opt) = isolated_machine_config_dir(dir.path()) else {
+        return;
+    };
+    let home = dir.path().join("home");
+    let registry = home.join(".cargo/registry");
+    let pip = registry.join("pip");
+    let go_build = pip.join("go-build");
+    let cargo_git = home.join(".cargo/git");
+    fs::create_dir_all(&go_build).unwrap();
+    fs::create_dir_all(&cargo_git).unwrap();
+    fs::write(registry.join("registry-fixture"), b"registry").unwrap();
+    fs::write(pip.join("pip-fixture"), b"pip").unwrap();
+    fs::write(go_build.join("go-fixture"), b"go").unwrap();
+    fs::write(cargo_git.join("git-fixture"), b"git").unwrap();
+
+    let output = isolated_upkit_command(&isolated_opt)
+        .args(["--json", "cache", "status"])
+        .current_dir(dir.path())
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", "/usr/bin:/bin")
+        .env("GOENV", "off")
+        .env("GOCACHE", &go_build)
+        .env("GOMODCACHE", home.join("go-mod"))
+        .env("XDG_CACHE_HOME", &registry)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let entries = report["entries"].as_array().unwrap();
+    let warnings = |name| {
+        entries.iter().find(|entry| entry["name"] == name).unwrap()["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| {
+                warning
+                    .as_str()
+                    .unwrap()
+                    .contains("size estimates may overlap")
+            })
+    };
+    assert!(warnings("Cargo registry"));
+    assert!(warnings("pip"));
+    assert!(warnings("Go build"));
+    assert!(!warnings("Cargo git"));
+    assert_eq!(
+        fs::read(registry.join("registry-fixture")).unwrap(),
+        b"registry"
+    );
+    assert_eq!(fs::read(pip.join("pip-fixture")).unwrap(), b"pip");
+    assert_eq!(fs::read(go_build.join("go-fixture")).unwrap(), b"go");
+    assert_eq!(fs::read(cargo_git.join("git-fixture")).unwrap(), b"git");
+}
+
+#[test]
+fn cargo_build_outputs_are_inventory_only_with_unknown_scope() {
+    use std::{fs, process::Command};
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let target = home.join("cargo-target");
+    let build = dir.path().join("cargo-build");
+    fs::create_dir_all(&target).unwrap();
+    fs::create_dir_all(&build).unwrap();
+    fs::write(target.join("fixture"), b"target output").unwrap();
+    fs::write(build.join("fixture"), b"intermediate output").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_upkit"))
+        .current_dir(dir.path())
+        .args(["--json", "cache", "status"])
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", "/usr/bin:/bin")
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("CARGO_TARGET_DIR", &target)
+        .env("CARGO_BUILD_BUILD_DIR", &build)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let entries = report["entries"].as_array().unwrap();
+    for path in [&target, &build] {
+        let entry = entries
+            .iter()
+            .find(|entry| {
+                entry["name"] == "Cargo build output (possible)"
+                    && entry["path"] == path.to_str().unwrap()
+            })
+            .unwrap();
+        assert_eq!(entry["ownership"], "configured Cargo output; scope unknown");
+        assert_eq!(entry["classification"], "configured output; scope unknown");
+        assert_eq!(entry["status"], "inventory only");
+        assert!(
+            entry["consequence"]
+                .as_str()
+                .unwrap()
+                .contains("other user data")
+        );
+    }
+    assert!(
+        report["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| {
+                warning.as_str().unwrap().contains(
+                    "Cargo --target-dir/--config overrides and config files outside that search are not inspected",
+                )
+            })
+    );
+    assert_eq!(fs::read(target.join("fixture")).unwrap(), b"target output");
+    assert_eq!(
+        fs::read(build.join("fixture")).unwrap(),
+        b"intermediate output"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -1284,6 +1487,7 @@ fn maven_cache_inventory_uses_user_settings_repository_without_mutating_files() 
     .unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_upkit"))
+        .current_dir(dir.path())
         .args(["--json", "cache", "status"])
         .env_clear()
         .env("HOME", &home)
@@ -1341,6 +1545,7 @@ fn unresolved_maven_user_settings_are_reported_and_not_inventoried() {
     )
     .unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_upkit"))
+        .current_dir(dir.path())
         .args(["--json", "cache", "status"])
         .env_clear()
         .env("HOME", &home)
@@ -1415,6 +1620,7 @@ fn cache_json_preserves_non_unicode_paths_in_inventory_and_go_preview() {
     )
     .unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_upkit"))
+        .current_dir(dir.path())
         .args(["--json", "--offline", "cache", "status"])
         .env_clear()
         .env("HOME", &home)
@@ -1444,6 +1650,7 @@ fn cache_json_preserves_non_unicode_paths_in_inventory_and_go_preview() {
             .contains("cargo-%FF/registry")
     );
     let preview = Command::new(env!("CARGO_BIN_EXE_upkit"))
+        .current_dir(dir.path())
         .args(["--json", "--non-interactive", "--home"])
         .arg(&home)
         .args(["cache", "go-test", "--path"])
@@ -1529,6 +1736,7 @@ fn configured_yarn_and_compiler_caches_are_inventoried_without_mutation() {
         fs::write(path.join("fixture"), contents).unwrap();
     }
     let output = Command::new(env!("CARGO_BIN_EXE_upkit"))
+        .current_dir(dir.path())
         .args(["--json", "cache", "status"])
         .env_clear()
         .env("HOME", &home)
@@ -1673,6 +1881,7 @@ fn uv_cache_inventory_is_read_only_and_respects_absolute_overrides() {
     let run = |home: &Path, xdg: &Path, override_dir: Option<&Path>| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_upkit"));
         command
+            .current_dir(dir.path())
             .args(["--json", "cache", "status"])
             .env_clear()
             .env("HOME", home)
@@ -1780,6 +1989,7 @@ fn go_module_cache_uses_first_gopath_entry() {
     fs::create_dir_all(&modules).unwrap();
     fs::write(modules.join("fixture"), b"modules").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_upkit"))
+        .current_dir(dir.path())
         .args(["--json", "cache", "status"])
         .env_clear()
         .env("HOME", &home)
@@ -1848,6 +2058,7 @@ fn go_cache_inventory_respects_persistent_environment_and_process_overrides() {
     let run = |overrides: &[(&str, &std::ffi::OsStr)]| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_upkit"));
         command
+            .current_dir(dir.path())
             .args(["--json", "cache", "status"])
             .env_clear()
             .env("HOME", &home)
@@ -1956,6 +2167,7 @@ fn go_user_empty_settings_shield_unknown_goroot_defaults() {
     .unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_upkit"))
+        .current_dir(dir.path())
         .args(["--json", "cache", "status"])
         .env_clear()
         .env("HOME", &home)
@@ -2062,6 +2274,7 @@ fn goenv_off_and_missing_user_keys_do_not_claim_unknown_goroot_defaults() {
     let run = |goenv: Option<&std::ffi::OsStr>, gocache: Option<&std::path::Path>| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_upkit"));
         command
+            .current_dir(dir.path())
             .args(["--json", "cache", "status"])
             .env_clear()
             .env("HOME", &home)
@@ -2144,6 +2357,7 @@ fn goenv_off_and_missing_user_keys_do_not_claim_unknown_goroot_defaults() {
 
     let missing_home = dir.path().join("missing-home");
     let missing = Command::new(env!("CARGO_BIN_EXE_upkit"))
+        .current_dir(dir.path())
         .args(["--json", "cache", "status"])
         .env_clear()
         .env("HOME", &missing_home)
@@ -2195,6 +2409,7 @@ fn go_persistent_environment_gopath_and_unsafe_file_are_reported() {
     .unwrap();
     let run = |selected: &std::path::Path| {
         let output = Command::new(env!("CARGO_BIN_EXE_upkit"))
+            .current_dir(dir.path())
             .args(["--json", "cache", "status"])
             .env_clear()
             .env("HOME", &home)
@@ -2294,6 +2509,7 @@ fn relative_xdg_directories_do_not_select_wrong_go_defaults() {
     let run = |goenv: Option<&std::path::Path>| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_upkit"));
         command
+            .current_dir(dir.path())
             .args(["--json", "cache", "status"])
             .env_clear()
             .env("HOME", &home)
@@ -2355,6 +2571,7 @@ fn go_test_cache_marker_is_visible_without_mutation() {
     fs::create_dir(&cache).unwrap();
     fs::write(cache.join("testexpire.txt"), "123456789\n").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_upkit"))
+        .current_dir(dir.path())
         .args(["--json", "cache", "status"])
         .env_clear()
         .env("HOME", dir.path())
@@ -2472,6 +2689,7 @@ fn go_test_cli_requires_explicit_authorization_and_records_fixture_result() {
     fs::write(cache.join("keep"), "fixture").unwrap();
     let run = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_upkit"))
+            .current_dir(dir.path())
             .args(["--json", "--non-interactive", "--home"])
             .arg(&home)
             .args(args)
@@ -2571,6 +2789,7 @@ fn zig_global_cache_inventory_uses_override_and_xdg_default_without_mutating_fil
     let run = |override_path: Option<&std::path::Path>| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_upkit"));
         command
+            .current_dir(dir.path())
             .args(["--json", "cache", "status"])
             .env_clear()
             .env("HOME", &home)
@@ -2611,6 +2830,7 @@ fn relative_zig_global_cache_is_reported_and_not_inventoried() {
     fs::create_dir_all(&default).unwrap();
     fs::write(default.join("keep"), "fixture").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_upkit"))
+        .current_dir(dir.path())
         .args(["--json", "cache", "status"])
         .env_clear()
         .env("HOME", &home)
@@ -2694,6 +2914,7 @@ fn macos_go_environment_uses_go_config_dir_without_exposing_other_values() {
     let run = |goenv: Option<&std::path::Path>, gocache: Option<&std::path::Path>| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_upkit"));
         command
+            .current_dir(dir.path())
             .args(["--json", "cache", "status"])
             .env_clear()
             .env("HOME", &home)
@@ -2848,6 +3069,7 @@ fn windows_go_environment_reads_default_and_override_with_process_precedence() {
     let run = |goenv: Option<&std::ffi::OsStr>, gocache: Option<&std::ffi::OsStr>| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_upkit"));
         command
+            .current_dir(&root)
             .args(["--json", "cache", "status"])
             .env_clear()
             .env("APPDATA", &app_data)
@@ -2996,6 +3218,7 @@ fn windows_go_environment_requires_known_gopath_and_follows_localappdata() {
                gocache: Option<&std::ffi::OsStr>| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_upkit"));
         command
+            .current_dir(dir.path())
             .args(["--json", "cache", "status"])
             .env_clear()
             .env("GOENV", &go_env);
@@ -3129,6 +3352,7 @@ fn bun_cache_inventory_uses_documented_default_and_override_precedence() {
     let run_status = |cache_dir: Option<&OsStr>, install: Option<&OsStr>| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_upkit"));
         command
+            .current_dir(dir.path())
             .args(["--offline", "--json", "cache", "status"])
             .env_clear()
             .env("HOME", &home)
@@ -3243,7 +3467,10 @@ fn bun_cache_inventory_uses_documented_default_and_override_precedence() {
 #[cfg(target_os = "linux")]
 #[test]
 fn bun_cache_inventory_blocks_upkit_removal_and_overlap_with_other_caches() {
-    use std::fs;
+    use std::{
+        fs,
+        os::unix::fs::{PermissionsExt, symlink},
+    };
 
     let dir = tempfile::tempdir().unwrap();
     let Some(isolated_opt) = isolated_machine_config_dir(dir.path()) else {
@@ -3252,6 +3479,8 @@ fn bun_cache_inventory_blocks_upkit_removal_and_overlap_with_other_caches() {
     let home = dir.path().join("home");
     let bun_cache = home.join(".bun/install/cache");
     let cargo_registry = home.join(".cargo/registry");
+    let workspace = home.join("workspace");
+    let linked_parent = cargo_registry.join("nested");
     let config = home.join(".config");
     fs::create_dir_all(config.join("go")).unwrap();
     fs::write(
@@ -3266,6 +3495,9 @@ fn bun_cache_inventory_blocks_upkit_removal_and_overlap_with_other_caches() {
     .unwrap();
     fs::create_dir_all(&bun_cache).unwrap();
     fs::create_dir_all(&cargo_registry).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&linked_parent).unwrap();
+    symlink(&linked_parent, workspace.join("cache-link")).unwrap();
     fs::write(bun_cache.join("fixture"), b"bun").unwrap();
     fs::write(cargo_registry.join("fixture"), b"cargo").unwrap();
     let preview = |target: &std::path::Path,
@@ -3274,6 +3506,7 @@ fn bun_cache_inventory_blocks_upkit_removal_and_overlap_with_other_caches() {
                    cargo_home: Option<&std::path::Path>| {
         let mut command = isolated_upkit_command(&isolated_opt);
         command
+            .current_dir(&workspace)
             .args([
                 "--offline",
                 "--json",
@@ -3324,6 +3557,128 @@ fn bun_cache_inventory_blocks_upkit_removal_and_overlap_with_other_caches() {
             .contains("overlaps another discovered cache location")
     );
     assert_eq!(fs::read(cargo_registry.join("fixture")).unwrap(), b"cargo");
+
+    fs::write(
+        workspace.join("bunfig.toml"),
+        "[install.cache]\ndir = \"cache-link/../bun-cache\"\n",
+    )
+    .unwrap();
+    let bun_config_cache = cargo_registry.join("bun-cache");
+    fs::create_dir_all(&bun_config_cache).unwrap();
+    fs::write(bun_config_cache.join("fixture"), b"bun-config").unwrap();
+    let output = preview(&cargo_registry, None, None, None);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("overlaps another discovered cache location")
+    );
+    assert_eq!(fs::read(cargo_registry.join("fixture")).unwrap(), b"cargo");
+    assert_eq!(
+        fs::read(bun_config_cache.join("fixture")).unwrap(),
+        b"bun-config"
+    );
+    let output = preview(&bun_config_cache, None, None, None);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("Upkit inventories the Bun cache but does not remove it")
+    );
+    assert_eq!(
+        fs::read(bun_config_cache.join("fixture")).unwrap(),
+        b"bun-config"
+    );
+
+    fs::write(workspace.join("bunfig.toml"), "[install.cache\n").unwrap();
+    let output = preview(&cargo_registry, None, None, None);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Bun cache configuration is unverified")
+    );
+    assert_eq!(fs::read(cargo_registry.join("fixture")).unwrap(), b"cargo");
+
+    let external_bunfig = workspace.join("real-bunfig.toml");
+    fs::write(
+        &external_bunfig,
+        "[install.cache]\ndir = \"/tmp/private\"\n",
+    )
+    .unwrap();
+    fs::remove_file(workspace.join("bunfig.toml")).unwrap();
+    symlink(&external_bunfig, workspace.join("bunfig.toml")).unwrap();
+    let output = preview(&cargo_registry, None, None, None);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Bun cache configuration is unverified")
+    );
+    assert_eq!(fs::read(cargo_registry.join("fixture")).unwrap(), b"cargo");
+
+    fs::remove_file(workspace.join("bunfig.toml")).unwrap();
+    fs::write(
+        workspace.join(".npmrc"),
+        format!("cache={}\n", home.join(".cargo").display()),
+    )
+    .unwrap();
+    let output = preview(&cargo_registry, None, None, None);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("overlaps another discovered cache location")
+    );
+    assert_eq!(fs::read(cargo_registry.join("fixture")).unwrap(), b"cargo");
+
+    fs::remove_file(workspace.join(".npmrc")).unwrap();
+    fs::write(
+        config.join(".npmrc"),
+        format!("cache={}\n", home.join(".cargo").display()),
+    )
+    .unwrap();
+    let output = preview(&cargo_registry, None, None, None);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("overlaps another discovered cache location")
+    );
+    assert_eq!(fs::read(cargo_registry.join("fixture")).unwrap(), b"cargo");
+    let separate_bun_cache = home.join("separate-bun-cache");
+    fs::create_dir(&separate_bun_cache).unwrap();
+    for path in [
+        home.join(".cargo"),
+        cargo_registry.clone(),
+        linked_parent.clone(),
+        bun_config_cache.clone(),
+    ] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    for path in [
+        cargo_registry.join("fixture"),
+        bun_config_cache.join("fixture"),
+    ] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    fs::write(
+        config.join(".npmrc"),
+        format!("cache={}\n", separate_bun_cache.display()),
+    )
+    .unwrap();
+    let output = preview(&cargo_registry, None, None, None);
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(cargo_registry.join("fixture")).unwrap(), b"cargo");
+    fs::remove_file(config.join(".npmrc")).unwrap();
+    let external_npmrc = workspace.join("external-npmrc");
+    fs::write(&external_npmrc, "cache=/fixture/private\n").unwrap();
+    symlink(&external_npmrc, config.join(".npmrc")).unwrap();
+    let output = preview(&cargo_registry, None, None, None);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("npm XDG config file could not be read safely")
+    );
+    assert_eq!(fs::read(cargo_registry.join("fixture")).unwrap(), b"cargo");
+    fs::remove_file(config.join(".npmrc")).unwrap();
 
     let output = preview(
         &cargo_registry,

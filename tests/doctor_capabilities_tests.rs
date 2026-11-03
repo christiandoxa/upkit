@@ -80,10 +80,30 @@ fn doctor_reports_capabilities_without_running_maintenance_or_container_engines(
         offline_report["capabilities"]["fstrim_timer"]["state"],
         "skipped"
     );
+    assert_eq!(offline_report["capabilities"]["fstrim_available"], true);
     assert_eq!(
         offline_report["capabilities"]["scan_timer"]["state"],
         "skipped"
     );
+    let offline_actions = offline_report["capabilities"]["actionable_diagnostics"]
+        .as_array()
+        .unwrap();
+    assert!(offline_actions.iter().any(|action| {
+        action
+            .as_str()
+            .unwrap()
+            .contains("systemctl show fstrim.timer")
+            && action
+                .as_str()
+                .unwrap()
+                .contains("skipped does not mean absent")
+    }));
+    assert!(offline_actions.iter().any(|action| {
+        action
+            .as_str()
+            .unwrap()
+            .contains("upkit --non-interactive schedule list")
+    }));
     assert!(!root.join("systemctl-calls").exists());
     let output = run(false, false);
     let output_text = String::from_utf8_lossy(&output.stdout);
@@ -288,4 +308,186 @@ fn doctor_distinguishes_unreadable_paths_from_missing_ones() {
             .iter()
             .any(|issue| { issue.as_str().unwrap().contains("bindir does not exist") })
     );
+}
+
+#[test]
+fn doctor_reports_unsupported_installation_integrity_as_unknown() {
+    use std::{fs, process::Command};
+
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_upkit"))
+        .args(["--home"])
+        .arg(root)
+        .arg("--bindir")
+        .arg(&bin)
+        .args([
+            "--json",
+            "--offline",
+            "--dry-run",
+            "--non-interactive",
+            "doctor",
+        ])
+        .current_dir(root)
+        .env("HOME", root)
+        .env("USERPROFILE", root)
+        .env("APPDATA", root.join("appdata"))
+        .env("LOCALAPPDATA", root.join("local-appdata"))
+        .env("PATH", &bin)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_CACHE_HOME", root.join("cache"))
+        .env_remove("GOROOT")
+        .env_remove("DOCKER_HOST")
+        .env_remove("DOCKER_CONTEXT")
+        .env_remove("CONTAINER_HOST")
+        .env_remove("CONTAINER_CONNECTION")
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("Doctor returned no JSON ({}): {error}", output.status));
+
+    let supported = cfg!(unix);
+    let integrity = &report["capabilities"]["installation_integrity"];
+    assert_eq!(integrity["supported"], supported);
+    let diagnostics = report["capabilities"]["actionable_diagnostics"]
+        .as_array()
+        .unwrap();
+    let unsupported = diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .as_str()
+            .is_some_and(|diagnostic| diagnostic.contains("installation integrity remains unknown"))
+    });
+    assert_eq!(unsupported, !supported);
+    if !supported {
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .as_str()
+                .is_some_and(|diagnostic| diagnostic.contains("provider's verification guidance"))
+        }));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn doctor_reports_nonempty_goroot_without_exposing_its_value() {
+    use std::{ffi::OsStr, fs, process::Command};
+
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let run = |goroot: Option<&OsStr>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_upkit"));
+        command
+            .args(["--home"])
+            .arg(root)
+            .arg("--bindir")
+            .arg(&bin)
+            .args([
+                "--non-interactive",
+                "--json",
+                "--dry-run",
+                "--offline",
+                "doctor",
+            ])
+            .env("HOME", root)
+            .env("PATH", &bin)
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .current_dir(root);
+        if let Some(goroot) = goroot {
+            command.env("GOROOT", goroot);
+        } else {
+            command.env_remove("GOROOT");
+        }
+        command.output().unwrap()
+    };
+
+    let secret = OsStr::new("/private/fixture/goroot-value");
+    let output = run(Some(secret));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("Doctor returned no JSON ({}): {error}", output.status));
+    let issues = report["issues"].as_array().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(if issues.is_empty() { 0 } else { 2 }),
+        "Doctor exit status should match its issue report"
+    );
+    let expected_status = output.status.code();
+    assert!(
+        issues
+            .iter()
+            .all(|issue| { !issue.as_str().is_some_and(|issue| issue.contains("GOROOT")) })
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("GOROOT is set in Upkit's environment"));
+    assert!(text.contains("Go honors a non-empty GOROOT when resolving its root"));
+    assert!(!text.contains(secret.to_str().unwrap()));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(secret.to_str().unwrap()));
+
+    for goroot in [Some(OsStr::new("")), None] {
+        let output = run(goroot);
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("Doctor returned no JSON ({}): {error}", output.status));
+        let issues = report["issues"].as_array().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(if issues.is_empty() { 0 } else { 2 }),
+            "Doctor exit status should match its issue report"
+        );
+        assert_eq!(output.status.code(), expected_status);
+        assert!(
+            issues
+                .iter()
+                .all(|issue| { !issue.as_str().is_some_and(|issue| issue.contains("GOROOT")) })
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(!text.contains("GOROOT is set in Upkit's environment"));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn doctor_recommends_inspection_when_the_scan_timer_failed() {
+    use std::{fs, os::unix::fs::PermissionsExt, process::Command};
+
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let systemctl = bin.join("systemctl");
+    fs::write(
+        &systemctl,
+        "#!/bin/sh\ncase \"$1/$2\" in\n  show/fstrim.timer) printf 'LoadState=loaded\\nActiveState=active\\n' ;;\n  --user/show) printf 'LoadState=loaded\\nActiveState=failed\\n' ;;\n  *) exit 2 ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_upkit"))
+        .args(["--non-interactive", "--json", "doctor"])
+        .env("HOME", root)
+        .env("PATH", &bin)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .current_dir(root)
+        .env_remove("DOCKER_HOST")
+        .env_remove("DOCKER_CONTEXT")
+        .env_remove("CONTAINER_HOST")
+        .env_remove("CONTAINER_CONNECTION")
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["capabilities"]["scan_timer"]["state"], "failed");
+    let diagnostics = report["capabilities"]["actionable_diagnostics"]
+        .as_array()
+        .unwrap();
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.as_str().is_some_and(|diagnostic| {
+            diagnostic.contains("scan schedule failed")
+                && diagnostic.contains("upkit --non-interactive schedule list")
+        })
+    }));
 }

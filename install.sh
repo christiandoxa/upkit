@@ -101,6 +101,9 @@ printf '%s\n' "$version" | grep -Eq '^upkit [0-9]+\.[0-9]+\.[0-9]+$' || {
 if [ "$release" != latest ] && [ "$version" != "upkit ${release#v}" ]; then
   echo "Downloaded version $version does not match $release" >&2; exit 1
 fi
+if [ -L "$install_dir/upkit" ] || { [ -e "$install_dir/upkit" ] && [ ! -f "$install_dir/upkit" ]; }; then
+  echo 'Install destination must be a regular file or absent' >&2; exit 1
+fi
 mv -f "$staged" "$install_dir/upkit"
 staged=''
 printf 'Installed %s to %s/upkit\n' "$version" "$install_dir"

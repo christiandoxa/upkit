@@ -999,7 +999,7 @@ mod tests {
         let report = performed
             .result
             .unwrap_or_else(|error| panic!("scheduled Trash run failed: {error}"));
-        assert_eq!(report.outcome, "completed");
+        assert_eq!(report.outcome, "completed", "report: {report:?}");
         assert_eq!(report.eligible, 1);
         assert_eq!(report.removed, 1);
         assert_eq!(report.items.len(), 1);

@@ -205,6 +205,43 @@ fn rust_check_not_installed() {
 }
 
 #[test]
+fn rust_check_offline_distinguishes_missing_executable_from_unknown_version() {
+    let _guard = reset_guard();
+    let (mut ctx, _dir) = ctx_with_dirs();
+    ctx.offline = true;
+    set_which("rustc", None);
+    let missing = check_rust(&ctx).unwrap();
+    assert!(matches!(missing.status, Status::NotInstalled));
+    assert!(missing.notes.iter().any(|note| note.contains("on PATH")));
+
+    set_which("rustc", Some(PathBuf::from("/fixture/rustc")));
+    let unverified = check_rust(&ctx).unwrap();
+    assert!(matches!(unverified.status, Status::Unknown));
+    assert!(unverified.installed.is_none());
+}
+
+#[test]
+fn rust_check_failed_probe_is_unknown_not_missing() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = ctx_with_dirs();
+    set_which("rustc", Some(PathBuf::from("/fixture/rustc")));
+    set_run_output(
+        "rustc",
+        &["--version"],
+        output_with_status(1, b"", b"unavailable"),
+    );
+    let report = check_rust(&ctx).unwrap();
+    assert!(matches!(report.status, Status::Unknown));
+    assert!(report.latest.is_none());
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|note| note.contains("could not be verified"))
+    );
+}
+
+#[test]
 fn update_rust_paths() {
     let _guard = reset_guard();
     let (mut ctx, dir) = ctx_with_dirs();

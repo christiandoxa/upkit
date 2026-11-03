@@ -112,8 +112,8 @@ pub fn check_flutter(ctx: &Ctx) -> Result<ToolReport> {
         flutter_metadata_version(root)
             .ok()
             .and_then(|v| Version::parse_loose(&v))
-    } else if ctx.dry_run {
-        // Flutter's version command can write its SDK cache.
+    } else if ctx.dry_run || ctx.offline {
+        // Flutter's version command can write its SDK cache or download dependencies.
         None
     } else if let Some(bin) = &bindir_flutter {
         flutter_installed_version(bin)
@@ -122,12 +122,9 @@ pub fn check_flutter(ctx: &Ctx) -> Result<ToolReport> {
     } else {
         None
     };
-    let version_unverified = ctx.dry_run
-        && if managed_windows.is_some() {
-            installed.is_none()
-        } else {
-            bindir_flutter.is_some() || path_flutter.is_some()
-        };
+    let executable_found =
+        managed_windows.is_some() || bindir_flutter.is_some() || path_flutter.is_some();
+    let version_unverified = executable_found && installed.is_none();
 
     let archive_update = ctx.os == "windows"
         && (managed_windows.is_some() || (bindir_flutter.is_none() && path_flutter.is_none()));
@@ -149,6 +146,16 @@ pub fn check_flutter(ctx: &Ctx) -> Result<ToolReport> {
     }
     if version_unverified {
         notes.push("Installed Flutter version was not verified.".into());
+        if ctx.offline && !ctx.dry_run {
+            notes.push(
+                "Offline mode skipped running Flutter; its startup can download dependencies."
+                    .into(),
+            );
+        } else if !ctx.dry_run {
+            notes.push(
+                "A Flutter executable was found, but its version could not be verified.".into(),
+            );
+        }
     }
     let latest = match flutter_latest_stable(ctx) {
         Ok(version) => Some(version),

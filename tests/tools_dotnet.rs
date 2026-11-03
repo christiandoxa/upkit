@@ -15,19 +15,31 @@ const INDEX: &str =
     "https://builds.dotnet.microsoft.com/dotnet/release-metadata/releases-index.json";
 const RELEASES: &str =
     "https://builds.dotnet.microsoft.com/dotnet/release-metadata/10.0/releases.json";
-const DOWNLOAD: &str = "https://example.invalid/dotnet.tar.gz";
+const DOWNLOAD: &str =
+    "https://builds.dotnet.microsoft.com/dotnet/Sdk/10.0.403/dotnet-sdk-linux-x64.tar.gz";
 
 fn index() -> Vec<u8> {
     br#"{"releases-index":[{"channel-version":"11.0","latest-sdk":"11.0.100-preview.1","release-type":"sts","support-phase":"go-live"},{"channel-version":"8.0","latest-sdk":"8.0.426","release-type":"lts","support-phase":"maintenance"},{"channel-version":"10.0","latest-sdk":"10.0.403","release-type":"lts","support-phase":"active"}]}"#.to_vec()
 }
 
 fn metadata(hash: &str) -> Vec<u8> {
-    format!(r#"{{"releases":[{{"sdks":[{{"version":"10.0.403","files":[{{"name":"dotnet-sdk-linux-x64.tar.gz","rid":"linux-x64","url":"{DOWNLOAD}","hash":"{hash}"}}]}}]}}]}}"#).into_bytes()
+    metadata_with_url(hash, DOWNLOAD)
+}
+
+fn metadata_with_url(hash: &str, url: &str) -> Vec<u8> {
+    format!(r#"{{"releases":[{{"sdks":[{{"version":"10.0.403","files":[{{"name":"dotnet-sdk-linux-x64.tar.gz","rid":"linux-x64","url":"{url}","hash":"{hash}"}}]}}]}}]}}"#).into_bytes()
 }
 
 fn plan(hash: &str) {
+    plan_with_url(hash, DOWNLOAD);
+}
+
+fn plan_with_url(hash: &str, url: &str) {
     set_http_plan(INDEX, vec![Ok(MockResponse::new(index(), None))]);
-    set_http_plan(RELEASES, vec![Ok(MockResponse::new(metadata(hash), None))]);
+    set_http_plan(
+        RELEASES,
+        vec![Ok(MockResponse::new(metadata_with_url(hash, url), None))],
+    );
 }
 
 fn plan_windows(hash: &str) {
@@ -123,12 +135,15 @@ fn fixture() -> (upkit::Ctx, tempfile::TempDir) {
 }
 
 #[test]
-fn detects_stable_sdk_without_running_dotnet_and_selects_supported_lts() {
+fn detects_only_complete_stable_sdk_without_running_dotnet_and_selects_supported_lts() {
     let _guard = reset_guard();
     let (ctx, dir) = fixture();
     let host = dir.path().join("dotnet");
     fs::write(&host, "not executed").unwrap();
-    fs::create_dir_all(dir.path().join("sdk/10.0.100")).unwrap();
+    let sdk = dir.path().join("sdk/10.0.100");
+    fs::create_dir_all(&sdk).unwrap();
+    fs::write(sdk.join("dotnet.dll"), b"fixture SDK").unwrap();
+    fs::create_dir_all(dir.path().join("sdk/99.0.0")).unwrap();
     fs::create_dir_all(dir.path().join("sdk/11.0.100-preview.1")).unwrap();
     set_which("dotnet", Some(host));
     plan(&"a".repeat(128));
@@ -136,6 +151,193 @@ fn detects_stable_sdk_without_running_dotnet_and_selects_supported_lts() {
     assert_eq!(report.tool, ToolKind::Dotnet);
     assert_eq!(report.installed.unwrap().to_string(), "10.0.100");
     assert_eq!(report.latest.unwrap().to_string(), "10.0.403");
+    assert_eq!(report.status, Status::Outdated);
+}
+
+#[test]
+fn incomplete_sdk_layout_reports_unknown_instead_of_not_installed() {
+    let _guard = reset_guard();
+    let (ctx, dir) = fixture();
+    let host = dir.path().join("dotnet");
+    fs::write(&host, "not executed").unwrap();
+    fs::create_dir_all(dir.path().join("sdk/10.0.100")).unwrap();
+    set_which("dotnet", Some(host));
+    plan(&"a".repeat(128));
+
+    let report = check_dotnet(&ctx).unwrap();
+    assert!(report.installed.is_none());
+    assert_eq!(report.status, Status::Unknown);
+    assert!(report.notes.iter().any(|note| note.contains("incomplete")));
+}
+
+#[test]
+fn host_wrapper_with_sdk_elsewhere_reports_unknown_without_running_it() {
+    let _guard = reset_guard();
+    let (ctx, dir) = fixture();
+    let host = dir.path().join("usr/bin/dotnet");
+    fs::create_dir_all(host.parent().unwrap()).unwrap();
+    fs::write(&host, "not executed").unwrap();
+    let sdk = dir.path().join("usr/lib/dotnet/sdk/10.0.100");
+    fs::create_dir_all(&sdk).unwrap();
+    fs::write(sdk.join("dotnet.dll"), b"fixture SDK").unwrap();
+    set_which("dotnet", Some(host));
+    plan(&"a".repeat(128));
+
+    let report = check_dotnet(&ctx).unwrap();
+    assert!(report.installed.is_none());
+    assert_eq!(report.status, Status::Unknown);
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|note| note.contains("stored elsewhere"))
+    );
+}
+
+#[test]
+fn empty_sdk_directory_reports_unknown() {
+    let _guard = reset_guard();
+    let (ctx, dir) = fixture();
+    let host = dir.path().join("dotnet");
+    fs::write(&host, "not executed").unwrap();
+    fs::create_dir_all(dir.path().join("sdk")).unwrap();
+    set_which("dotnet", Some(host));
+    plan(&"a".repeat(128));
+
+    let report = check_dotnet(&ctx).unwrap();
+
+    assert!(report.installed.is_none());
+    assert_eq!(report.status, Status::Unknown);
+}
+
+#[test]
+fn sdk_directory_with_only_prerelease_sdk_reports_unknown() {
+    let _guard = reset_guard();
+    let (ctx, dir) = fixture();
+    let host = dir.path().join("dotnet");
+    fs::write(&host, "not executed").unwrap();
+    let preview = dir.path().join("sdk/10.0.403-preview.1");
+    fs::create_dir_all(&preview).unwrap();
+    fs::write(preview.join("dotnet.dll"), b"fixture SDK").unwrap();
+    set_which("dotnet", Some(host));
+    plan(&"a".repeat(128));
+
+    let report = check_dotnet(&ctx).unwrap();
+
+    assert!(report.installed.is_none());
+    assert_eq!(report.status, Status::Unknown);
+    assert!(report.notes.iter().any(|note| note.contains("prerelease")));
+}
+
+#[test]
+fn sdk_directory_with_only_nonversion_entries_reports_unknown() {
+    let _guard = reset_guard();
+    let (ctx, dir) = fixture();
+    let host = dir.path().join("dotnet");
+    fs::write(&host, "not executed").unwrap();
+    let sdk = dir.path().join("sdk");
+    fs::create_dir_all(&sdk).unwrap();
+    fs::write(sdk.join("sentinel"), b"fixture").unwrap();
+    set_which("dotnet", Some(host));
+    plan(&"a".repeat(128));
+
+    let report = check_dotnet(&ctx).unwrap();
+
+    assert!(report.installed.is_none());
+    assert_eq!(report.status, Status::Unknown);
+}
+
+#[test]
+fn rejects_untrusted_dotnet_archive_host_before_download() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = fixture();
+    plan_with_url(
+        &"a".repeat(128),
+        "https://attacker.invalid/dotnet-sdk-linux-x64.tar.gz",
+    );
+
+    let error = update_dotnet(&ctx).unwrap_err();
+
+    assert!(error.to_string().contains("official HTTPS archive URL"));
+    assert!(!ctx.home.exists());
+}
+
+#[test]
+fn accepts_legacy_official_dotnet_archive_cdns() {
+    let _guard = reset_guard();
+    let (mut ctx, _dir) = fixture();
+    ctx.dry_run = true;
+    for url in [
+        "https://download.visualstudio.microsoft.com/download/pr/fixture/dotnet-sdk-linux-x64.tar.gz",
+        "https://dotnetcli.azureedge.net/dotnet/Sdk/10.0.403/dotnet-sdk-linux-x64.tar.gz",
+    ] {
+        plan_with_url(&"a".repeat(128), url);
+        update_dotnet(&ctx).unwrap();
+    }
+
+    assert!(!ctx.home.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn detects_sdk_dll_symlink_within_sdk_version_directory() {
+    use std::os::unix::fs::symlink;
+    let _guard = reset_guard();
+    let (ctx, dir) = fixture();
+    let host = dir.path().join("dotnet");
+    fs::write(&host, "not executed").unwrap();
+    let sdk = dir.path().join("sdk/10.0.100");
+    fs::create_dir_all(sdk.join("lib")).unwrap();
+    fs::write(sdk.join("lib/dotnet.dll"), b"fixture SDK").unwrap();
+    symlink("lib/dotnet.dll", sdk.join("dotnet.dll")).unwrap();
+    set_which("dotnet", Some(host));
+    plan(&"a".repeat(128));
+
+    let report = check_dotnet(&ctx).unwrap();
+    assert_eq!(report.installed.unwrap().to_string(), "10.0.100");
+}
+
+#[cfg(unix)]
+#[test]
+fn ignores_sdk_dll_symlink_to_another_version_inside_install_root() {
+    use std::os::unix::fs::symlink;
+    let _guard = reset_guard();
+    let (ctx, dir) = fixture();
+    let host = dir.path().join("dotnet");
+    fs::write(&host, "not executed").unwrap();
+    let old_sdk = dir.path().join("sdk/10.0.100");
+    fs::create_dir_all(&old_sdk).unwrap();
+    fs::write(old_sdk.join("dotnet.dll"), b"fixture SDK").unwrap();
+    let latest_sdk = dir.path().join("sdk/10.0.403");
+    fs::create_dir_all(&latest_sdk).unwrap();
+    symlink("../10.0.100/dotnet.dll", latest_sdk.join("dotnet.dll")).unwrap();
+    set_which("dotnet", Some(host));
+    plan(&"a".repeat(128));
+
+    let report = check_dotnet(&ctx).unwrap();
+
+    assert_eq!(report.installed.unwrap().to_string(), "10.0.100");
+    assert_eq!(report.status, Status::Outdated);
+}
+
+#[cfg(unix)]
+#[test]
+fn ignores_sdk_version_directory_symlink_when_detecting_installed_sdk() {
+    use std::os::unix::fs::symlink;
+    let _guard = reset_guard();
+    let (ctx, dir) = fixture();
+    let host = dir.path().join("dotnet");
+    fs::write(&host, "not executed").unwrap();
+    let sdk = dir.path().join("sdk/10.0.100");
+    fs::create_dir_all(&sdk).unwrap();
+    fs::write(sdk.join("dotnet.dll"), b"fixture SDK").unwrap();
+    symlink("10.0.100", dir.path().join("sdk/99.0.0")).unwrap();
+    set_which("dotnet", Some(host));
+    plan(&"a".repeat(128));
+
+    let report = check_dotnet(&ctx).unwrap();
+
+    assert_eq!(report.installed.unwrap().to_string(), "10.0.100");
     assert_eq!(report.status, Status::Outdated);
 }
 
@@ -334,7 +536,9 @@ fn offline_cli_infers_sdk_without_executing_dotnet() {
     let host = bin.join("dotnet");
     fs::write(&host, "#!/bin/sh\nprintf invoked > \"$HOME/invoked\"\n").unwrap();
     fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
-    fs::create_dir_all(bin.join("sdk/10.0.100")).unwrap();
+    let sdk = bin.join("sdk/10.0.100");
+    fs::create_dir_all(&sdk).unwrap();
+    fs::write(sdk.join("dotnet.dll"), b"fixture SDK").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_upkit"))
         .args([
             "--offline",

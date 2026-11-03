@@ -50,7 +50,8 @@ pub fn check_node(ctx: &Ctx) -> Result<ToolReport> {
     .and_then(|out| Version::parse_loose(&out));
 
     let latest = node_latest_lts(ctx).ok();
-    let status = if ctx.dry_run && executable_found {
+    let version_unverified = executable_found && installed.is_none();
+    let status = if version_unverified {
         Status::Unknown
     } else {
         Status::from_versions(installed.as_ref(), latest.as_ref())
@@ -61,6 +62,8 @@ pub fn check_node(ctx: &Ctx) -> Result<ToolReport> {
         notes.push(
             "Dry-run found a Node executable; its version was not checked and is unknown.".into(),
         );
+    } else if version_unverified {
+        notes.push("A Node executable was found, but its version could not be verified.".into());
     }
     if ctx.os == "windows" {
         notes.push("Windows installation requires permission to create symbolic links.".into());

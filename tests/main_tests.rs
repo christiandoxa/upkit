@@ -16,6 +16,70 @@ use upkit::*;
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(target_os = "linux")]
+fn set_private_path_directory(path: &std::path::Path) {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn offline_check_skips_version_probes_that_can_download_toolchains() {
+    use std::process::Command;
+
+    let dir = tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    for tool in ["go", "rustc", "flutter"] {
+        let executable = bin.join(tool);
+        fs::write(
+            &executable,
+            "#!/bin/sh\nprintf ran > \"$HOME/probe-ran\"\nprintf '99.0.0\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            Command::new(&executable)
+                .env("HOME", dir.path())
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(dir.path().join("probe-ran").exists());
+        fs::remove_file(dir.path().join("probe-ran")).unwrap();
+    }
+
+    for tool in ["go", "rust", "flutter"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_upkit"))
+            .args(["--offline", "--non-interactive", "--json", "--only", tool])
+            .arg("--home")
+            .arg(dir.path().join("managed"))
+            .arg("--bindir")
+            .arg(&bin)
+            .arg("check")
+            .env_clear()
+            .env("HOME", dir.path())
+            .env("PATH", &bin)
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .env("XDG_DATA_HOME", dir.path().join("data"))
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let reports: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(reports[0]["installed"].is_null(), "{tool}: {reports}");
+        assert_eq!(reports[0]["status"], "Unknown", "{tool}: {reports}");
+        assert!(
+            !dir.path().join("probe-ran").exists(),
+            "{tool} was executed"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn reviewed_clean_tool(ctx: &Ctx, tool: ToolKind) -> anyhow::Result<()> {
     let cancel = std::sync::atomic::AtomicBool::new(false);
     let plan = managed_cleanup::preview(ctx, tool, &cancel)?;
@@ -817,6 +881,8 @@ fn maybe_path_hint_paths() {
     let home = dir.path().join("home");
     let bindir = dir.path().join("bin");
     fs::create_dir_all(&home).unwrap();
+    #[cfg(target_os = "linux")]
+    set_private_path_directory(&home);
     fs::create_dir_all(&bindir).unwrap();
     set_env_var("PATH", Some(bindir.display().to_string()));
     set_env_var("SHELL", Some("bash".to_string()));
@@ -1410,6 +1476,8 @@ fn maybe_path_hint_shell_variants_and_write_errors() {
     let home = dir.path().join("home");
     let bindir = dir.path().join("bin");
     fs::create_dir_all(&home).unwrap();
+    #[cfg(target_os = "linux")]
+    set_private_path_directory(&home);
     fs::create_dir_all(&bindir).unwrap();
     set_home_dir(Some(home.clone()));
     let prompt = Arc::new(TestPrompt::default());
@@ -1422,6 +1490,11 @@ fn maybe_path_hint_shell_variants_and_write_errors() {
 
     set_env_var("SHELL", Some("fish".to_string()));
     fs::create_dir_all(home.join(".config/fish")).unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        set_private_path_directory(&home.join(".config"));
+        set_private_path_directory(&home.join(".config/fish"));
+    }
     maybe_path_hint(&ctx);
     let fish_rc = home.join(".config/fish/config.fish");
     let content = fs::read_to_string(&fish_rc).unwrap();

@@ -14,15 +14,19 @@ use crate::{
 };
 
 pub fn check_rust(ctx: &Ctx) -> Result<ToolReport> {
-    let installed = if ctx.dry_run {
+    let skip_execution = ctx.dry_run || ctx.offline;
+    let rustc_found = which_or_none("rustc").is_some();
+    let installed = if skip_execution {
         None
-    } else {
-        which_or_none("rustc")
-            .and_then(|_| run_capture("rustc", &["--version"]).ok())
+    } else if rustc_found {
+        run_capture("rustc", &["--version"])
+            .ok()
             .and_then(|out| Version::parse_loose(&out))
+    } else {
+        None
     };
 
-    let channel = if ctx.dry_run {
+    let channel = if skip_execution || (rustc_found && installed.is_none()) {
         None
     } else {
         installed
@@ -31,7 +35,9 @@ pub fn check_rust(ctx: &Ctx) -> Result<ToolReport> {
             .unwrap_or(Some("stable"))
     };
     let latest = channel.and_then(|channel| rust_latest(ctx, channel).ok());
-    let status = if ctx.dry_run {
+    let status = if !rustc_found {
+        Status::NotInstalled
+    } else if installed.is_none() {
         Status::Unknown
     } else {
         match channel {
@@ -43,8 +49,15 @@ pub fn check_rust(ctx: &Ctx) -> Result<ToolReport> {
     let mut notes = vec![
         "Rust updates use the active rustup toolchain when rustc is managed by rustup.".into(),
     ];
-    if ctx.dry_run {
-        notes.push("Rust version and channel were not inspected in dry-run mode.".into());
+    if !rustc_found {
+        notes.push("No rustc executable was found on PATH.".into());
+    } else if skip_execution {
+        notes.push(format!(
+            "Rust version and channel were not inspected in {} mode.",
+            if ctx.dry_run { "dry-run" } else { "offline" }
+        ));
+    } else if installed.is_none() {
+        notes.push("Rust executable was found, but its version could not be verified.".into());
     } else {
         match channel {
             Some(channel @ ("beta" | "nightly")) => notes.push(format!(

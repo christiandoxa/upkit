@@ -114,6 +114,20 @@ fn directory_anchor(identity: &Identity) -> (u64, u64, u32, u32) {
 }
 
 #[cfg(target_os = "linux")]
+fn ensure_private_cleanup_directories(
+    home: &std::fs::File,
+    root: Option<&std::fs::File>,
+    bindir: Option<&std::fs::File>,
+) -> Result<()> {
+    for directory in [Some(home), root, bindir].into_iter().flatten() {
+        if identity(&directory.metadata()?).mode & 0o022 != 0 {
+            bail!("managed paths are writable by group or others; cleanup is refused");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 struct Entry {
     #[serde(serialize_with = "serialize_path")]
@@ -310,6 +324,23 @@ pub struct CleanupPlan {
     #[cfg(target_os = "linux")]
     #[serde(skip)]
     tree_digest: String,
+}
+
+/// Refuse risky removals before a CLI or dashboard batch starts any target.
+pub(crate) fn validate_removal_plan(plan: &CleanupPlan) -> Result<()> {
+    if plan.selected_entries.is_empty() && plan.links.is_empty() {
+        return Ok(());
+    }
+    if plan.writable_by_others {
+        bail!("managed paths are writable by group or others; cleanup is refused");
+    }
+    if matches!(
+        plan.activity_status,
+        "open_handles_or_cwd_observed" | "executable_observed"
+    ) {
+        bail!("a process is using a selected installation; stop it before cleaning");
+    }
+    Ok(())
 }
 
 /// Inspect sealed installations and Upkit-recorded links; unverified data remains visible.
@@ -751,12 +782,7 @@ fn remove_with_hook(
             "no sealed Upkit installation or recorded link is eligible; unverified data was preserved"
         );
     }
-    if matches!(
-        fresh.activity_status,
-        "open_handles_or_cwd_observed" | "executable_observed"
-    ) {
-        bail!("a process is using a selected installation; stop it before cleaning");
-    }
+    validate_removal_plan(&fresh)?;
     if !fresh.links.is_empty()
         && fresh
             .bindir_identity
@@ -929,6 +955,7 @@ fn remove_with_hook(
         }
         Some(directory)
     };
+    ensure_private_cleanup_directories(&home, root_dir.as_ref(), bindir.as_ref())?;
     let needs_root_quarantine = !fresh.sealed_entries.is_empty()
         || fresh
             .link_entries
@@ -975,6 +1002,7 @@ fn remove_with_hook(
     let private_bins = private_bins.as_ref();
 
     let stage_result = (|| -> Result<()> {
+        ensure_private_cleanup_directories(&home, root_dir, bindir)?;
         let root = root_dir.context("tool root disappeared after preview")?;
         let (private, _, _) = private_root.context("missing tool-root quarantine")?;
         for (index, entry) in fresh.sealed_entries.iter().enumerate() {
@@ -1220,6 +1248,7 @@ fn remove_with_hook(
         if current.0 != expected {
             bail!("unselected tool-root entries changed during staging");
         }
+        ensure_private_cleanup_directories(&home, root_dir, bindir)?;
         Ok(())
     })();
     if let Err(error) = validation {
@@ -1343,6 +1372,7 @@ mod tests {
         fs::create_dir_all(bindir).unwrap();
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(root, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(root.parent().unwrap(), fs::Permissions::from_mode(0o755)).unwrap();
         fs::set_permissions(bindir, fs::Permissions::from_mode(0o755)).unwrap();
         let stage = tempfile::Builder::new()
             .prefix("install-")
@@ -1409,6 +1439,15 @@ mod tests {
             activity_statuses: Vec::new(),
             tree_digest: String::new(),
         }
+    }
+
+    #[test]
+    fn shared_writable_path_without_eligible_targets_does_not_veto_a_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = serialization_plan(dir.path().join("go"), Vec::new(), Vec::new());
+        plan.writable_by_others = true;
+
+        validate_removal_plan(&plan).unwrap();
     }
 
     #[test]
@@ -1523,6 +1562,40 @@ mod tests {
             "changed during quarantine"
         );
         assert!(fs::symlink_metadata(bindir.join("go")).is_ok());
+        assert!(root.join("active").exists());
+    }
+
+    #[test]
+    fn permission_change_after_staging_restores_the_selected_installation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("managed");
+        let bindir = dir.path().join("bin");
+        let root = home.join("go");
+        let install = sealed_fixture(&root, &bindir, "fixture");
+        let ctx = base_ctx(
+            home.clone(),
+            bindir.clone(),
+            Arc::new(TestPrompt::default()),
+        );
+        let cancel = AtomicBool::new(false);
+        let plan = preview(&ctx, ToolKind::Go, &cancel).unwrap();
+
+        let result = remove_with_hook(&ctx, &plan, &cancel, |_| {
+            fs::set_permissions(&home, fs::Permissions::from_mode(0o775)).unwrap();
+        });
+
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("writable by group or others"));
+        assert_eq!(
+            fs::read_to_string(install.join("go/bin/go")).unwrap(),
+            "fixture"
+        );
+        assert_eq!(
+            fs::read_link(bindir.join("go")).unwrap(),
+            root.join("active/bin/go")
+        );
         assert!(root.join("active").exists());
     }
 

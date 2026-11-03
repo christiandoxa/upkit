@@ -420,6 +420,36 @@ fn node_check_statuses() {
     assert!(matches!(report.status, Status::UpToDate));
 }
 
+#[test]
+fn node_found_but_unverifiable_is_unknown_not_not_installed() {
+    let _guard = reset_guard();
+    let (ctx, _dir) = ctx_with_dirs();
+    set_which("node", Some(PathBuf::from("/fixture/node")));
+    set_run_output(
+        "node",
+        &["--version"],
+        output_with_status(1, b"", b"fixture failure"),
+    );
+    set_http_plan(
+        "https://nodejs.org/dist/index.json",
+        vec![Ok(MockResponse::new(
+            br#"[{"version":"v1.2.3","lts":true}]"#.to_vec(),
+            None,
+        ))],
+    );
+
+    let report = check_node(&ctx).unwrap();
+
+    assert!(report.installed.is_none());
+    assert_eq!(report.status, Status::Unknown);
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|note| note.contains("could not be verified"))
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn node_dry_run_skips_version_probe_for_detected_executable() {

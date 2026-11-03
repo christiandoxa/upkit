@@ -1149,3 +1149,71 @@ esac
         .success()
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn malformed_engine_inventory_rows_fail_only_their_resource_list() {
+    use std::{fs, os::unix::fs::PermissionsExt, process::Command};
+
+    let dir = tempfile::tempdir().unwrap();
+    let executable = dir.path().join("podman");
+    let id = "a".repeat(64);
+    fs::write(
+        &executable,
+        r##"#!/bin/sh
+case "$*" in
+  'system df --format json') printf '%s\n' '{"Type":"Images","Size":"12MB"}' ;;
+  'container ls --all --size --no-trunc --format json') printf '[null]\n' ;;
+  'image ls --all --format json'|'image ls --all --no-trunc --format json')
+    printf '{"ID":"%s","Names":["fixture:latest"]}\n{"ID":"%s","Names":["fixture:old"]}\n' "$IMAGE_ID" "$IMAGE_ID" ;;
+  'image ls --all --no-trunc --format {{.Id}} {{.Containers}}')
+    printf '%s 0\n%s 0\n' "$IMAGE_ID" "$IMAGE_ID" ;;
+  *) printf '[]\n' ;;
+esac
+"##,
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_upkit"))
+        .args(["--non-interactive", "--json", "containers", "status"])
+        .env("PATH", dir.path())
+        .env("HOME", dir.path())
+        .env("XDG_CONFIG_HOME", dir.path())
+        .env("XDG_DATA_HOME", dir.path())
+        .env("IMAGE_ID", id)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let podman = &report[1];
+    assert_eq!(podman["state"], "available");
+    assert_eq!(podman["usage"][0]["Size"], "12MB");
+
+    let resources = podman["resources"].as_array().unwrap();
+    let list = |kind: &str| {
+        resources
+            .iter()
+            .find(|list| list["kind"] == kind)
+            .unwrap_or_else(|| panic!("missing resource list: {kind}"))
+    };
+    let containers = list("containers");
+    assert_eq!(
+        containers["error"],
+        "Engine returned a non-object inventory row."
+    );
+    assert_eq!(containers["items"], serde_json::json!([]));
+
+    let images = list("images");
+    assert!(images["error"].is_null());
+    assert_eq!(images["items"].as_array().unwrap().len(), 2);
+    let unused_images = list("unused images (snapshot)");
+    assert!(unused_images["error"].is_null());
+    assert_eq!(unused_images["items"].as_array().unwrap().len(), 1);
+    assert!(list("volumes")["error"].is_null());
+    assert!(list("networks")["error"].is_null());
+}

@@ -168,8 +168,8 @@ jobs:
           else
             cargo build --release --locked --target "$TARGET"
           fi
-      - name: Smoke test native macOS dashboard
-        if: runner.os == 'macOS'
+      - name: Smoke test native dashboard
+        if: runner.os != 'Windows'
         shell: bash
         env:
           TARGET: ${{ matrix.target }}

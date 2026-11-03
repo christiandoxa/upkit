@@ -82,23 +82,18 @@ fn fingerprint(meta: &std::fs::Metadata) -> Fingerprint {
 
 #[cfg(target_os = "linux")]
 fn bytecode_name(name: &str) -> Result<(&str, &'static str, u16)> {
-    let parts = name
+    let name = name
         .strip_suffix(".pyc")
-        .context("bytecode file must end in .pyc")?
-        .split('.')
-        .collect::<Vec<_>>();
-    let ([module, tag] | [module, tag, "opt-1" | "opt-2"]) = parts.as_slice() else {
-        bail!("unsupported bytecode filename");
-    };
-    let mut bytes = module.bytes();
-    if !bytes
-        .next()
-        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
-        || !bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
-    {
-        bail!("unsupported Python module name");
-    }
-    let (version, magic) = match *tag {
+        .context("bytecode file must end in .pyc")?;
+    let name = name
+        .strip_suffix(".opt-1")
+        .or_else(|| name.strip_suffix(".opt-2"))
+        .unwrap_or(name);
+    let (module, tag) = name
+        .rsplit_once('.')
+        .filter(|(module, _)| !module.is_empty())
+        .context("unsupported bytecode filename")?;
+    let (version, magic) = match tag {
         "cpython-310" => ("3.10", 3439),
         "cpython-311" => ("3.11", 3495),
         "cpython-312" => ("3.12", 3531),
@@ -1202,6 +1197,21 @@ mod tests {
         .unwrap();
 
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn bytecode_filenames_preserve_arbitrary_python_source_stems() {
+        for (filename, source_stem) in [
+            ("package.module.cpython-311.pyc", "package.module"),
+            ("non-module-name.cpython-311.opt-1.pyc", "non-module-name"),
+            ("módulo.cpython-311.pyc", "módulo"),
+        ] {
+            let (module, python, magic) = bytecode_name(filename).unwrap();
+            assert_eq!(module, source_stem);
+            assert_eq!(python, "3.11");
+            assert_eq!(magic, 3495);
+        }
+        assert!(bytecode_name(".cpython-311.pyc").is_err());
     }
 
     #[test]

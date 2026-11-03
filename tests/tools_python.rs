@@ -32,6 +32,22 @@ fn python_tar(entries: &[&str]) -> Vec<u8> {
 }
 
 fn python_tar_with_files(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
+    zstd::stream::encode_all(&python_tar_bytes(entries)[..], 0).unwrap()
+}
+
+fn python_tar_gz(entries: &[&str]) -> Vec<u8> {
+    use std::io::Write;
+
+    let entries = entries
+        .iter()
+        .map(|entry| (*entry, b"fixture".as_slice(), 0o755))
+        .collect::<Vec<_>>();
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&python_tar_bytes(&entries)).unwrap();
+    encoder.finish().unwrap()
+}
+
+fn python_tar_bytes(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
     let mut bytes = Vec::new();
     {
         let mut tar = tar::Builder::new(&mut bytes);
@@ -44,7 +60,7 @@ fn python_tar_with_files(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
         }
         tar.finish().unwrap();
     }
-    zstd::stream::encode_all(&bytes[..], 0).unwrap()
+    bytes
 }
 
 fn set_verified_release(url: &str, metadata: &str, archive: &[u8]) {
@@ -301,35 +317,44 @@ fn python_check_uses_windows_executable() {
 }
 
 #[test]
-fn update_python_installs_windows_python_exe_layout() {
+fn update_python_installs_both_windows_python_exe_layouts() {
     let _guard = reset_guard();
-    let (mut ctx, _dir) = ctx_with_dirs();
-    ctx.os = "windows".into();
-    ctx.arch = "aarch64".into();
-    fs::create_dir_all(&ctx.bindir).unwrap();
-    set_which("python.exe", None);
-    set_which("python", None);
-    let url = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest";
-    let json = r#"{"tag_name":"20261026","assets":[{"name":"cpython-3.15.2+20261026-aarch64-pc-windows-msvc-pgo-full.tar.zst","browser_download_url":"https://example.com/python.tar.zst"}]}"#;
-    let archive = python_tar(&["python/install/python.exe"]);
-    set_verified_release(url, json, &archive);
-    set_http_plan(
-        "https://example.com/python.tar.zst",
-        vec![Ok(MockResponse::new(
-            archive.clone(),
-            Some(archive.len() as u64),
-        ))],
-    );
+    for (archive_path, active_subdir) in [
+        ("python/install/python.exe", "install"),
+        ("python/python.exe", ""),
+    ] {
+        let (mut ctx, _dir) = ctx_with_dirs();
+        ctx.os = "windows".into();
+        ctx.arch = "aarch64".into();
+        fs::create_dir_all(&ctx.bindir).unwrap();
+        set_which("python.exe", None);
+        set_which("python", None);
+        let url = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest";
+        let json = r#"{"tag_name":"20261026","assets":[{"name":"cpython-3.15.2+20261026-aarch64-pc-windows-msvc-pgo-full.tar.zst","browser_download_url":"https://example.com/python.tar.zst"}]}"#;
+        let archive = python_tar(&[archive_path]);
+        set_verified_release(url, json, &archive);
+        set_http_plan(
+            "https://example.com/python.tar.zst",
+            vec![Ok(MockResponse::new(
+                archive.clone(),
+                Some(archive.len() as u64),
+            ))],
+        );
 
-    update_python(&ctx).unwrap();
+        update_python(&ctx).unwrap();
 
-    let active_python = ctx.home.join("python/active/install/python.exe");
-    assert!(active_python.is_file());
-    assert_eq!(
-        fs::read_link(ctx.bindir.join("python.exe")).unwrap(),
-        active_python
-    );
-    assert!(!ctx.bindir.join("python3").exists());
+        let active_python = ctx
+            .home
+            .join("python/active")
+            .join(active_subdir)
+            .join("python.exe");
+        assert!(active_python.is_file());
+        assert_eq!(
+            fs::read_link(ctx.bindir.join("python.exe")).unwrap(),
+            active_python
+        );
+        assert!(!ctx.bindir.join("python3").exists());
+    }
 }
 
 #[test]
@@ -391,19 +416,68 @@ fn python_pick_asset_install_only() {
     ctx.arch = "x86_64".into();
 
     let url = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest";
-    let json = r#"{"tag_name":"v3.11.9","assets":[{"name":"cpython-3.11.9+20240224-x86_64-unknown-linux-gnu.tar.zst","browser_download_url":"https://example.com/python.tar.zst"},{"name":"cpython-3.11.9+20240224-x86_64-unknown-linux-gnu-install_only.tar.zst","browser_download_url":"https://example.com/python-install.tar.zst"}]}"#;
+    let json = r#"{"tag_name":"20260510","assets":[{"name":"cpython-3.14.5+20260510-x86_64-unknown-linux-gnu-install_only.tar.gz","browser_download_url":"https://example.com/python-install.tar.gz"},{"name":"cpython-3.14.5+20260510-x86_64-unknown-linux-gnu-freethreaded-install_only.tar.gz","browser_download_url":"https://example.com/python-freethreaded-install.tar.gz"},{"name":"cpython-3.14.5+20260510-x86_64-unknown-linux-gnu-pgo+lto-full.tar.zst","browser_download_url":"https://example.com/python.tar.zst"}]}"#;
     set_http_plan(
         url,
         vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
     );
     let v = Version {
         major: 3,
-        minor: 11,
-        patch: 9,
+        minor: 14,
+        patch: 5,
         pre: None,
     };
     let asset = python_pick_asset(&ctx, &v).unwrap();
-    assert!(asset.name.contains("install_only"));
+    assert_eq!(
+        asset.browser_download_url,
+        "https://example.com/python-install.tar.gz"
+    );
+
+    let free_threaded = r#"{"tag_name":"20260510","assets":[{"name":"cpython-3.14.5+20260510-x86_64-unknown-linux-gnu-freethreaded-install_only.tar.gz","browser_download_url":"https://example.com/python-freethreaded-install.tar.gz"}]}"#;
+    set_http_plan(
+        url,
+        vec![Ok(MockResponse::new(
+            free_threaded.as_bytes().to_vec(),
+            None,
+        ))],
+    );
+    assert!(python_latest(&ctx).is_err());
+    set_http_plan(
+        url,
+        vec![Ok(MockResponse::new(
+            free_threaded.as_bytes().to_vec(),
+            None,
+        ))],
+    );
+    assert!(python_pick_asset(&ctx, &v).is_err());
+}
+
+#[test]
+fn update_python_installs_verified_install_only_gzip_archive() {
+    let _guard = reset_guard();
+    let (mut ctx, _dir) = ctx_with_dirs();
+    ctx.os = "linux".into();
+    ctx.arch = "x86_64".into();
+    fs::create_dir_all(&ctx.bindir).unwrap();
+    set_which("python3", None);
+    set_which("python", None);
+
+    let url = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest";
+    let metadata = r#"{"tag_name":"20260510","assets":[{"name":"cpython-3.14.5+20260510-x86_64-unknown-linux-gnu-install_only.tar.gz","browser_download_url":"https://example.com/python-install.tar.gz"},{"name":"cpython-3.14.5+20260510-x86_64-unknown-linux-gnu-freethreaded-install_only.tar.gz","browser_download_url":"https://example.com/python-freethreaded-install.tar.gz"}]}"#;
+    let archive = python_tar_gz(&["python/bin/python", "python/bin/python3"]);
+    set_verified_release(url, metadata, &archive);
+    set_http_plan(
+        "https://example.com/python-install.tar.gz",
+        vec![Ok(MockResponse::new(
+            archive.clone(),
+            Some(archive.len() as u64),
+        ))],
+    );
+
+    update_python(&ctx).unwrap();
+
+    assert!(ctx.home.join("python/active/bin/python3").is_file());
+    assert!(ctx.bindir.join("python3").is_file());
 }
 
 #[test]
@@ -425,6 +499,39 @@ fn python_check_fallback_binary() {
     );
     let report = check_python(&ctx).unwrap();
     assert!(matches!(report.status, Status::UpToDate));
+}
+
+#[test]
+fn python_found_but_unverifiable_is_unknown_not_not_installed() {
+    let _guard = reset_guard();
+    let (mut ctx, _dir) = ctx_with_dirs();
+    ctx.os = "linux".into();
+    ctx.arch = "x86_64".into();
+    set_which("python3", Some(PathBuf::from("/fixture/python3")));
+    set_which("python", None);
+    set_run_output(
+        "python3",
+        &["--version"],
+        output_with_status(1, b"", b"fixture failure"),
+    );
+    set_http_plan(
+        "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest",
+        vec![Ok(MockResponse::new(
+            br#"{"tag_name":"v3.11.9","assets":[{"name":"cpython-3.11.9+20240224-x86_64-unknown-linux-gnu.tar.zst","browser_download_url":"https://example.com/python.tar.zst"}]}"#.to_vec(),
+            None,
+        ))],
+    );
+
+    let report = check_python(&ctx).unwrap();
+
+    assert!(report.installed.is_none());
+    assert_eq!(report.status, Status::Unknown);
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|note| note.contains("could not be verified"))
+    );
 }
 
 #[cfg(unix)]

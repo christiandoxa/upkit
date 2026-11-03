@@ -47,8 +47,13 @@ pub fn check_mojo(ctx: &Ctx) -> Result<ToolReport> {
             None
         }
     };
-    let status = if ctx.dry_run && executable.is_some() {
+    let version_unverified = executable.is_some() && installed.is_none();
+    if ctx.dry_run && executable.is_some() {
         notes.push("Installed Mojo version was not verified during dry-run.".into());
+    } else if version_unverified {
+        notes.push("A Mojo executable was found, but its version could not be verified.".into());
+    }
+    let status = if version_unverified {
         Status::Unknown
     } else {
         Status::from_versions(installed.as_ref(), latest.as_ref())

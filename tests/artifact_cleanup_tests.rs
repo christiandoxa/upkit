@@ -49,7 +49,11 @@ impl Fixture {
             fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
         }
         let manifest = project.join("Cargo.toml");
-        fs::write(&manifest, "[package]\nname='fixture'\nversion='0.1.0'\n").unwrap();
+        fs::write(
+            &manifest,
+            "[package]\nname='fixture'\nversion='0.1.0'\n[workspace]\n",
+        )
+        .unwrap();
         fs::set_permissions(&manifest, fs::Permissions::from_mode(0o600)).unwrap();
         let file = target.join("debug/output");
         fs::write(&file, "artifact").unwrap();
@@ -147,6 +151,10 @@ impl Fixture {
             .arg(home)
             .args(args)
             .env("HOME", &self.home)
+            .env_remove("CARGO_HOME")
+            .env_remove("CARGO_TARGET_DIR")
+            .env_remove("CARGO_BUILD_TARGET_DIR")
+            .env_remove("CARGO_BUILD_BUILD_DIR")
             .env("XDG_CONFIG_HOME", self.home.join("config"))
             .env("XDG_DATA_HOME", self.home.join("data"))
             .env(
@@ -294,6 +302,9 @@ fn artifact_fixture_namespace_worker() {
                 &fixture,
             );
         }
+        Ok("standalone_cargo_cleanup_revalidates_parent_workspaces") => {
+            standalone_cargo_cleanup_revalidates_parent_workspaces_in_namespace(&fixture);
+        }
         Ok("artifact_removal_rejects_changed_scope_age_and_manifest") => {
             artifact_removal_rejects_changed_scope_age_and_manifest_in_namespace(&fixture);
         }
@@ -301,6 +312,9 @@ fn artifact_fixture_namespace_worker() {
             artifact_removal_refuses_history_inside_selected_target_without_mutation_in_namespace(
                 &fixture,
             );
+        }
+        Ok("go_project_outputs_are_inspection_only_and_cannot_be_removed") => {
+            go_project_outputs_are_inspection_only_and_cannot_be_removed_in_namespace(&fixture);
         }
         scenario => panic!("unknown artifact namespace scenario: {scenario:?}"),
     }
@@ -650,6 +664,110 @@ fn zig_artifact_preview_uses_build_manifest_and_marks_zig_out_for_review() {
 }
 
 #[test]
+fn go_project_outputs_are_inspection_only_and_cannot_be_removed() {
+    run_fixture_namespace_worker("go_project_outputs_are_inspection_only_and_cannot_be_removed");
+}
+
+fn go_project_outputs_are_inspection_only_and_cannot_be_removed_in_namespace(f: &Fixture) {
+    let manifest = f.project.join("go.mod");
+    fs::write(&manifest, "module example.invalid/service\ngo 1.22\n").unwrap();
+    fs::set_permissions(&manifest, fs::Permissions::from_mode(0o600)).unwrap();
+    let build = f.project.join("build");
+    let bin = f.project.join("bin");
+    for target in [&build, &bin] {
+        fs::create_dir(target).unwrap();
+        fs::set_permissions(target, fs::Permissions::from_mode(0o700)).unwrap();
+        let file = target.join("user-data");
+        fs::write(&file, "keep Go project data").unwrap();
+        fs::set_permissions(file, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let root = f.project.to_str().unwrap();
+    let build_arg = build.to_str().unwrap();
+    let bin_arg = bin.to_str().unwrap();
+    let generic_preview = f.run(&[
+        "sweep", "preview", root, "--select", build_arg, "--select", bin_arg,
+    ]);
+    assert!(
+        generic_preview.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&generic_preview.stdout),
+        String::from_utf8_lossy(&generic_preview.stderr)
+    );
+    let generic_preview: serde_json::Value =
+        serde_json::from_slice(&generic_preview.stdout).unwrap();
+    let items = generic_preview["items"].as_array().unwrap();
+    let selected_items = items
+        .iter()
+        .filter(|item| item["selected"] == true)
+        .collect::<Vec<_>>();
+    assert_eq!(selected_items.len(), 2);
+    assert!(selected_items.iter().all(|item| {
+        item["candidate"]["ecosystem"] == "go"
+            && item["candidate"]["classification"] == "review"
+            && item["risk"] == "potentially destructive"
+            && item["execution_ready"] == false
+    }));
+    assert!(generic_preview.get("preview_token").is_none());
+
+    let scope = upkit::sweep::Scope {
+        roots: vec![f.project.clone()],
+        exclusions: Vec::new(),
+        older_than_seconds: None,
+        enabled: None,
+    };
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    for target in [&build, &bin] {
+        let error = upkit::artifact_cleanup::preview(&scope, target, &cancel).unwrap_err();
+        assert!(format!("{error:#}").contains("inspection-only"));
+    }
+    let targets = vec![build.clone(), bin.clone()];
+    let error = upkit::artifact_cleanup::preview_batch(&scope, &targets, &cancel).unwrap_err();
+    assert!(format!("{error:#}").contains("inspection-only"));
+    assert!(upkit::artifact_cleanup::remove(&scope, &build, "forged", &cancel).is_err());
+    assert!(upkit::artifact_cleanup::remove_batch(&scope, &targets, "forged", &cancel).is_err());
+
+    for (selection, preview) in [
+        (vec![build_arg], true),
+        (vec![build_arg, bin_arg], true),
+        (vec![build_arg], false),
+        (vec![build_arg, bin_arg], false),
+    ] {
+        let mut args = if preview {
+            vec!["sweep", "run", "--scope", "artifacts"]
+        } else {
+            vec!["--yes", "sweep", "run", "--scope", "artifacts"]
+        };
+        for target in &selection {
+            args.extend(["--select", target]);
+        }
+        args.extend(["--root", root]);
+        if preview {
+            args.push("--preview");
+        } else {
+            args.extend(["--authorize-artifact-removal", "--preview-token", "forged"]);
+        }
+        let output = f.run(&args);
+        assert!(!output.status.success());
+        let detail = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(detail.contains("inspection-only"), "{detail}");
+    }
+
+    assert_eq!(
+        fs::read_to_string(build.join("user-data")).unwrap(),
+        "keep Go project data"
+    );
+    assert_eq!(
+        fs::read_to_string(bin.join("user-data")).unwrap(),
+        "keep Go project data"
+    );
+    assert!(!f.home.join("upkit/history").exists());
+}
+
+#[test]
 #[ignore = "runs only inside the selected-batch fixture namespace"]
 fn artifact_batch_worker() {
     let project = PathBuf::from(std::env::var_os("UPKIT_BATCH_PROJECT").unwrap());
@@ -935,6 +1053,83 @@ fn reviewed_artifact_cleanup_requires_authorization_and_revalidates_tree_in_name
 }
 
 #[test]
+fn standalone_cargo_cleanup_revalidates_parent_workspaces() {
+    run_fixture_namespace_worker("standalone_cargo_cleanup_revalidates_parent_workspaces");
+}
+
+fn standalone_cargo_cleanup_revalidates_parent_workspaces_in_namespace(f: &Fixture) {
+    let manifest = f.project.join("Cargo.toml");
+    fs::write(
+        &manifest,
+        "[package]\nname = 'fixture'\nversion = '0.1.0'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&manifest, fs::Permissions::from_mode(0o600)).unwrap();
+    f.git(&["add", "Cargo.toml"]);
+    f.git(&["commit", "-qm", "make fixture standalone"]);
+    let root = f.project.to_str().unwrap();
+    let target = f.target.to_str().unwrap();
+
+    let scan = f.run(&["sweep", "scan", root]);
+    assert!(scan.status.success());
+    let scan: serde_json::Value = serde_json::from_slice(&scan.stdout).unwrap();
+    let cargo = scan["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| candidate["target"] == target)
+        .unwrap();
+    assert_eq!(cargo["classification"], "rebuildable");
+    assert_eq!(cargo["cargo_workspace"]["status"], "standalone_package");
+
+    let preview = f.preview();
+    let token = preview["plan"]["preview_token"].as_str().unwrap();
+    let parent_manifest = f.project.parent().unwrap().join("Cargo.toml");
+    fs::write(&parent_manifest, "[workspace]\nmembers = ['project']\n").unwrap();
+    let changed = f.run(&[
+        "--yes",
+        "sweep",
+        "run",
+        "--scope",
+        "artifacts",
+        "--select",
+        target,
+        "--root",
+        root,
+        "--authorize-artifact-removal",
+        "--preview-token",
+        token,
+    ]);
+    assert!(!changed.status.success());
+    assert!(f.target.join("debug/output").exists());
+
+    fs::remove_file(parent_manifest).unwrap();
+    let preview = f.preview();
+    let token = preview["plan"]["preview_token"].as_str().unwrap();
+    let removed = f.run(&[
+        "--yes",
+        "sweep",
+        "run",
+        "--scope",
+        "artifacts",
+        "--select",
+        target,
+        "--root",
+        root,
+        "--authorize-artifact-removal",
+        "--preview-token",
+        token,
+    ]);
+    assert!(
+        removed.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&removed.stdout),
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(!f.target.exists());
+}
+
+#[test]
 fn parcel_cache_removal_plan_discloses_unverified_contents() {
     let Some(mut f) = Fixture::new() else {
         return;
@@ -956,6 +1151,41 @@ fn parcel_cache_removal_plan_discloses_unverified_contents() {
     let warning = plan["plan"]["reproduction_warning"].as_str().unwrap();
     assert!(warning.contains("do not prove") && warning.contains("inspect"));
     assert!(data.is_file());
+}
+
+#[test]
+fn javascript_coverage_report_enters_the_reviewed_artifact_plan() {
+    let Some(mut f) = Fixture::new() else {
+        return;
+    };
+    let manifest = f.project.join("package.json");
+    fs::write(&manifest, "{}\n").unwrap();
+    fs::set_permissions(&manifest, fs::Permissions::from_mode(0o600)).unwrap();
+    let target = f.project.join("coverage");
+    fs::create_dir(&target).unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+    let report = target.join("lcov.info");
+    fs::write(&report, "TN:\nSF:src/app.ts\n").unwrap();
+    fs::set_permissions(&report, fs::Permissions::from_mode(0o600)).unwrap();
+    f.target = target;
+
+    let plan = f.preview();
+    assert_eq!(plan["plan"]["ecosystem"], "javascript");
+    assert_eq!(plan["plan"]["classification"], "review");
+    assert!(
+        plan["plan"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "lcov.info")
+    );
+    assert!(
+        plan["plan"]["reproduction_warning"]
+            .as_str()
+            .unwrap()
+            .contains("coverage report filename")
+    );
+    assert!(report.is_file());
 }
 
 #[test]
@@ -1259,7 +1489,7 @@ fn artifact_removal_rejects_changed_scope_age_and_manifest_in_namespace(f: &Fixt
     assert!(String::from_utf8_lossy(&too_young.stdout).contains("selected target was not found"));
     fs::write(
         f.project.join("Cargo.toml"),
-        "[package]\nname='changed'\nversion='0.1.0'\n",
+        "[package]\nname='changed'\nversion='0.1.0'\n[workspace]\n",
     )
     .unwrap();
     let changed_manifest = removal(root, &[]);

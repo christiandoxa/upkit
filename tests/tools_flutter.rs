@@ -855,6 +855,39 @@ fn flutter_check_uses_bindir() {
 }
 
 #[test]
+fn flutter_found_but_unverifiable_is_unknown_not_not_installed() {
+    let _guard = reset_guard();
+    let (mut ctx, _dir) = ctx_with_dirs();
+    ctx.os = "linux".into();
+    ctx.arch = "x86_64".into();
+    let flutter = PathBuf::from("/fixture/flutter");
+    set_which("flutter", Some(flutter.clone()));
+    set_run_output(
+        flutter.to_string_lossy().as_ref(),
+        &["--version", "--machine"],
+        output_with_status(1, b"", b"fixture failure"),
+    );
+    set_http_plan(
+        "https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json",
+        vec![Ok(MockResponse::new(
+            br#"{"releases":[{"dart_sdk_arch":"x64","channel":"stable","version":"3.1.0","archive":"stable/linux/flutter_linux_3.1.0-stable.tar.xz","hash":"abc"}]}"#.to_vec(),
+            None,
+        ))],
+    );
+
+    let report = check_flutter(&ctx).unwrap();
+
+    assert!(report.installed.is_none());
+    assert_eq!(report.status, Status::Unknown);
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|note| note.contains("could not be verified"))
+    );
+}
+
+#[test]
 fn update_flutter_install_dry_run() {
     let _guard = reset_guard();
     let (mut ctx, _dir) = ctx_with_dirs();
@@ -1170,11 +1203,6 @@ fn update_flutter_paths() {
     set_http_plan(
         url,
         vec![Ok(MockResponse::new(json.as_bytes().to_vec(), None))],
-    );
-    set_run_output(
-        "/bin/flutter",
-        &["--version", "--machine"],
-        output_with_status(0, br#"{"frameworkVersion":"3.0.0"}"#, b""),
     );
     ctx.dry_run = true;
     update_flutter(&ctx).unwrap();

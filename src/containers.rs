@@ -4,7 +4,10 @@ use serde_json::Value;
 use std::{
     io::Read,
     process::{Command, Stdio},
-    sync::mpsc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -28,6 +31,27 @@ pub struct ResourceList {
 pub(crate) const BUILD_CACHE: &str = "build cache (selected Buildx builder; snapshot)";
 const UNUSED_IMAGES: &str = "unused images (snapshot)";
 const UNATTACHED_VOLUMES: &str = "unattached volumes (snapshot)";
+const MAX_OUTPUT_READERS: usize = 16;
+static OUTPUT_READERS: AtomicUsize = AtomicUsize::new(0);
+
+struct OutputReaderGuard(&'static AtomicUsize);
+
+impl OutputReaderGuard {
+    fn acquire(readers: &'static AtomicUsize) -> Option<Self> {
+        readers
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < MAX_OUTPUT_READERS).then_some(count + 1)
+            })
+            .ok()
+            .map(|_| Self(readers))
+    }
+}
+
+impl Drop for OutputReaderGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
 
 pub(crate) fn validate_engine(engine: &str) -> anyhow::Result<()> {
     if !matches!(engine, "docker" | "podman") {
@@ -615,6 +639,61 @@ mod build_cache_tests {
     }
 }
 
+#[cfg(test)]
+mod output_reader_tests {
+    use super::{MAX_OUTPUT_READERS, OutputReaderGuard};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn readers_are_bounded_and_capacity_returns_when_a_reader_finishes() {
+        static READERS: AtomicUsize = AtomicUsize::new(0);
+        let mut guards: Vec<_> = (0..MAX_OUTPUT_READERS)
+            .map(|_| OutputReaderGuard::acquire(&READERS).unwrap())
+            .collect();
+        assert!(OutputReaderGuard::acquire(&READERS).is_none());
+        assert_eq!(
+            super::query_text_with_readers(std::path::Path::new("unused"), &[], &READERS),
+            Err((
+                "error",
+                "Too many container engine output readers are still active."
+            ))
+        );
+        drop(guards.pop());
+        guards.push(OutputReaderGuard::acquire(&READERS).unwrap());
+        drop(guards);
+        assert_eq!(READERS.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_descendant_holding_stdout_keeps_its_reader_slot_until_eof() {
+        use std::{fs, os::unix::fs::PermissionsExt, thread, time::Duration};
+
+        static READERS: AtomicUsize = AtomicUsize::new(0);
+        let fixture = tempfile::tempdir().unwrap();
+        let executable = fixture.path().join("engine");
+        let release = fixture.path().join("release");
+        fs::write(
+            &executable,
+            "#!/bin/sh\n( i=0; while [ ! -e \"$1\" ] && [ \"$i\" -lt 250 ]; do sleep 0.02; i=$((i + 1)); done ) &\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let result =
+            super::query_text_with_readers(&executable, &[release.to_str().unwrap()], &READERS);
+        assert_eq!(result, Err(("error", "Engine output was not available.")));
+        assert_eq!(READERS.load(Ordering::Acquire), 1);
+        fs::write(release, "").unwrap();
+        for _ in 0..200 {
+            if READERS.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("reader slot was not released after the descendant closed stdout");
+    }
+}
+
 fn relevant_fields(row: Value) -> Value {
     const FIELDS: &[&str] = &[
         "ID",
@@ -657,24 +736,43 @@ fn query(
     args: &[&str],
 ) -> Result<Vec<Value>, (&'static str, &'static str)> {
     let text = query_text(path, args)?;
-    if let Ok(value) = serde_json::from_str::<Value>(&text) {
-        return Ok(match value {
+    let rows = if let Ok(value) = serde_json::from_str::<Value>(&text) {
+        match value {
             Value::Array(rows) => rows,
-            other => vec![other],
-        });
+            Value::Object(object) => vec![Value::Object(object)],
+            _ => return Err(("error", "Engine returned a non-object inventory row.")),
+        }
+    } else {
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                serde_json::from_str(line).map_err(|_| ("error", "Engine returned invalid JSON."))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    if rows.iter().all(Value::is_object) {
+        Ok(rows)
+    } else {
+        Err(("error", "Engine returned a non-object inventory row."))
     }
-    text.lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            serde_json::from_str(line).map_err(|_| ("error", "Engine returned invalid JSON."))
-        })
-        .collect()
 }
 
 fn query_text(
     path: &std::path::Path,
     args: &[&str],
 ) -> Result<String, (&'static str, &'static str)> {
+    query_text_with_readers(path, args, &OUTPUT_READERS)
+}
+
+fn query_text_with_readers(
+    path: &std::path::Path,
+    args: &[&str],
+    readers: &'static AtomicUsize,
+) -> Result<String, (&'static str, &'static str)> {
+    let reader_guard = OutputReaderGuard::acquire(readers).ok_or((
+        "error",
+        "Too many container engine output readers are still active.",
+    ))?;
     let mut child = Command::new(path)
         .args(args)
         .stdin(Stdio::null())
@@ -687,6 +785,7 @@ fn query_text(
     thread::spawn(move || {
         let mut bytes = Vec::new();
         let result = stdout.by_ref().take(1_048_577).read_to_end(&mut bytes);
+        drop(reader_guard);
         let _ = send.send((result, bytes));
     });
     let deadline = Instant::now() + Duration::from_secs(3);

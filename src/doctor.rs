@@ -317,9 +317,19 @@ fn installation_integrity_with_limits(
 
 /// Compare only completed scans with the same bound scope and policy.
 pub(crate) fn artifact_growth_warning(home: &std::path::Path) -> Option<String> {
-    let history = crate::reports::read(home).ok()?;
+    let history = match crate::reports::read(home) {
+        Ok(history) => history,
+        Err(_) => {
+            return Some(
+                "Maintenance history could not be read safely; inspect `upkit report` before relying on historical totals.".into(),
+            );
+        }
+    };
     if !history.warnings.is_empty() {
-        return None;
+        return Some(format!(
+            "Maintenance history contains {} warning(s); inspect `upkit report` before relying on historical totals.",
+            history.warnings.len()
+        ));
     }
     artifact_growth_from_records(&history.records)
 }
@@ -379,6 +389,7 @@ pub(crate) struct Capabilities {
     pub cancelled: bool,
     pub cache_removal_probe: &'static str,
     pub cache_removal_note: &'static str,
+    /// True only when Linux's `fstrim` executable is discoverable.
     pub fstrim_available: bool,
     pub fstrim_timer: crate::maintenance::TimerStatus,
     pub scan_timer: crate::maintenance::TimerStatus,
@@ -528,9 +539,36 @@ fn scan_schedule_diagnostic(
         )
     } else if status.state == "unavailable" {
         Some("The platform schedule manager could not be queried; check that it is available and the current user can inspect it, then rerun `upkit schedule list` before changing the scan schedule.".into())
+    } else if status.state == "failed" {
+        Some("The Upkit scan schedule failed; inspect `upkit --non-interactive schedule list` before relying on scheduled scans.".into())
     } else {
         None
     }
+}
+
+fn skipped_probe_diagnostic(
+    label: &str,
+    status: &crate::maintenance::TimerStatus,
+    command: &str,
+) -> Option<String> {
+    if status.state != "skipped" {
+        return None;
+    }
+    let reason = status.detail.as_deref()?;
+    let skipped_because = if reason.contains("dry-run") {
+        "dry-run mode skipped the scheduler query"
+    } else if reason.contains("offline mode") {
+        "offline mode skipped the scheduler query"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "{label} status is unknown because {skipped_because}; skipped does not mean absent. If the configured scheduler is safe to query, inspect its status with `{command}`."
+    ))
+}
+
+fn go_goroot_override_is_set(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| !value.is_empty())
 }
 
 fn actionable_diagnostics(capabilities: &Capabilities) -> Vec<String> {
@@ -543,6 +581,11 @@ fn actionable_diagnostics(capabilities: &Capabilities) -> Vec<String> {
             );
         }
         return diagnostics;
+    }
+    if !capabilities.installation_integrity.supported {
+        diagnostics.push(
+            "Managed installation seal verification is unsupported on this platform; installation integrity remains unknown. Consult the toolchain provider's verification guidance before relying on a managed installation.".into(),
+        );
     }
     if capabilities.cache_removal_probe == "openat2_unavailable_or_denied" {
         diagnostics.push(
@@ -576,6 +619,22 @@ fn actionable_diagnostics(capabilities: &Capabilities) -> Vec<String> {
     {
         diagnostics.push(diagnostic);
     }
+    if cfg!(target_os = "linux")
+        && let Some(diagnostic) = skipped_probe_diagnostic(
+            "System TRIM timer",
+            &capabilities.fstrim_timer,
+            "systemctl show fstrim.timer --no-pager --property=LoadState,ActiveState,UnitFileState",
+        )
+    {
+        diagnostics.push(diagnostic);
+    }
+    if let Some(diagnostic) = skipped_probe_diagnostic(
+        "Upkit scan schedule",
+        &capabilities.scan_timer,
+        "upkit --non-interactive schedule list",
+    ) {
+        diagnostics.push(diagnostic);
+    }
     for container in &capabilities.containers {
         if !container.executable_found {
             diagnostics.push(format!(
@@ -607,6 +666,14 @@ fn actionable_diagnostics(capabilities: &Capabilities) -> Vec<String> {
         }
     }
     diagnostics
+}
+
+fn fstrim_available_on(
+    is_linux: bool,
+    cancelled: bool,
+    executable_found: impl FnOnce() -> bool,
+) -> bool {
+    is_linux && !cancelled && executable_found()
 }
 
 pub(crate) fn capabilities(home: &Path, offline: bool, cancel: &AtomicBool) -> Capabilities {
@@ -678,7 +745,9 @@ pub(crate) fn capabilities_with_dry_run(
         } else {
             "Secure cache removal is unsupported on this platform."
         },
-        fstrim_available: !cancelled && which::which("fstrim").is_ok(),
+        fstrim_available: fstrim_available_on(cfg!(target_os = "linux"), cancelled, || {
+            which::which("fstrim").is_ok()
+        }),
         fstrim_timer,
         scan_timer,
         installation_integrity,
@@ -698,6 +767,11 @@ pub(crate) fn capabilities_with_dry_run(
         actionable_diagnostics: Vec::new(),
     };
     capabilities.actionable_diagnostics = actionable_diagnostics(&capabilities);
+    if !capabilities.cancelled && go_goroot_override_is_set(std::env::var_os("GOROOT").as_deref()) {
+        capabilities.actionable_diagnostics.push(
+            "GOROOT is set in Upkit's environment. Go honors a non-empty GOROOT when resolving its root; inspect or unset it if Go commands resolve unexpectedly. This diagnostic does not inspect or display the value.".into(),
+        );
+    }
     capabilities
 }
 
@@ -814,8 +888,60 @@ mod tests {
         assert!(artifact_growth_from_records(&records).is_none());
     }
 
+    #[test]
+    fn doctor_reports_incomplete_history_without_echoing_record_contents() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let history = dir.path().join("history");
+        fs::create_dir(&history).unwrap();
+        let record = history.join("000.json");
+        fs::write(&record, b"private-fixture-marker").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&history, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(&record, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let warning = artifact_growth_warning(dir.path()).unwrap();
+        assert!(warning.contains("Maintenance history contains 1 warning"));
+        assert!(warning.contains("upkit report"));
+        assert!(!warning.contains("private-fixture-marker"));
+    }
+
+    #[test]
+    fn doctor_reports_unsafe_history_directory_without_echoing_its_path() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("private-fixture-target");
+            std::fs::create_dir(&target).unwrap();
+            symlink(&target, dir.path().join("history")).unwrap();
+
+            let warning = artifact_growth_warning(dir.path()).unwrap();
+            assert!(warning.contains("could not be read safely"));
+            assert!(warning.contains("upkit report"));
+            assert!(!warning.contains(&target.to_string_lossy().to_string()));
+        }
+    }
+
     fn timer(state: &str) -> crate::maintenance::TimerStatus {
         super::timer_status(state, "fixture")
+    }
+
+    #[test]
+    fn fstrim_probe_is_linux_only_and_skips_cancelled_lookup() {
+        assert!(!fstrim_available_on(false, false, || panic!(
+            "non-Linux probe ran"
+        )));
+        assert!(!fstrim_available_on(true, true, || panic!(
+            "cancelled probe ran"
+        )));
+        assert!(fstrim_available_on(true, false, || true));
+        assert!(!fstrim_available_on(true, false, || false));
     }
 
     fn task_status(state: &str, load_state: Option<&str>) -> crate::maintenance::TimerStatus {
@@ -876,6 +1002,38 @@ mod tests {
     }
 
     #[test]
+    fn skipped_scheduler_probes_explain_the_unknown_state_and_give_read_only_commands() {
+        let dry_run = timer_status(
+            "skipped",
+            "dry-run skips platform scheduler queries; timer state was not inspected",
+        );
+        let diagnostic = skipped_probe_diagnostic(
+            "Upkit scan schedule",
+            &dry_run,
+            "upkit --non-interactive schedule list",
+        )
+        .unwrap();
+        assert!(diagnostic.contains("unknown"));
+        assert!(diagnostic.contains("skipped does not mean absent"));
+        assert!(diagnostic.contains("upkit --non-interactive schedule list"));
+        assert!(diagnostic.contains("scheduler is safe to query"));
+
+        let offline = timer_status(
+            "skipped",
+            "offline mode skips systemd queries; manager endpoints may be remote",
+        );
+        assert!(
+            skipped_probe_diagnostic("System TRIM timer", &offline, "systemctl show fstrim.timer")
+                .unwrap()
+                .contains("offline mode skipped")
+        );
+        assert!(skipped_probe_diagnostic("timer", &timer("active"), "read-only command").is_none());
+        assert!(
+            skipped_probe_diagnostic("timer", &timer("skipped"), "read-only command").is_none()
+        );
+    }
+
+    #[test]
     fn recommendations_are_specific_and_never_echo_container_endpoints() {
         let capabilities = Capabilities {
             cancelled: false,
@@ -902,6 +1060,35 @@ mod tests {
         assert!(!diagnostics.contains("systemd upkit-scan.timer"));
         assert!(diagnostics.contains("verify its target"));
         assert!(!diagnostics.contains("tcp://"));
+    }
+
+    #[test]
+    fn unsupported_installation_integrity_is_unknown_and_has_a_safe_next_step() {
+        let capabilities = Capabilities {
+            cancelled: false,
+            cache_removal_probe: "unsupported_platform",
+            cache_removal_note: "fixture",
+            fstrim_available: false,
+            fstrim_timer: timer("unsupported"),
+            scan_timer: timer("not_found"),
+            containers: Vec::new(),
+            installation_integrity: InstallationIntegrityStatus::new(false),
+            actionable_diagnostics: Vec::new(),
+        };
+
+        let diagnostics = actionable_diagnostics(&capabilities).join("\n");
+        assert!(diagnostics.contains("integrity remains unknown"));
+        assert!(diagnostics.contains("provider's verification guidance"));
+        assert!(!diagnostics.contains("verified"));
+    }
+
+    #[test]
+    fn empty_goroot_is_ignored_but_any_nonempty_value_is_an_override() {
+        use std::ffi::OsStr;
+
+        assert!(!go_goroot_override_is_set(None));
+        assert!(!go_goroot_override_is_set(Some(OsStr::new(""))));
+        assert!(go_goroot_override_is_set(Some(OsStr::new("/custom/go"))));
     }
 
     #[test]

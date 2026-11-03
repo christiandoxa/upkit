@@ -602,6 +602,306 @@ fn pnpm_configured_store_dir() -> Option<std::ffi::OsString> {
         .or_else(|| env::var_os("PNPM_CONFIG_STORE_DIR").filter(|value| !value.is_empty()))
 }
 
+fn cargo_build_paths_from(
+    target_dir: Option<std::ffi::OsString>,
+    build_target_dir: Option<std::ffi::OsString>,
+    build_dir: Option<std::ffi::OsString>,
+) -> (Vec<PathBuf>, bool) {
+    let mut paths = Vec::new();
+    let mut target_paths = Vec::new();
+    let mut unresolved = false;
+    for value in [target_dir, build_target_dir].into_iter().flatten() {
+        let path = PathBuf::from(&value);
+        if value.is_empty() || !path.is_absolute() {
+            unresolved = true;
+            continue;
+        }
+        if !target_paths.contains(&path) {
+            target_paths.push(path.clone());
+        }
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    if target_paths.len() > 1 {
+        unresolved = true;
+    }
+    if let Some(value) = build_dir {
+        let path = PathBuf::from(&value);
+        let text = value.to_string_lossy();
+        if value.is_empty() || !path.is_absolute() || text.contains('{') || text.contains('}') {
+            unresolved = true;
+        } else if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    (paths, unresolved)
+}
+
+fn cargo_build_paths() -> (Vec<PathBuf>, bool) {
+    let (paths, unresolved) = cargo_build_paths_from(
+        env::var_os("CARGO_TARGET_DIR"),
+        env::var_os("CARGO_BUILD_TARGET_DIR"),
+        env::var_os("CARGO_BUILD_BUILD_DIR"),
+    );
+    #[cfg(target_os = "linux")]
+    {
+        let mut unresolved = unresolved;
+        let mut resolved = Vec::new();
+        for path in paths {
+            match resolve_cargo_output_path(&path) {
+                Ok(path) if !resolved.contains(&path) => resolved.push(path),
+                Ok(_) => {}
+                Err(_) => unresolved = true,
+            }
+        }
+        (resolved, unresolved)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        (paths, unresolved)
+    }
+}
+
+const CARGO_CONFIG_UNVERIFIED: &str =
+    "Cargo output configuration is unverified; shared-cache removal is blocked";
+
+#[cfg(target_os = "linux")]
+const MAX_CARGO_CONFIG_DEPTH: usize = 256;
+#[cfg(target_os = "linux")]
+const MAX_CARGO_CONFIG_FILES: usize = 32;
+#[cfg(target_os = "linux")]
+const MAX_CARGO_CONFIG_BYTES: u64 = 1024 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_CARGO_CONFIG_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+
+#[cfg(target_os = "linux")]
+fn read_cargo_config(path: &Path) -> Result<Option<Vec<u8>>, &'static str> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+
+    let fd = match rustix::fs::openat2(
+        rustix::fs::CWD,
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+        rustix::fs::ResolveFlags::NO_SYMLINKS | rustix::fs::ResolveFlags::NO_MAGICLINKS,
+    ) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(_) => return Err("Cargo config could not be read without following links"),
+    };
+    let file = std::fs::File::from(fd);
+    let before = file
+        .metadata()
+        .map_err(|_| "Cargo config could not be inspected safely")?;
+    if !before.is_file() || before.len() > MAX_CARGO_CONFIG_BYTES {
+        return Err("Cargo config is not a regular file or exceeds the size limit");
+    }
+    let mut bytes = Vec::with_capacity(before.len() as usize);
+    (&file)
+        .take(MAX_CARGO_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "Cargo config could not be read safely")?;
+    let after = file
+        .metadata()
+        .map_err(|_| "Cargo config could not be inspected safely")?;
+    if bytes.len() as u64 > MAX_CARGO_CONFIG_BYTES
+        || before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.len() != after.len()
+        || before.mtime() != after.mtime()
+        || before.mtime_nsec() != after.mtime_nsec()
+        || before.ctime() != after.ctime()
+        || before.ctime_nsec() != after.ctime_nsec()
+    {
+        return Err("Cargo config changed while being read");
+    }
+    Ok(Some(bytes))
+}
+
+#[cfg(target_os = "linux")]
+fn read_cargo_config_in(directory: &Path) -> Result<Option<(PathBuf, Vec<u8>)>, &'static str> {
+    let legacy = directory.join("config");
+    if let Some(bytes) = read_cargo_config(&legacy)? {
+        return Ok(Some((legacy, bytes)));
+    }
+    let modern = directory.join("config.toml");
+    Ok(read_cargo_config(&modern)?.map(|bytes| (modern, bytes)))
+}
+
+#[cfg(target_os = "linux")]
+fn cargo_config_output_path(
+    value: &toml::Value,
+    config_file: &Path,
+    build_dir: bool,
+) -> Result<PathBuf, &'static str> {
+    let value = value
+        .as_str()
+        .filter(|value| !value.is_empty() && !value.contains('\0'))
+        .ok_or("Cargo build output path is not a non-empty string")?;
+    if build_dir && value.contains(['{', '}']) {
+        return Err("Cargo build-dir template is unresolved");
+    }
+    let path = PathBuf::from(value);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        let base = config_file
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("Cargo config-relative path has no base directory")?;
+        base.join(path)
+    };
+    resolve_cargo_output_path(&path)
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_cargo_output_path(path: &Path) -> Result<PathBuf, &'static str> {
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        return Err("Cargo build output path is not absolute after resolution");
+    }
+    let mut resolved = PathBuf::from("/");
+    let mut missing = false;
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::CurDir => {}
+            Component::ParentDir if missing => {
+                return Err("Cargo build output path has unresolved parent components");
+            }
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Normal(name) if missing => resolved.push(name),
+            Component::Normal(name) => match resolved.join(name).canonicalize() {
+                Ok(path) => resolved = path,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    resolved.push(name);
+                    missing = true;
+                }
+                Err(_) => return Err("Cargo build output path could not be resolved safely"),
+            },
+            Component::Prefix(_) => {
+                return Err("Cargo build output path has an unsupported prefix");
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+#[cfg(target_os = "linux")]
+fn cargo_config_build_paths_from(
+    cwd: &Path,
+    cargo_home: &Path,
+    target_dir_overridden: bool,
+    build_dir_overridden: bool,
+) -> (Vec<PathBuf>, bool) {
+    if !cwd.is_absolute() || !cargo_home.is_absolute() {
+        return (Vec::new(), true);
+    }
+    let mut paths = Vec::new();
+    let mut target_dir_found = target_dir_overridden;
+    let mut build_dir_found = build_dir_overridden;
+    let mut directories = Vec::new();
+    for (depth, ancestor) in cwd.ancestors().enumerate() {
+        if depth >= MAX_CARGO_CONFIG_DEPTH {
+            return (paths, true);
+        }
+        directories.push(ancestor.join(".cargo"));
+    }
+    directories.push(cargo_home.to_owned());
+    let mut seen = HashSet::new();
+    let mut file_count = 0usize;
+    let mut total_bytes = 0usize;
+    for directory in directories {
+        if target_dir_found && build_dir_found {
+            break;
+        }
+        if !seen.insert(directory.clone()) {
+            continue;
+        }
+        let (config_file, bytes) = match read_cargo_config_in(&directory) {
+            Ok(Some(config)) => config,
+            Ok(None) => continue,
+            Err(_) => return (paths, true),
+        };
+        file_count += 1;
+        total_bytes = total_bytes.saturating_add(bytes.len());
+        if file_count > MAX_CARGO_CONFIG_FILES || total_bytes > MAX_CARGO_CONFIG_TOTAL_BYTES {
+            return (paths, true);
+        }
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            return (paths, true);
+        };
+        let Ok(config) = toml::from_str::<toml::Value>(text) else {
+            return (paths, true);
+        };
+        let Some(root) = config.as_table() else {
+            return (paths, true);
+        };
+        let build = match root.get("build") {
+            Some(value) => match value.as_table() {
+                Some(table) => Some(table),
+                None => return (paths, true),
+            },
+            None => None,
+        };
+        if !target_dir_found && let Some(value) = build.and_then(|table| table.get("target-dir")) {
+            let Ok(path) = cargo_config_output_path(value, &config_file, false) else {
+                return (paths, true);
+            };
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+            target_dir_found = true;
+        }
+        if !build_dir_found && let Some(value) = build.and_then(|table| table.get("build-dir")) {
+            let Ok(path) = cargo_config_output_path(value, &config_file, true) else {
+                return (paths, true);
+            };
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+            build_dir_found = true;
+        }
+        if root
+            .get("include")
+            .is_some_and(|value| !matches!(value.as_array(), Some(values) if values.is_empty()))
+            && (!target_dir_found || !build_dir_found)
+        {
+            return (paths, true);
+        }
+    }
+    (paths, false)
+}
+
+#[cfg(target_os = "linux")]
+fn cargo_config_build_paths() -> (Vec<PathBuf>, bool) {
+    let (Some(cwd), Some(home)) = (env::current_dir().ok(), dirs::home_dir()) else {
+        return (Vec::new(), true);
+    };
+    let cargo_home = match env::var_os("CARGO_HOME") {
+        Some(value) if Path::new(&value).is_absolute() => PathBuf::from(value),
+        Some(_) => return (Vec::new(), true),
+        None => home.join(".cargo"),
+    };
+    cargo_config_build_paths_from(
+        &cwd,
+        &cargo_home,
+        env::var_os("CARGO_TARGET_DIR").is_some()
+            || env::var_os("CARGO_BUILD_TARGET_DIR").is_some(),
+        env::var_os("CARGO_BUILD_BUILD_DIR").is_some(),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cargo_config_build_paths() -> (Vec<PathBuf>, bool) {
+    (Vec::new(), false)
+}
+
 fn uv_cache_path(
     platform: Platform,
     home: &Path,
@@ -710,8 +1010,728 @@ fn env_dir(name: &str, default: PathBuf) -> Option<PathBuf> {
     }
 }
 
+fn npm_config_overrides(setting: &str) -> Vec<std::ffi::OsString> {
+    let Some(expected) = setting.strip_prefix("npm_config_") else {
+        return Vec::new();
+    };
+    env::vars_os()
+        .filter_map(|(env_name, value)| {
+            let name = env_name.to_str()?;
+            let (prefix, name) = name.split_at_checked("npm_config_".len())?;
+            let normalize = |byte: u8| match byte {
+                b'_' => b'-',
+                _ => byte.to_ascii_lowercase(),
+            };
+            (prefix.eq_ignore_ascii_case("npm_config_")
+                && name.len() == expected.len()
+                && name
+                    .bytes()
+                    .map(normalize)
+                    .eq(expected.bytes().map(normalize)))
+            .then_some(value)
+        })
+        .collect()
+}
+
+#[derive(Default)]
+struct NpmConfig {
+    cache_roots: Vec<PathBuf>,
+    log_directories: Vec<PathBuf>,
+    prefixes: Vec<PathBuf>,
+    user_config_files: Vec<PathBuf>,
+    global_config_files: Vec<PathBuf>,
+    global_config_verified: bool,
+}
+
+const MAX_BUN_CONFIG_DEPTH: usize = 128;
+const MAX_BUN_CONFIG_FILES: usize = 32;
+const MAX_BUN_CONFIG_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+
+fn bun_config_cache_path(
+    home: &Path,
+    config_dir: &Path,
+    value: &str,
+) -> Result<PathBuf, &'static str> {
+    if value.is_empty() || value.contains(['\0', '$', '%']) {
+        return Err("Bun cache config path is unresolved");
+    }
+    let path = if let Some(rest) = value.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        let path = PathBuf::from(value);
+        if path.is_absolute() {
+            path
+        } else {
+            config_dir.join(path)
+        }
+    };
+    if !path.is_absolute() || path.parent().is_none() {
+        return Err("Bun cache config path is not a safe absolute directory");
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        resolve_cargo_output_path(&path)
+            .map_err(|_| "Bun cache config path could not be resolved safely")
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::path::Component;
+
+        // Without an equivalent component resolver, refuse `..` instead of guessing across links.
+        if path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        {
+            return Err("Bun cache config path has unresolved parent components");
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    let normalized = path;
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Canonicalize the deepest existing parent so links still overlap.
+        let mut missing = Vec::new();
+        let mut existing = normalized.as_path();
+        loop {
+            match existing.canonicalize() {
+                Ok(mut resolved) => {
+                    for component in missing.iter().rev() {
+                        resolved.push(component);
+                    }
+                    return Ok(resolved);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let name = existing
+                        .file_name()
+                        .ok_or("Bun cache config parent could not be resolved")?;
+                    missing.push(name.to_owned());
+                    existing = existing
+                        .parent()
+                        .ok_or("Bun cache config parent could not be resolved")?;
+                }
+                Err(_) => return Err("Bun cache config parent could not be resolved safely"),
+            }
+        }
+    }
+}
+
+fn parse_bun_cache_config(
+    bytes: &[u8],
+    home: &Path,
+    config_dir: &Path,
+) -> Result<Option<PathBuf>, &'static str> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "Bun config is not UTF-8")?;
+    let config =
+        toml::from_str::<toml::Value>(text).map_err(|_| "Bun config is malformed or ambiguous")?;
+    let Some(install) = config.get("install") else {
+        return Ok(None);
+    };
+    let install = install
+        .as_table()
+        .ok_or("Bun install config is ambiguous")?;
+    let Some(cache) = install.get("cache") else {
+        return Ok(None);
+    };
+    let cache = cache.as_table().ok_or("Bun cache config is ambiguous")?;
+    let Some(directory) = cache.get("dir") else {
+        return Ok(None);
+    };
+    let directory = directory
+        .as_str()
+        .ok_or("Bun cache directory config is ambiguous")?;
+    bun_config_cache_path(home, config_dir, directory).map(Some)
+}
+
+#[cfg(target_os = "linux")]
+fn read_bun_config(path: &Path) -> Result<Option<Vec<u8>>, &'static str> {
+    read_cargo_config(path).map_err(|_| "Bun config could not be read without following links")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_bun_config(path: &Path) -> Result<Option<Vec<u8>>, &'static str> {
+    read_maven_settings(path)
+        .map(|settings| settings.map(|settings| settings.bytes))
+        .map_err(|_| "Bun config could not be read safely")
+}
+
+fn bun_config_cache_paths(
+    home: &Path,
+    cwd: &Path,
+    xdg_config_home: Option<&std::ffi::OsStr>,
+) -> Result<Vec<PathBuf>, &'static str> {
+    let global = match xdg_config_home {
+        Some(value) if value.is_empty() => return Err("Bun XDG config directory is unresolved"),
+        Some(value) => {
+            let path = PathBuf::from(value);
+            if !path.is_absolute() {
+                return Err("Bun XDG config directory is not absolute");
+            }
+            path.join(".bunfig.toml")
+        }
+        None => home.join(".bunfig.toml"),
+    };
+    let cwd = cwd
+        .canonicalize()
+        .map_err(|_| "Bun project config directory could not be resolved")?;
+    if !cwd.is_dir() {
+        return Err("Bun project config directory could not be resolved");
+    }
+    let mut configs = vec![(global.clone(), global.parent().unwrap_or(home).to_owned())];
+    for (depth, directory) in cwd.ancestors().enumerate() {
+        if depth >= MAX_BUN_CONFIG_DEPTH {
+            return Err("Bun project config search exceeded its depth limit");
+        }
+        configs.push((directory.join("bunfig.toml"), directory.to_owned()));
+    }
+    let mut paths = Vec::new();
+    let mut file_count = 0usize;
+    let mut total_bytes = 0usize;
+    for (path, config_dir) in configs {
+        let Some(bytes) = read_bun_config(&path)? else {
+            continue;
+        };
+        file_count += 1;
+        total_bytes = total_bytes.saturating_add(bytes.len());
+        if file_count > MAX_BUN_CONFIG_FILES || total_bytes > MAX_BUN_CONFIG_TOTAL_BYTES {
+            return Err("Bun configs exceed the inspection limits");
+        }
+        if let Some(path) = parse_bun_cache_config(&bytes, home, &config_dir)?
+            && !paths.contains(&path)
+        {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
+}
+
+const MAX_NPM_PROJECT_DEPTH: usize = 128;
+const MAX_NPM_CONFIG_FILES: usize = 32;
+const MAX_NPM_CONFIG_TOTAL_BYTES: usize = 1024 * 1024;
+const MAX_NPM_CONFIG_LOCATIONS: usize = 64;
+
+fn npm_trim(value: &str) -> &str {
+    value.trim_matches(|ch| {
+        matches!(
+            ch,
+            '\u{0009}'..='\u{000d}'
+                | '\u{0020}'
+                | '\u{00a0}'
+                | '\u{1680}'
+                | '\u{2000}'..='\u{200a}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+                | '\u{feff}'
+        )
+    })
+}
+
+fn npm_environment_path(value: &std::ffi::OsStr) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let value = npm_trim(value.to_str()?);
+    if value.is_empty() || value.contains('$') {
+        return None;
+    }
+    let path = PathBuf::from(value);
+    (path.is_absolute()
+        && path.parent().is_some()
+        && !path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir)))
+    .then_some(path)
+}
+
+fn npm_prefix_path(value: &std::ffi::OsStr) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let value = value.to_str()?;
+    if value.is_empty() || value != npm_trim(value) || value.contains('$') {
+        return None;
+    }
+    let path = PathBuf::from(value);
+    (path.is_absolute()
+        && !path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir)))
+    .then_some(path)
+}
+
+fn npm_prefix_global_config(prefix: &Path) -> Result<PathBuf, &'static str> {
+    use std::path::Component;
+
+    if !prefix.is_absolute()
+        || prefix
+            .components()
+            .any(|part| matches!(part, Component::ParentDir))
+    {
+        return Err("npm prefix is not a safe absolute path");
+    }
+    let global_config = prefix.join("etc/npmrc");
+    let mut current = PathBuf::new();
+    for component in global_config.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                #[cfg(windows)]
+                let is_link = {
+                    use std::os::windows::fs::MetadataExt;
+                    metadata.file_attributes() & WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT != 0
+                };
+                #[cfg(not(windows))]
+                let is_link = metadata.file_type().is_symlink();
+                if is_link {
+                    return Err("npm global config path contains a symbolic link");
+                }
+                if current != global_config && !metadata.is_dir() {
+                    return Err("npm global config path has a non-directory parent");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(_) => return Err("npm global config path could not be inspected safely"),
+        }
+    }
+    Ok(global_config)
+}
+
+fn npm_prefix_override(overrides: &[std::ffi::OsString]) -> Result<Option<PathBuf>, &'static str> {
+    let mut values = overrides.iter();
+    let Some(first) = values.next() else {
+        return Ok(None);
+    };
+    if values.any(|value| value != first) {
+        return Err("npm prefix environment aliases conflict");
+    }
+    npm_prefix_path(first)
+        .map(Some)
+        .ok_or("npm prefix environment override is not an absolute path")
+}
+
+fn npm_prefix_environment(
+    value: Option<&std::ffi::OsStr>,
+) -> Result<Option<PathBuf>, &'static str> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    npm_prefix_path(value)
+        .map(Some)
+        .ok_or("npm PREFIX environment value is not an absolute path")
+}
+
+fn npm_config_path(
+    value: &str,
+    home: &Path,
+    home_variable: Option<&std::ffi::OsStr>,
+    allow_root: bool,
+) -> Result<PathBuf, &'static str> {
+    use std::path::Component;
+
+    let value = npm_trim(value);
+    let value = if value.contains("${HOME}") {
+        if home_variable != Some(home.as_os_str()) {
+            return Err("npm config has an unresolved HOME variable");
+        }
+        value.replace("${HOME}", home.to_str().ok_or("npm home is not Unicode")?)
+    } else {
+        value.to_owned()
+    };
+    if value.is_empty() || value.contains(['$', '\0']) {
+        return Err("npm config contains an unresolved path");
+    }
+    let path = if let Some(rest) = value.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        PathBuf::from(value)
+    };
+    if !path.is_absolute()
+        || (!allow_root && path.parent().is_none())
+        || path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir))
+    {
+        return Err("npm config path is not a safe absolute path");
+    }
+    Ok(path)
+}
+
+fn push_npm_config_path(paths: &mut Vec<PathBuf>, path: PathBuf) -> Result<(), &'static str> {
+    if paths.contains(&path) {
+        return Ok(());
+    }
+    if paths.len() >= MAX_NPM_CONFIG_LOCATIONS {
+        return Err("npm config contains too many possible locations");
+    }
+    paths.push(path);
+    Ok(())
+}
+
+fn parse_npm_config(
+    bytes: &[u8],
+    home: &Path,
+    home_variable: Option<&std::ffi::OsStr>,
+) -> Result<NpmConfig, &'static str> {
+    let input = std::str::from_utf8(bytes).map_err(|_| "npm config is not UTF-8")?;
+    let mut config = NpmConfig::default();
+    for line in input.split(['\n', '\r']) {
+        let line = npm_trim(line);
+        if line.is_empty() || line.starts_with(['#', ';']) {
+            continue;
+        }
+        if line.starts_with('[') || line.contains('\0') {
+            return Err("npm config uses unsupported syntax");
+        }
+        let (key, value) = line.split_once('=').unwrap_or((line, ""));
+        let key = npm_trim(key);
+        let key = key.strip_suffix("[]").unwrap_or(key);
+        if key.contains(['\\', '$', '"', '\'', '[', ']', '#', ';']) {
+            return Err("npm config contains an ambiguous key");
+        }
+        if !["cache", "logs-dir", "prefix", "userconfig", "globalconfig"]
+            .iter()
+            .any(|candidate| key.eq_ignore_ascii_case(candidate))
+        {
+            continue;
+        }
+        let value = npm_trim(value);
+        let value = if value.starts_with('"') && value.ends_with('"') {
+            serde_json::from_str::<String>(value)
+                .map_err(|_| "npm config contains an unsupported path")?
+        } else if value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2 {
+            value[1..value.len() - 1].to_owned()
+        } else {
+            if value.contains(['\\', '"', '\'']) {
+                return Err("npm config contains an unsupported path");
+            }
+            npm_trim(value.split(['#', ';']).next().unwrap_or("")).to_owned()
+        };
+        let is_prefix = key.eq_ignore_ascii_case("prefix");
+        let path = npm_config_path(&value, home, home_variable, is_prefix)?;
+        let destination = if key.eq_ignore_ascii_case("cache") {
+            &mut config.cache_roots
+        } else if key.eq_ignore_ascii_case("logs-dir") {
+            &mut config.log_directories
+        } else if is_prefix {
+            &mut config.prefixes
+        } else if key.eq_ignore_ascii_case("userconfig") {
+            &mut config.user_config_files
+        } else {
+            &mut config.global_config_files
+        };
+        push_npm_config_path(destination, path)?;
+    }
+    Ok(config)
+}
+
+fn npm_project_config_files(cwd: &Path) -> Result<Vec<PathBuf>, &'static str> {
+    if !cwd.is_absolute() {
+        return Err("npm project directory is not absolute");
+    }
+    // Workspace resolution can promote an ancestor to localPrefix, so inspect each ancestor.
+    let mut files = Vec::new();
+    for (depth, directory) in cwd.ancestors().enumerate() {
+        if depth >= MAX_NPM_PROJECT_DEPTH {
+            return Err("npm project config search exceeds the depth limit");
+        }
+        let file = directory.join(".npmrc");
+        match std::fs::symlink_metadata(&file) {
+            Ok(_) => files.push(file),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("npm project config could not be inspected safely"),
+        }
+    }
+    Ok(files)
+}
+
+fn queue_npm_config_file(
+    pending: &mut std::collections::VecDeque<(PathBuf, bool)>,
+    known: &mut std::collections::HashMap<PathBuf, bool>,
+    path: PathBuf,
+    follow_redirects: bool,
+) -> Result<(), &'static str> {
+    match known.get(&path).copied() {
+        Some(true) | Some(false) if !follow_redirects => return Ok(()),
+        Some(true) => return Ok(()),
+        Some(false) => {
+            known.insert(path.clone(), true);
+            pending.push_back((path, true));
+        }
+        None => {
+            known.insert(path.clone(), follow_redirects);
+            pending.push_back((path, follow_redirects));
+        }
+    }
+    if known.len() > MAX_NPM_CONFIG_FILES {
+        return Err("npm config refers to too many files");
+    }
+    Ok(())
+}
+
+fn npm_config_sources(
+    home: &Path,
+    cwd: &Path,
+    home_variable: Option<&std::ffi::OsStr>,
+    prefix_overrides: &[std::ffi::OsString],
+    prefix_environment: Option<&std::ffi::OsStr>,
+    userconfig_overrides: &[std::ffi::OsString],
+    globalconfig_overrides: &[std::ffi::OsString],
+) -> Result<NpmConfig, &'static str> {
+    use std::collections::{HashMap, VecDeque};
+    use std::path::Component;
+
+    let npm_home = home_variable
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| home.to_owned(), PathBuf::from);
+    if !npm_home.is_absolute()
+        || npm_home.parent().is_none()
+        || npm_home
+            .components()
+            .any(|part| matches!(part, Component::ParentDir))
+    {
+        return Err("npm home is not an absolute path");
+    }
+    let prefix_override = npm_prefix_override(prefix_overrides)?;
+    let default_prefix = match prefix_override.clone() {
+        Some(prefix) => Some(prefix),
+        None => npm_prefix_environment(prefix_environment)?,
+    };
+    let mut pending = VecDeque::new();
+    let mut known = HashMap::new();
+    queue_npm_config_file(&mut pending, &mut known, home.join(".npmrc"), true)?;
+    queue_npm_config_file(&mut pending, &mut known, npm_home.join(".npmrc"), true)?;
+    for path in npm_project_config_files(cwd)? {
+        queue_npm_config_file(&mut pending, &mut known, path, true)?;
+    }
+    for value in userconfig_overrides {
+        queue_npm_config_file(
+            &mut pending,
+            &mut known,
+            npm_environment_path(value)
+                .ok_or("npm user config override is not a resolved absolute file path")?,
+            true,
+        )?;
+    }
+    for value in globalconfig_overrides {
+        queue_npm_config_file(
+            &mut pending,
+            &mut known,
+            npm_environment_path(value)
+                .ok_or("npm global config override is not a resolved absolute file path")?,
+            false,
+        )?;
+    }
+    let mut combined = NpmConfig {
+        global_config_verified: !globalconfig_overrides.is_empty(),
+        ..NpmConfig::default()
+    };
+    if globalconfig_overrides.is_empty()
+        && let Some(prefix) = &default_prefix
+    {
+        let path = npm_prefix_global_config(prefix)?;
+        push_npm_config_path(&mut combined.global_config_files, path.clone())?;
+        queue_npm_config_file(&mut pending, &mut known, path, false)?;
+    }
+    let mut total_bytes = 0usize;
+    while let Some((path, follow_redirects)) = pending.pop_front() {
+        let Some(settings) =
+            read_maven_settings(&path).map_err(|_| "npm config file could not be read safely")?
+        else {
+            continue;
+        };
+        total_bytes = total_bytes
+            .checked_add(settings.bytes.len())
+            .filter(|size| *size <= MAX_NPM_CONFIG_TOTAL_BYTES)
+            .ok_or("npm config files exceed the total size limit")?;
+        let config = parse_npm_config(&settings.bytes, &npm_home, home_variable)?;
+        let user_redirects = config.user_config_files.clone();
+        let global_redirects = config.global_config_files.clone();
+        if follow_redirects && globalconfig_overrides.is_empty() && prefix_override.is_none() {
+            for prefix in &config.prefixes {
+                let path = npm_prefix_global_config(prefix)?;
+                push_npm_config_path(&mut combined.global_config_files, path.clone())?;
+                queue_npm_config_file(&mut pending, &mut known, path, false)?;
+            }
+        }
+        for (values, destination) in [
+            (config.cache_roots, &mut combined.cache_roots),
+            (config.log_directories, &mut combined.log_directories),
+            (config.user_config_files, &mut combined.user_config_files),
+            (
+                config.global_config_files,
+                &mut combined.global_config_files,
+            ),
+        ] {
+            for value in values {
+                push_npm_config_path(destination, value)?;
+            }
+        }
+        if follow_redirects {
+            for redirect in user_redirects {
+                queue_npm_config_file(&mut pending, &mut known, redirect, true)?;
+            }
+            for redirect in global_redirects {
+                queue_npm_config_file(&mut pending, &mut known, redirect, false)?;
+            }
+        }
+    }
+    Ok(combined)
+}
+
+fn npm_config_from_environment(home: &Path, cwd: &Path) -> Result<NpmConfig, &'static str> {
+    let home_variable = env::var_os("HOME");
+    let prefix_overrides = npm_config_overrides("npm_config_prefix");
+    let prefix_environment = env::var_os("PREFIX");
+    let userconfig_overrides = npm_config_overrides("npm_config_userconfig");
+    let globalconfig_overrides = npm_config_overrides("npm_config_globalconfig");
+    let mut config = npm_config_sources(
+        home,
+        cwd,
+        home_variable.as_deref(),
+        &prefix_overrides,
+        prefix_environment.as_deref(),
+        &userconfig_overrides,
+        &globalconfig_overrides,
+    )?;
+    if let Some(value) = env::var_os("XDG_CONFIG_HOME") {
+        let xdg = npm_environment_path(&value)
+            .ok_or("npm XDG config directory is not a resolved absolute path")?;
+        if let Some(bytes) = read_bun_config(&xdg.join(".npmrc"))
+            .map_err(|_| "npm XDG config file could not be read safely")?
+        {
+            let bun_config = parse_npm_config(&bytes, home, home_variable.as_deref())?;
+            for path in bun_config.cache_roots {
+                push_npm_config_path(&mut config.cache_roots, path)?;
+            }
+        }
+    }
+    Ok(config)
+}
+
+fn npm_config_log_paths(config: &NpmConfig) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for path in config
+        .cache_roots
+        .iter()
+        .map(|root| root.join("_logs"))
+        .chain(config.log_directories.iter().cloned())
+    {
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+fn add_npm_config_specs(specs: &mut Vec<Spec>, config: &NpmConfig) {
+    for root in &config.cache_roots {
+        let path = root.join("_cacache");
+        if !specs
+            .iter()
+            .any(|spec| spec.name == "npm" && spec.path == path)
+        {
+            specs.push(Spec {
+                name: "npm configured cache (possible)",
+                path,
+                classification: "possible shared package cache",
+                consequence: "npm configuration may be overridden; verify the active npm cache before cleanup",
+            });
+        }
+    }
+    for path in npm_config_log_paths(config) {
+        if !specs
+            .iter()
+            .any(|spec| spec.name == "npm logs" && spec.path == path)
+        {
+            specs.push(Spec {
+                name: "npm logs",
+                path,
+                classification: "diagnostic logs",
+                consequence: "logs may contain command output and local paths",
+            });
+        }
+    }
+}
+
+fn npm_cache_roots(platform: Platform, home: &Path, data: &Path) -> Vec<PathBuf> {
+    let overrides = npm_config_overrides("npm_config_cache");
+    if overrides.is_empty() {
+        return vec![npm_default(platform, home, data)];
+    }
+    let mut roots = Vec::new();
+    for value in overrides {
+        if let Some(path) = npm_environment_path(&value)
+            && !roots.contains(&path)
+        {
+            roots.push(path);
+        }
+    }
+    roots
+}
+
+fn npm_cache_paths(platform: Platform, home: &Path, data: &Path) -> Vec<PathBuf> {
+    npm_cache_roots(platform, home, data)
+        .into_iter()
+        .map(|path| path.join("_cacache"))
+        .collect()
+}
+
+fn npm_log_paths(platform: Platform, home: &Path, data: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![npm_default(platform, home, data).join("_logs")];
+    paths.extend(
+        npm_cache_roots(platform, home, data)
+            .into_iter()
+            .map(|path| path.join("_logs")),
+    );
+    paths.extend(
+        npm_config_overrides("npm_config_logs_dir")
+            .into_iter()
+            .filter_map(|value| npm_environment_path(&value)),
+    );
+    let mut unique = Vec::new();
+    for path in paths {
+        if !unique.contains(&path) {
+            unique.push(path);
+        }
+    }
+    unique
+}
+
+// shortcut: include new single-path overrides here before allowing shared-cache removal.
+const CACHE_DIRECTORY_OVERRIDES: &[&str] = &[
+    "CARGO_HOME",
+    "YARN_CACHE_FOLDER",
+    "PIP_CACHE_DIR",
+    "GRADLE_USER_HOME",
+    "CCACHE_DIR",
+    "SCCACHE_DIR",
+    "PUB_CACHE",
+];
+
+const UNRESOLVED_CACHE_DIRECTORY_OVERRIDE: &str =
+    "a cache directory environment setting is unresolved; shared-cache removal is blocked";
+
+fn has_unresolved_cache_directory_override(platform: Platform) -> bool {
+    CACHE_DIRECTORY_OVERRIDES.iter().any(|name| {
+        env::var_os(name).is_some_and(|value| value.is_empty() || !Path::new(&value).is_absolute())
+    }) || (platform != Platform::Windows
+        && env::var_os("XDG_CACHE_HOME")
+            .is_some_and(|value| value.is_empty() || !Path::new(&value).is_absolute()))
+        || cargo_build_paths().1
+        || npm_config_overrides("npm_config_cache")
+            .iter()
+            .any(|value| npm_environment_path(value).is_none())
+        || npm_config_overrides("npm_config_logs_dir")
+            .iter()
+            .any(|value| npm_environment_path(value).is_none())
+}
+
 const MAX_MAVEN_SETTINGS_BYTES: u64 = 256 * 1024;
 const MAX_MAVEN_REPOSITORY_BYTES: usize = 4096;
+const MAX_MAVEN_PROJECT_CONFIG_DEPTH: usize = 128;
 const MAX_NUGET_CONFIG_PATH_BYTES: usize = 4096;
 const MAX_NUGET_CONFIG_DIR_ENTRIES: usize = 256;
 const MAX_NUGET_SOLUTION_CONFIG_DEPTH: usize = 128;
@@ -721,6 +1741,401 @@ const MAX_NUGET_SOLUTION_CONFIG_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 const WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 #[cfg(windows)]
 const WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+fn maven_options_may_override_local_repository(value: &std::ffi::OsStr, maven_args: bool) -> bool {
+    let Some(value) = value.to_str() else {
+        return true;
+    };
+    if value.is_empty() {
+        return false;
+    }
+    if value
+        .chars()
+        .any(|character| matches!(character, '\'' | '"' | '\\'))
+    {
+        return true;
+    }
+
+    let mut arguments = value.split_ascii_whitespace();
+    while let Some(argument) = arguments.next() {
+        if argument.starts_with('@')
+            || (argument == "-D" && !maven_args)
+            || ["-javaagent:", "-agentlib:", "-agentpath:"]
+                .iter()
+                .any(|prefix| argument.starts_with(prefix))
+        {
+            return true;
+        }
+        if maven_args
+            && (matches!(
+                argument,
+                "-f" | "--file"
+                    | "-s"
+                    | "--settings"
+                    | "-gs"
+                    | "--global-settings"
+                    | "-ps"
+                    | "--project-settings"
+                    | "-is"
+                    | "--install-settings"
+            ) || [
+                "--file=",
+                "--settings=",
+                "--global-settings=",
+                "--project-settings=",
+                "--install-settings=",
+            ]
+            .iter()
+            .any(|prefix| argument.starts_with(prefix))
+                || (argument.starts_with('-')
+                    && !matches!(argument, "-ff" | "-fae" | "-fn")
+                    && ["-f", "-s", "-gs", "-ps", "-is"]
+                        .iter()
+                        .any(|prefix| argument.starts_with(prefix))))
+        {
+            return true;
+        }
+        let property = if matches!(argument, "-D" | "--define") {
+            let Some(property) = arguments.next() else {
+                return true;
+            };
+            property
+        } else if let Some(property) = argument.strip_prefix("--define=") {
+            property
+        } else if let Some(property) = argument.strip_prefix("-D") {
+            property
+        } else {
+            continue;
+        };
+        if matches!(
+            property.split('=').next(),
+            Some(
+                "maven.repo.local"
+                    | "maven.repo.local.head"
+                    | "maven.repo.local.tail"
+                    | "maven.reactor.outputRepository"
+                    | "maven.ext.class.path"
+                    | "user.home"
+                    | "user.dir"
+                    | "java.system.class.loader"
+                    | "java.class.path"
+                    | "java.endorsed.dirs"
+                    | "java.ext.dirs"
+                    | "maven.home"
+                    | "maven.conf"
+                    | "maven.multiModuleProjectDirectory"
+                    | "maven.installation.conf"
+                    | "maven.installation.settings"
+                    | "maven.installation.extensions"
+                    | "maven.installation.toolchains"
+                    | "maven.user.conf"
+                    | "maven.user.settings"
+                    | "maven.user.extensions"
+                    | "maven.user.toolchains"
+                    | "maven.project.conf"
+                    | "maven.project.settings"
+                    | "maven.project.extensions"
+                    | "org.apache.maven.global-settings"
+                    | "org.apache.maven.user-settings"
+            )
+        ) {
+            return true;
+        }
+    }
+    !maven_config_options_are_unambiguous(value, maven_args)
+}
+
+fn maven_system_property_is_safe(property: &str) -> bool {
+    let Some((name, value)) = property.split_once('=') else {
+        return false;
+    };
+    !value.is_empty()
+        && matches!(
+            name,
+            "user.language"
+                | "user.country"
+                | "user.variant"
+                | "user.timezone"
+                | "file.encoding"
+                | "java.awt.headless"
+        )
+}
+
+fn maven_config_options_are_unambiguous(value: &str, maven_args: bool) -> bool {
+    if maven_args {
+        let mut arguments = value.split_ascii_whitespace();
+        while let Some(argument) = arguments.next() {
+            match argument {
+                "-B"
+                | "--batch-mode"
+                | "-C"
+                | "--strict-checksums"
+                | "-c"
+                | "--lax-checksums"
+                | "-e"
+                | "--errors"
+                | "-ff"
+                | "--fail-fast"
+                | "-fae"
+                | "--fail-at-end"
+                | "-fn"
+                | "--fail-never"
+                | "-N"
+                | "--non-recursive"
+                | "-npr"
+                | "--no-plugin-registry"
+                | "-npu"
+                | "--no-plugin-updates"
+                | "-nsu"
+                | "--no-snapshot-updates"
+                | "-o"
+                | "--offline"
+                | "-q"
+                | "--quiet"
+                | "-U"
+                | "--update-snapshots"
+                | "-v"
+                | "--version"
+                | "-V"
+                | "--show-version"
+                | "-X"
+                | "--debug"
+                | "-ntp"
+                | "--no-transfer-progress"
+                | "-itr"
+                | "--ignore-transitive-repositories"
+                | "-am"
+                | "--also-make"
+                | "-amd"
+                | "--also-make-dependents"
+                | "-h"
+                | "--help" => {}
+                "-T" | "--threads" => {
+                    if arguments
+                        .next()
+                        .is_none_or(|value| !maven_thread_count_is_valid(value))
+                    {
+                        return false;
+                    }
+                }
+                "-pl" | "--projects" | "-rf" | "--resume-from" | "-l" | "--log-file" => {
+                    if arguments.next().is_none_or(|value| value.starts_with('-')) {
+                        return false;
+                    }
+                }
+                "-D" | "--define" => {
+                    let Some(property) = arguments.next() else {
+                        return false;
+                    };
+                    if !maven_system_property_is_safe(property) {
+                        return false;
+                    }
+                }
+                _ if argument.starts_with("-D") && argument.len() > 2 => {
+                    if !maven_system_property_is_safe(&argument[2..]) {
+                        return false;
+                    }
+                }
+                _ if argument.starts_with("--define=") && argument.len() > 9 => {
+                    if !maven_system_property_is_safe(&argument[9..]) {
+                        return false;
+                    }
+                }
+                _ if argument.starts_with("--threads=") => {
+                    if !maven_thread_count_is_valid(&argument[10..]) {
+                        return false;
+                    }
+                }
+                _ if argument.starts_with("-T") && argument.len() > 2 => {
+                    if !maven_thread_count_is_valid(&argument[2..]) {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        true
+    } else {
+        value.split_ascii_whitespace().all(|option| {
+            let size = [
+                "-Xmx",
+                "-Xms",
+                "-Xss",
+                "-XX:MaxMetaspaceSize=",
+                "-XX:ReservedCodeCacheSize=",
+            ]
+            .iter()
+            .find_map(|prefix| option.strip_prefix(prefix));
+            if let Some(size) = size {
+                return maven_memory_size_is_valid(size);
+            }
+            if let Some(property) = option.strip_prefix("-D") {
+                return maven_system_property_is_safe(property);
+            }
+            matches!(option, "-server" | "-client")
+        })
+    }
+}
+
+fn maven_thread_count_is_valid(value: &str) -> bool {
+    let number = value
+        .strip_suffix('C')
+        .or_else(|| value.strip_suffix('c'))
+        .unwrap_or(value);
+    let mut decimal_points = 0;
+    if number.is_empty()
+        || !number.bytes().all(|byte| match byte {
+            b'0'..=b'9' => true,
+            b'.' => {
+                decimal_points += 1;
+                decimal_points <= 1
+            }
+            _ => false,
+        })
+    {
+        return false;
+    }
+    number
+        .parse::<f64>()
+        .is_ok_and(|count| count.is_finite() && count > 0.0)
+}
+
+fn maven_memory_size_is_valid(value: &str) -> bool {
+    let number = value
+        .strip_suffix('k')
+        .or_else(|| value.strip_suffix('K'))
+        .or_else(|| value.strip_suffix('m'))
+        .or_else(|| value.strip_suffix('M'))
+        .or_else(|| value.strip_suffix('g'))
+        .or_else(|| value.strip_suffix('G'))
+        .or_else(|| value.strip_suffix('t'))
+        .or_else(|| value.strip_suffix('T'))
+        .unwrap_or(value);
+    !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn maven_option_file_may_override_local_repository(
+    path: &Path,
+    maven_args: bool,
+) -> Result<bool, &'static str> {
+    let Some(file) = read_maven_settings(path)? else {
+        return Ok(false);
+    };
+    let value = std::str::from_utf8(&file.bytes).map_err(|_| "Maven options file is not UTF-8")?;
+    let options = std::ffi::OsStr::new(value);
+    Ok(maven_options_may_override_local_repository(
+        options, maven_args,
+    ))
+}
+
+fn maven_settings_file_may_override_local_repository(path: &Path) -> Result<bool, &'static str> {
+    let Some(file) = read_maven_settings(path)? else {
+        return Ok(false);
+    };
+    Ok(parse_maven_settings(&file.bytes)?.is_some())
+}
+
+fn maven_directory_config_may_override_local_repository(
+    directory: &Path,
+    names: &[&str],
+) -> Result<bool, &'static str> {
+    match std::fs::symlink_metadata(directory) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err("Maven configuration directory could not be inspected safely"),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err("Maven configuration directory is not a regular directory");
+        }
+        Ok(_) => {}
+    }
+    for name in names {
+        match std::fs::symlink_metadata(directory.join(name)) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("Maven configuration file could not be inspected safely"),
+        }
+    }
+    Ok(false)
+}
+
+fn maven_project_config_may_override_local_repository(cwd: &Path) -> Result<bool, &'static str> {
+    for (depth, ancestor) in cwd.ancestors().enumerate() {
+        if depth >= MAX_MAVEN_PROJECT_CONFIG_DEPTH {
+            return Err("Maven project config search exceeded its depth limit");
+        }
+        let directory = ancestor.join(".mvn");
+        if maven_directory_config_may_override_local_repository(
+            &directory,
+            &[
+                "maven-system.properties",
+                "maven-user.properties",
+                "extensions.xml",
+            ],
+        )? || maven_option_file_may_override_local_repository(
+            &directory.join("jvm.config"),
+            false,
+        )? || maven_option_file_may_override_local_repository(
+            &directory.join("maven.config"),
+            true,
+        )? || maven_settings_file_may_override_local_repository(&directory.join("settings.xml"))?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn maven_repository_may_be_overridden(cwd: &Path, home: &Path) -> Result<bool, &'static str> {
+    for (name, maven_args) in [
+        ("MAVEN_OPTS", false),
+        ("MAVEN_ARGS", true),
+        ("JAVA_TOOL_OPTIONS", false),
+        ("JDK_JAVA_OPTIONS", false),
+        ("_JAVA_OPTIONS", false),
+    ] {
+        if env::var_os(name)
+            .is_some_and(|value| maven_options_may_override_local_repository(&value, maven_args))
+        {
+            return Ok(true);
+        }
+    }
+    if maven_project_config_may_override_local_repository(cwd)?
+        || maven_directory_config_may_override_local_repository(
+            &home.join(".m2"),
+            &["maven-system.properties", "maven-user.properties"],
+        )?
+    {
+        return Ok(true);
+    }
+    for name in ["MAVEN_HOME", "M2_HOME"] {
+        let Some(value) = env::var_os(name) else {
+            continue;
+        };
+        let path = PathBuf::from(value);
+        if !path.is_absolute() {
+            return Err("Maven installation home is not an absolute path");
+        }
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err("Maven installation home is not a regular directory");
+            }
+            Ok(_) => {}
+            Err(_) => return Err("Maven installation home could not be inspected safely"),
+        }
+        let conf = path.join("conf");
+        if maven_directory_config_may_override_local_repository(
+            &conf,
+            &[
+                "maven-system.properties",
+                "maven-user.properties",
+                "maven.properties",
+            ],
+        )? || maven_settings_file_may_override_local_repository(&conf.join("settings.xml"))?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 
 fn maven_repository(home: &Path) -> Result<PathBuf, &'static str> {
     use std::path::Component;
@@ -2781,6 +4196,20 @@ fn specs(
         "shared dependencies",
         "Git dependencies may need to be fetched again",
     );
+    let mut cargo_output_paths = cargo_build_paths().0;
+    for path in cargo_config_build_paths().0 {
+        if !cargo_output_paths.contains(&path) {
+            cargo_output_paths.push(path);
+        }
+    }
+    for path in cargo_output_paths {
+        add(
+            "Cargo build output (possible)",
+            Some(path),
+            "configured output; scope unknown",
+            "Cargo may place build artifacts or other user data here; Upkit only inventories this path",
+        );
+    }
     add(
         "Go build",
         match go_env.value("GOCACHE") {
@@ -2810,12 +4239,14 @@ fn specs(
         "shared dependencies",
         "modules may need to be downloaded again",
     );
-    add(
-        "npm",
-        env_dir("npm_config_cache", npm_default(platform, home, data)).map(|p| p.join("_cacache")),
-        "shared package cache",
-        "packages may need to be downloaded again",
-    );
+    for path in npm_cache_paths(platform, home, data) {
+        add(
+            "npm",
+            Some(path),
+            "shared package cache",
+            "packages may need to be downloaded again",
+        );
+    }
     add(
         "pnpm",
         pnpm_store_path(
@@ -2902,7 +4333,11 @@ fn specs(
     specs
 }
 
-fn bun_specs(cache: Option<PathBuf>, command_cache: Option<PathBuf>) -> Vec<Spec> {
+fn bun_specs(
+    cache: Option<PathBuf>,
+    command_cache: Option<PathBuf>,
+    configured_caches: Vec<PathBuf>,
+) -> Vec<Spec> {
     let command_cache = command_cache.filter(|path| Some(path) != cache.as_ref());
     let mut specs = Vec::new();
     if let Some(path) = cache {
@@ -2921,24 +4356,67 @@ fn bun_specs(cache: Option<PathBuf>, command_cache: Option<PathBuf>) -> Vec<Spec
             consequence: "Bun cache rm/prune may target this location; Upkit only inventories it",
         });
     }
+    for path in configured_caches {
+        if !specs.iter().any(|spec: &Spec| spec.path == path) {
+            specs.push(Spec {
+                name: "Bun configured cache",
+                path,
+                classification: "shared package cache",
+                consequence: "Bun configuration may use this path; Upkit protects it from cache removal",
+            });
+        }
+    }
     specs
 }
 
 #[cfg(target_os = "linux")]
 pub(crate) fn selected_cache(path: &Path) -> anyhow::Result<Spec> {
     use anyhow::{Context, bail};
-    let nuget_solution = nuget_solution_config_paths(
-        Platform::Linux,
-        &env::current_dir().context("current directory is unavailable")?,
-    )
-    .map_err(|error| {
+    if has_unresolved_cache_directory_override(Platform::Linux) {
+        bail!(UNRESOLVED_CACHE_DIRECTORY_OVERRIDE);
+    }
+    if cargo_config_build_paths().1 {
+        bail!(CARGO_CONFIG_UNVERIFIED);
+    }
+    let cwd = env::current_dir().context("current directory is unavailable")?;
+    let home = dirs::home_dir().context("user home is unavailable")?;
+    match maven_repository_may_be_overridden(&cwd, &home) {
+        Ok(false) => {}
+        Ok(true) => bail!(
+            "Maven local repository may be overridden by Maven arguments or configuration; shared-cache removal is blocked"
+        ),
+        Err(error) => bail!(
+            "Maven repository configuration is unverified ({error}); shared-cache removal is blocked"
+        ),
+    }
+    let nuget_solution = nuget_solution_config_paths(Platform::Linux, &cwd).map_err(|error| {
         anyhow::anyhow!(
             "NuGet solution config is unverified ({error}); shared-cache removal is blocked"
         )
     })?;
-    let home = dirs::home_dir().context("user home is unavailable")?;
     let cache = dirs::cache_dir().context("user cache directory is unavailable")?;
     let data = dirs::data_local_dir().context("user data directory is unavailable")?;
+    let npm_config = npm_config_from_environment(&home, &cwd).map_err(|error| {
+        anyhow::anyhow!(
+            "npm cache configuration is unverified ({error}); shared-cache removal is blocked"
+        )
+    })?;
+    let mut bun_configured_caches = bun_config_cache_paths(
+        &home,
+        &cwd,
+        env::var_os("XDG_CONFIG_HOME").as_deref(),
+    )
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "Bun cache configuration is unverified ({error}); shared-cache removal is blocked"
+        )
+    })?;
+    bun_configured_caches.extend(npm_config.cache_roots.iter().cloned());
+    if !npm_config.global_config_verified {
+        bail!(
+            "npm global config location is unverified; set NPM_CONFIG_GLOBALCONFIG to an absolute path before removing a shared cache (a prefix-derived path is only a possible location)"
+        );
+    }
     let dotnet_home = nuget_environment_property("DOTNET_CLI_HOME")
         .map_err(|error| anyhow::anyhow!("NuGet package locations are unverified ({error})"))?;
     let dotnet_home = nuget_dotnet_cli_home(dotnet_home.as_deref()).map_err(|error| {
@@ -3087,7 +4565,12 @@ pub(crate) fn selected_cache(path: &Path) -> anyhow::Result<Spec> {
         (nuget_packages, nuget_fallback_packages),
         [Some(maven_repository), Some(zig_global_cache)],
     );
-    discovered.extend(bun_specs(Some(bun_cache.clone()), Some(bun_command_cache)));
+    add_npm_config_specs(&mut discovered, &npm_config);
+    discovered.extend(bun_specs(
+        Some(bun_cache.clone()),
+        Some(bun_command_cache),
+        bun_configured_caches,
+    ));
     discovered.extend(nuget_repository_paths.into_iter().map(|path| Spec {
         name: "NuGet packages.config repository",
         path,
@@ -3100,20 +4583,63 @@ pub(crate) fn selected_cache(path: &Path) -> anyhow::Result<Spec> {
         classification: "local package feed",
         consequence: "packages may be restored from this local source",
     }));
-    let mut matches = discovered.iter().filter(|spec| spec.path == path);
-    let first = matches
+    for path in npm_log_paths(Platform::Linux, &home, &data) {
+        if !discovered
+            .iter()
+            .any(|spec| spec.name == "npm logs" && spec.path == path)
+        {
+            discovered.push(Spec {
+                name: "npm logs",
+                path,
+                classification: "diagnostic logs",
+                consequence: "logs may contain command output and local paths",
+            });
+        }
+    }
+    let mut matches = discovered
+        .iter()
+        .enumerate()
+        .filter(|(_, spec)| spec.path == path);
+    let (first_index, first) = matches
         .next()
-        .context("selected path is not a discovered shared cache")?
-        .clone();
+        .context("selected path is not a discovered shared cache")?;
     if matches.next().is_some() {
         bail!("selected path matches more than one cache");
+    }
+    let first = first.clone();
+    if first.name == "npm configured cache (possible)" {
+        bail!("npm configuration may be overridden; this possible cache is inspection-only");
+    }
+    if first.name == "npm"
+        && npm_config_overrides("npm_config_cache").is_empty()
+        && !npm_config.cache_roots.is_empty()
+        && (npm_config.cache_roots.len() != 1
+            || npm_config.cache_roots[0].join("_cacache") != first.path)
+    {
+        bail!(
+            "npm configuration may override the default cache; set an explicit cache environment path before removal"
+        );
+    }
+    if first.name == "npm" && npm_cache_roots(Platform::Linux, &home, &data).len() > 1 {
+        bail!("conflicting npm cache environment values must be resolved before removal");
+    }
+    if first.name == "npm logs" {
+        bail!("npm log directories are protected and are not removable shared caches");
+    }
+    if first.name == "Cargo build output (possible)" {
+        bail!(
+            "Cargo build output is inventory-only because its contents may include project or other user data"
+        );
     }
     if first.name == "pnpm" && pnpm_configured_store_dir().is_none() {
         bail!(
             "pnpm's store can be configured per workspace or filesystem; only an explicit PNPM_CONFIG_STORE_DIR can be removed safely"
         );
     }
-    if matches!(first.name, "Bun" | "Bun cache command target") {
+    if matches!(
+        first.name,
+        "Bun" | "Bun cache command target" | "Bun configured cache"
+    ) {
         bail!(
             "Upkit inventories the Bun cache but does not remove it; its hard-linked package files may still be used by project node_modules"
         );
@@ -3144,7 +4670,10 @@ pub(crate) fn selected_cache(path: &Path) -> anyhow::Result<Spec> {
     } else if uv_override.is_some() {
         bail!("uv cache configuration is relative; resolve it before removing a cache");
     }
-    for other in discovered.iter().filter(|other| other.name != first.name) {
+    for (index, other) in discovered.iter().enumerate() {
+        if index == first_index {
+            continue;
+        }
         if other.path.starts_with(path)
             || path.starts_with(&other.path)
             || other
@@ -3232,9 +4761,22 @@ pub fn inventory(cancel: &AtomicBool) -> CacheReport {
     };
     let nuget_defaults_warning = nuget_defaults_result.as_ref().err().copied();
     let nuget_defaults = nuget_defaults_result.unwrap_or_default();
-    let nuget_solution_result = env::current_dir()
-        .map_err(|_| "current directory is unavailable")
-        .and_then(|cwd| nuget_solution_config_paths(platform, &cwd));
+    let cwd = env::current_dir().ok();
+    let maven_override_warning =
+        cwd.as_deref()
+            .map_or(Some("current directory is unavailable"), |cwd| {
+                match maven_repository_may_be_overridden(cwd, &home) {
+                    Ok(true) => {
+                        Some("Maven arguments or configuration may change the repository location")
+                    }
+                    Ok(false) => None,
+                    Err(error) => Some(error),
+                }
+            });
+    let nuget_solution_result = cwd
+        .as_deref()
+        .ok_or("current directory is unavailable")
+        .and_then(|cwd| nuget_solution_config_paths(platform, cwd));
     let nuget_solution_warning = nuget_solution_result.as_ref().err().copied();
     let nuget_solution = nuget_solution_result.unwrap_or_default();
     let mut nuget_source_paths = nuget_config
@@ -3316,6 +4858,10 @@ pub fn inventory(cancel: &AtomicBool) -> CacheReport {
         .map(PathBuf::from)
         .filter(|path| path.is_absolute());
     let uv_cache_override = env::var_os("UV_CACHE_DIR");
+    let npm_config = cwd
+        .as_deref()
+        .ok_or("current directory is unavailable")
+        .and_then(|cwd| npm_config_from_environment(&home, cwd));
     let maven_repository = maven_repository(&home);
     let maven_warning = maven_repository.as_ref().err().copied();
     let zig_global_cache = zig_global_cache(platform);
@@ -3328,6 +4874,17 @@ pub fn inventory(cancel: &AtomicBool) -> CacheReport {
         env::var_os("BUN_INSTALL").as_deref(),
     );
     let bun_command_cache_warning = bun_command_cache.as_ref().err().copied();
+    let bun_configured_caches = cwd
+        .as_deref()
+        .ok_or("current directory is unavailable")
+        .and_then(|cwd| {
+            bun_config_cache_paths(&home, cwd, env::var_os("XDG_CONFIG_HOME").as_deref())
+        });
+    let bun_config_warning = bun_configured_caches.as_ref().err().copied();
+    let mut bun_configured_caches = bun_configured_caches.unwrap_or_default();
+    if let Ok(config) = &npm_config {
+        bun_configured_caches.extend(config.cache_roots.iter().cloned());
+    }
     let bun_cache = bun_cache.ok();
     let bun_command_cache = bun_command_cache.ok();
     let mut discovered = specs(
@@ -3339,7 +4896,14 @@ pub fn inventory(cancel: &AtomicBool) -> CacheReport {
         (nuget_packages.clone(), nuget_fallback_packages.clone()),
         [maven_repository.ok(), zig_global_cache.ok()],
     );
-    discovered.extend(bun_specs(bun_cache, bun_command_cache));
+    if let Ok(config) = &npm_config {
+        add_npm_config_specs(&mut discovered, config);
+    }
+    discovered.extend(bun_specs(
+        bun_cache,
+        bun_command_cache,
+        bun_configured_caches,
+    ));
     discovered.extend(nuget_source_paths.into_iter().map(|path| Spec {
         name: "NuGet local package source",
         path,
@@ -3362,6 +4926,32 @@ pub fn inventory(cancel: &AtomicBool) -> CacheReport {
         discovered.push(uv);
     }
     let mut report = inventory_specs(discovered, &home, cancel, platform);
+    if npm_config
+        .as_ref()
+        .is_ok_and(|config| !config.cache_roots.is_empty())
+    {
+        report.warnings.push(
+            "npm configuration contains possible cache locations; npm may override or ignore these settings by source priority.".into(),
+        );
+    }
+    if npm_config
+        .as_ref()
+        .is_ok_and(|config| !config.global_config_verified)
+    {
+        report.warnings.push(
+            "npm global config location is unverified; shared-cache removal is blocked unless NPM_CONFIG_GLOBALCONFIG names an absolute config path. Prefix-derived global config paths are only possible locations.".into(),
+        );
+    }
+    if let Err(error) = npm_config {
+        report.warnings.push(format!(
+            "npm cache configuration is unverified ({error}); shared-cache removal is blocked"
+        ));
+    }
+    if has_unresolved_cache_directory_override(platform) {
+        report
+            .warnings
+            .push(UNRESOLVED_CACHE_DIRECTORY_OVERRIDE.into());
+    }
     if uv_cache_override.is_some()
         && uv_cache_path(
             platform,
@@ -3401,6 +4991,11 @@ pub fn inventory(cancel: &AtomicBool) -> CacheReport {
             .warnings
             .push(format!("Maven cache: {warning}; location skipped"));
     }
+    if let Some(warning) = maven_override_warning {
+        report.warnings.push(format!(
+            "Maven local repository is unverified ({warning}); shared-cache removal is blocked"
+        ));
+    }
     if let Some(warning) = zig_cache_warning {
         report
             .warnings
@@ -3414,6 +5009,11 @@ pub fn inventory(cancel: &AtomicBool) -> CacheReport {
     if let Some(warning) = bun_command_cache_warning {
         report.warnings.push(format!(
             "Bun cache command target: {warning}; shared-cache removal is blocked"
+        ));
+    }
+    if let Some(error) = bun_config_warning {
+        report.warnings.push(format!(
+            "Bun cache configuration is unverified ({error}); shared-cache removal is blocked"
         ));
     }
     report.warnings.push("NuGet inventory includes environment, user config, defaults, known MSBuild environment paths, and safe paths observed across NuGet.Config files in the current directory's ancestor chain. It keeps the union across those config levels, including local package feeds. Config files outside that chain and project-file restore properties are not inspected, including MSBuild restore settings; they may select other paths.".into());
@@ -3475,7 +5075,25 @@ pub fn inventory(cancel: &AtomicBool) -> CacheReport {
     {
         report.warnings.push("An external Go build-cache program is configured; its contents and behavior are not inspected or executed, and Linux shared-cache removal is blocked.".into());
     }
-    report.warnings.push("Cache locations are inferred from environment variables, Go's persistent environment when accessible, Maven user settings when readable, and platform defaults. Bun user/workspace bunfig.toml and .npmrc, Maven global settings, command-line overrides, and other tool-specific configuration can select different locations.".into());
+    report.warnings.push("Cache locations are inferred from environment variables, npm and Maven user settings when readable, Go's persistent environment when accessible, and platform defaults. npm project/global/builtin config and --cache/--logs-dir overrides may select unlisted paths. Bun global and workspace bunfig.toml cache paths and npm cache settings are protected as possible Bun caches; Bun --cache-dir, --config, and .env values may select unlisted paths. Maven global settings, command-line overrides, and other tool-specific configuration may select unlisted locations.".into());
+    if npm_cache_paths(platform, &home, &data).len() > 1
+        || npm_log_paths(platform, &home, &data).len() > 1
+    {
+        report.warnings.push(
+            "npm: conflicting case-insensitive cache or logs environment values are treated as possible locations for removal checks; Upkit does not infer which values npm uses.".into(),
+        );
+    }
+    if platform == Platform::Linux {
+        report.warnings.push("Cargo build output inventory includes absolute CARGO_TARGET_DIR, CARGO_BUILD_TARGET_DIR, and CARGO_BUILD_BUILD_DIR paths plus effective build.target-dir/build.build-dir settings from the current directory's ancestor config files and CARGO_HOME. Cargo --target-dir/--config overrides and config files outside that search are not inspected; additional outputs may be unlisted. Configured output is not assumed shared or rebuildable, and Upkit does not remove it.".into());
+        if cargo_config_build_paths().1 {
+            report.warnings.push(CARGO_CONFIG_UNVERIFIED.into());
+        }
+    } else {
+        report.warnings.push("Cargo build output inventory includes only absolute CARGO_TARGET_DIR, CARGO_BUILD_TARGET_DIR, and CARGO_BUILD_BUILD_DIR environment paths. Cargo config files and per-command --target-dir values are not inspected, so additional outputs may be unlisted; configured output is not assumed shared or rebuildable, and Upkit does not remove it.".into());
+    }
+    if cargo_build_paths().1 {
+        report.warnings.push("Cargo build output environment settings are relative, templated, or conflicting; affected paths are unresolved and shared-cache removal is blocked.".into());
+    }
     report
 }
 
@@ -3560,7 +5178,11 @@ fn inventory_specs(
         let mut entry = CacheEntry {
             name: spec.name,
             path: spec.path,
-            ownership: "shared user cache",
+            ownership: if spec.name == "Cargo build output (possible)" {
+                "configured Cargo output; scope unknown"
+            } else {
+                "shared user cache"
+            },
             directory_owner_status,
             classification: spec.classification,
             consequence: spec.consequence,
@@ -3622,15 +5244,82 @@ fn inventory_specs(
         }
         report.entries.push(entry);
     }
-    let paths = report
-        .entries
-        .iter()
-        .map(|entry| entry.path.canonicalize().ok())
-        .collect::<Vec<_>>();
-    let targets = paths
-        .iter()
-        .map(|path| path.clone().unwrap_or_default())
-        .collect::<Vec<_>>();
+    let mut paths = Vec::with_capacity(report.entries.len());
+    for entry in &report.entries {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        paths.push(entry.path.canonicalize().ok());
+    }
+    paths.resize_with(report.entries.len(), || None);
+    let mut entries_by_path = HashMap::<PathBuf, Vec<usize>>::new();
+    for (index, path) in paths.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        if let Some(path) = path {
+            entries_by_path.entry(path.clone()).or_default().push(index);
+        }
+    }
+    let mut overlapping_paths = HashSet::new();
+    if !cancel.load(Ordering::Relaxed) {
+        'find_overlap: for path in entries_by_path.keys() {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            if entries_by_path
+                .get(path)
+                .is_some_and(|indices| indices.len() > 1)
+            {
+                overlapping_paths.insert(path.clone());
+            }
+            // Each path checks its nearest candidate ancestor, which is enough to mark every
+            // member of a nested chain as its own path is visited.
+            for ancestor in path.ancestors().skip(1) {
+                if cancel.load(Ordering::Relaxed) {
+                    break 'find_overlap;
+                }
+                if entries_by_path.contains_key(ancestor) {
+                    overlapping_paths.insert(path.clone());
+                    overlapping_paths.insert(ancestor.to_path_buf());
+                    break;
+                }
+            }
+        }
+    }
+    let mut overlapping = vec![false; paths.len()];
+    'mark_overlap: for (path, indices) in &entries_by_path {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        if overlapping_paths.contains(path) {
+            for &index in indices {
+                if cancel.load(Ordering::Relaxed) {
+                    break 'mark_overlap;
+                }
+                overlapping[index] = true;
+            }
+        }
+    }
+    for (entry, overlaps) in report.entries.iter_mut().zip(overlapping) {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        if overlaps {
+            entry.warnings.push(
+                "This cache path overlaps another discovered cache path; their size estimates may overlap, so do not add them without checking."
+                    .into(),
+            );
+        }
+    }
+    let mut targets = Vec::with_capacity(paths.len());
+    for path in &paths {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        targets.push(path.clone().unwrap_or_default());
+    }
+    targets.resize_with(paths.len(), PathBuf::new);
     let activity = if platform == Platform::Linux {
         crate::activity::inspect(&targets, cancel)
     } else {
@@ -3657,6 +5346,410 @@ fn inventory_specs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cargo_build_output_paths_are_inventory_candidates_only_when_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("cargo-target");
+        let build = dir.path().join("cargo-build");
+        let (paths, unresolved) = cargo_build_paths_from(
+            Some(target.clone().into_os_string()),
+            Some(target.clone().into_os_string()),
+            Some(build.clone().into_os_string()),
+        );
+        assert_eq!(paths, [target.clone(), build]);
+        assert!(!unresolved);
+
+        let conflicting = dir.path().join("other-target");
+        let (paths, unresolved) = cargo_build_paths_from(
+            Some(target.clone().into_os_string()),
+            Some(conflicting.clone().into_os_string()),
+            None,
+        );
+        assert_eq!(paths, [target.clone(), conflicting]);
+        assert!(unresolved);
+
+        let (paths, unresolved) = cargo_build_paths_from(
+            Some("relative-target".into()),
+            None,
+            Some(dir.path().join("{workspace-root}").into_os_string()),
+        );
+        assert!(paths.is_empty());
+        assert!(unresolved);
+    }
+
+    #[test]
+    fn npm_config_extracts_only_supported_paths_without_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let logs = home.join("npm logs");
+        let prefix = home.join("npm prefix");
+        let user_config = home.join("user npmrc");
+        let global_config = home.join("global npmrc");
+        let input = format!(
+            "# fixture\n//registry.example.invalid/:_authToken=${{SYNTHETIC_TOKEN}}\ncache=${{HOME}}/first # comment\ncache=~/second\n\u{feff}cache=\"${{HOME}}/third \u{feff}\"\nlogs-dir={}\nprefix={}\nuserconfig={}\nglobalconfig={}\n",
+            serde_json::to_string(logs.to_str().unwrap()).unwrap(),
+            serde_json::to_string(prefix.to_str().unwrap()).unwrap(),
+            serde_json::to_string(user_config.to_str().unwrap()).unwrap(),
+            serde_json::to_string(global_config.to_str().unwrap()).unwrap(),
+        );
+        let config = parse_npm_config(input.as_bytes(), home, Some(home.as_os_str())).unwrap();
+        assert_eq!(
+            config.cache_roots,
+            [home.join("first"), home.join("second"), home.join("third")]
+        );
+        assert_eq!(config.log_directories, [logs]);
+        assert_eq!(config.prefixes, [prefix]);
+        assert_eq!(config.user_config_files, [user_config]);
+        assert_eq!(config.global_config_files, [global_config]);
+        assert!(parse_npm_config(input.as_bytes(), home, None).is_err());
+        for input in [
+            "cache=relative/path",
+            "cache=${UNKNOWN}/private",
+            "cache=~/../outside",
+            "prefix=relative/path",
+            "prefix=${UNKNOWN}/private",
+            "prefix=~/../outside",
+            "\"cache\"=/tmp/fixture",
+            "${KEY}=/tmp/fixture",
+            "[section]\ncache=/tmp/fixture",
+            "logs-dir=",
+        ] {
+            assert!(parse_npm_config(input.as_bytes(), home, Some(home.as_os_str())).is_err());
+        }
+    }
+
+    #[test]
+    fn npm_prefix_adds_default_global_config_as_a_possible_location() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let cwd = dir.path().join("project");
+        let prefix = dir.path().join("npm-prefix");
+        let global = prefix.join("etc/npmrc");
+        let cache = dir.path().join("npm-cache");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(&global, format!("cache={}\n", cache.display())).unwrap();
+
+        let config = npm_config_sources(
+            &home,
+            &cwd,
+            Some(home.as_os_str()),
+            &[prefix.as_os_str().to_os_string()],
+            None,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(!config.global_config_verified);
+        assert!(config.global_config_files.contains(&global));
+        assert!(config.cache_roots.contains(&cache));
+
+        let config =
+            npm_config_sources(&home, &cwd, Some(home.as_os_str()), &[], None, &[], &[]).unwrap();
+        assert!(!config.global_config_verified);
+
+        let config = npm_config_sources(
+            &home,
+            &cwd,
+            Some(home.as_os_str()),
+            &[],
+            Some(prefix.as_os_str()),
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(!config.global_config_verified);
+        assert!(config.global_config_files.contains(&global));
+        assert!(config.cache_roots.contains(&cache));
+    }
+
+    #[test]
+    fn npm_config_prefix_adds_default_global_config_as_a_possible_location() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let cwd = dir.path().join("project");
+        let prefix = dir.path().join("configured-prefix");
+        let global = prefix.join("etc/npmrc");
+        let cache = dir.path().join("npm-cache");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(
+            home.join(".npmrc"),
+            format!("prefix={}\n", prefix.display()),
+        )
+        .unwrap();
+        std::fs::write(&global, format!("cache={}\n", cache.display())).unwrap();
+
+        let config =
+            npm_config_sources(&home, &cwd, Some(home.as_os_str()), &[], None, &[], &[]).unwrap();
+        assert!(!config.global_config_verified);
+        assert!(config.global_config_files.contains(&global));
+        assert!(config.cache_roots.contains(&cache));
+    }
+
+    #[test]
+    fn npm_prefix_overrides_reject_conflicts_and_unresolved_paths() {
+        use std::ffi::OsString;
+
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first-prefix");
+        let second = dir.path().join("second-prefix");
+        for values in [
+            vec![OsString::from("relative-prefix")],
+            vec![OsString::from(format!("{} ", first.display()))],
+            vec![first.join("../unsafe").into_os_string()],
+            vec![
+                OsString::from(first.as_os_str()),
+                OsString::from(second.as_os_str()),
+            ],
+        ] {
+            assert!(npm_prefix_override(&values).is_err());
+        }
+        assert!(npm_prefix_environment(Some(std::ffi::OsStr::new("relative"))).is_err());
+        assert_eq!(npm_prefix_environment(None).unwrap(), None);
+        assert_eq!(
+            npm_prefix_override(&[
+                first.as_os_str().to_os_string(),
+                first.as_os_str().to_os_string()
+            ])
+            .unwrap(),
+            Some(first)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn npm_global_config_default_rejects_symlinked_prefix_paths() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let actual_prefix = dir.path().join("actual-prefix");
+        let linked_prefix = dir.path().join("linked-prefix");
+        std::fs::create_dir_all(actual_prefix.join("etc")).unwrap();
+        symlink(&actual_prefix, &linked_prefix).unwrap();
+        assert!(npm_prefix_global_config(&linked_prefix).is_err());
+
+        let linked_etc = dir.path().join("linked-etc");
+        symlink(actual_prefix.join("etc"), &linked_etc).unwrap();
+        assert!(npm_prefix_global_config(&linked_etc).is_err());
+    }
+
+    #[test]
+    fn npm_config_sources_follow_bounded_project_and_user_redirects() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let project = dir.path().join("project");
+        let workspace = project.join("nested");
+        let cwd = workspace.join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            project.join("package.json"),
+            br#"{"workspaces":["nested"]}"#,
+        )
+        .unwrap();
+        std::fs::write(workspace.join("package.json"), b"{}").unwrap();
+
+        let redirected_user = home.join("redirected.npmrc");
+        let user_global = home.join("user-global.npmrc");
+        let project_cache = home.join("project-cache");
+        let workspace_cache = home.join("workspace-cache");
+        let user_cache = home.join("redirected-user-cache");
+        let user_global_cache = home.join("user-global-cache");
+        let env_global = home.join("env-global.npmrc");
+        let env_global_cache = home.join("env-global-cache");
+        let project_logs = home.join("project-logs");
+        let global_logs = home.join("global-logs");
+        std::fs::write(
+            home.join(".npmrc"),
+            format!(
+                "//registry.example.invalid/:_authToken=synthetic-user-secret\nglobalconfig={}\ncache={}\n",
+                redirected_user.display(),
+                user_global_cache.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".npmrc"),
+            format!(
+                "userconfig={}\ncache={}\nlogs-dir={}\n//registry.example.invalid/:_authToken=synthetic-project-secret\n",
+                redirected_user.display(),
+                project_cache.display(),
+                project_logs.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join(".npmrc"),
+            format!("cache={}\n", workspace_cache.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            &redirected_user,
+            format!(
+                "cache={}\nuserconfig={}\nglobalconfig={}\n",
+                user_cache.display(),
+                home.join(".npmrc").display(),
+                user_global.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &user_global,
+            format!(
+                "cache={}\nlogs-dir={}\n",
+                user_global_cache.display(),
+                global_logs.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &env_global,
+            format!("cache={}\n", env_global_cache.display()),
+        )
+        .unwrap();
+
+        let config = npm_config_sources(
+            &home,
+            &cwd,
+            Some(home.as_os_str()),
+            &[],
+            None,
+            &[],
+            &[env_global.as_os_str().to_os_string()],
+        )
+        .unwrap();
+        for path in [
+            &project_cache,
+            &workspace_cache,
+            &user_cache,
+            &user_global_cache,
+            &env_global_cache,
+        ] {
+            assert!(config.cache_roots.contains(path));
+        }
+        assert!(config.log_directories.contains(&project_logs));
+        assert!(config.log_directories.contains(&global_logs));
+        assert_eq!(
+            npm_project_config_files(&cwd).unwrap(),
+            [workspace.join(".npmrc"), project.join(".npmrc")]
+        );
+        assert!(npm_config_log_paths(&config).contains(&global_logs));
+        assert!(config.global_config_verified);
+
+        let unverified =
+            npm_config_sources(&home, &cwd, Some(home.as_os_str()), &[], None, &[], &[]).unwrap();
+        assert!(!unverified.global_config_verified);
+
+        let invalid_project = dir.path().join("invalid-project");
+        std::fs::create_dir_all(&invalid_project).unwrap();
+        std::fs::write(invalid_project.join("package.json"), b"{}").unwrap();
+        std::fs::write(
+            invalid_project.join(".npmrc"),
+            b"userconfig=relative.npmrc\n",
+        )
+        .unwrap();
+        assert!(
+            npm_config_sources(
+                &home,
+                &invalid_project,
+                Some(home.as_os_str()),
+                &[],
+                None,
+                &[],
+                &[home.join("explicit-global.npmrc").into_os_string()],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn npm_project_sources_include_cwd_fallback_and_lock_only_ancestors() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let global = dir.path().join("global.npmrc");
+        std::fs::create_dir_all(&home).unwrap();
+
+        let plain_cwd = dir.path().join("plain/nested");
+        let plain_cache = dir.path().join("plain-cwd-cache");
+        std::fs::create_dir_all(&plain_cwd).unwrap();
+        std::fs::write(
+            plain_cwd.join(".npmrc"),
+            format!("cache={}\n", plain_cache.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            npm_project_config_files(&plain_cwd).unwrap(),
+            [plain_cwd.join(".npmrc")]
+        );
+        let plain = npm_config_sources(
+            &home,
+            &plain_cwd,
+            Some(home.as_os_str()),
+            &[],
+            None,
+            &[],
+            &[global.as_os_str().to_os_string()],
+        )
+        .unwrap();
+        assert!(plain.cache_roots.contains(&plain_cache));
+
+        let lock_parent = dir.path().join("lock-only");
+        let lock_cwd = lock_parent.join("nested");
+        let lock_parent_cache = dir.path().join("lock-parent-cache");
+        let lock_cwd_cache = dir.path().join("lock-cwd-cache");
+        std::fs::create_dir_all(&lock_cwd).unwrap();
+        std::fs::write(lock_parent.join("package-lock.json"), b"{}").unwrap();
+        std::fs::write(
+            lock_parent.join(".npmrc"),
+            format!("cache={}\n", lock_parent_cache.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            lock_cwd.join(".npmrc"),
+            format!("cache={}\n", lock_cwd_cache.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            npm_project_config_files(&lock_cwd).unwrap(),
+            [lock_cwd.join(".npmrc"), lock_parent.join(".npmrc")]
+        );
+        let lock_only = npm_config_sources(
+            &home,
+            &lock_cwd,
+            Some(home.as_os_str()),
+            &[],
+            None,
+            &[],
+            &[global.as_os_str().to_os_string()],
+        )
+        .unwrap();
+        assert!(lock_only.cache_roots.contains(&lock_cwd_cache));
+        assert!(lock_only.cache_roots.contains(&lock_parent_cache));
+    }
+
+    #[test]
+    fn npm_environment_paths_trim_like_npm_and_reject_unresolved_values() {
+        use std::ffi::OsStr;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("npm cache");
+        let padded = format!("\u{feff}{} \t", path.display());
+        assert_eq!(npm_environment_path(OsStr::new(&padded)), Some(path));
+        let dynamic = format!("{}/${{SECRET}}/cache", dir.path().display());
+        let parent = format!("{}/nested/../cache", dir.path().display());
+        for value in ["", "relative", &dynamic, &parent] {
+            assert!(npm_environment_path(OsStr::new(value)).is_none());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(npm_environment_path(OsStr::from_bytes(b"/fixture/\xff")).is_none());
+        }
+    }
 
     fn test_nuget_machine_config_directories(
         directory: &Path,
@@ -4622,6 +6715,7 @@ mod tests {
             entries.extend(bun_specs(
                 Some(default.clone()),
                 Some(command_cache.clone()),
+                Vec::new(),
             ));
             assert_eq!(
                 entries
@@ -4652,6 +6746,107 @@ mod tests {
             bun_cache_command_path(dir.path(), None, Some(OsStr::new("relative/bun"))).is_err()
         );
         assert!(bun_install_cache_path(dir.path(), Some(OsStr::new(""))).is_err());
+    }
+
+    #[test]
+    fn bun_config_cache_paths_resolve_relative_and_home_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        assert_eq!(
+            parse_bun_cache_config(
+                br#"[install.cache]
+dir = "../cache/bun"
+"#,
+                &home,
+                &workspace
+            )
+            .unwrap(),
+            Some(dir.path().join("cache/bun"))
+        );
+        assert_eq!(
+            parse_bun_cache_config(
+                br#"[install.cache]
+dir = "~/bun-cache"
+"#,
+                &home,
+                &workspace
+            )
+            .unwrap(),
+            Some(home.join("bun-cache"))
+        );
+    }
+
+    #[test]
+    fn bun_global_and_workspace_configs_are_unioned() {
+        use std::ffi::OsStr;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let xdg_config = dir.path().join("xdg-config");
+        let workspace = dir.path().join("workspace");
+        let nested = workspace.join("packages/app");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&xdg_config).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            xdg_config.join(".bunfig.toml"),
+            r#"[install.cache]
+dir = "~/bun-global"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join("bunfig.toml"),
+            r#"[install.cache]
+dir = "../cache/bun-workspace"
+"#,
+        )
+        .unwrap();
+
+        let paths = bun_config_cache_paths(&home, &nested, Some(xdg_config.as_os_str())).unwrap();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&home.join("bun-global")));
+        assert!(paths.contains(&dir.path().join("cache/bun-workspace")));
+        assert!(bun_config_cache_paths(&home, &nested, Some(OsStr::new("relative"))).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oversized_bunfig_is_rejected_before_parsing() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join(".bunfig.toml"),
+            vec![b' '; MAX_CARGO_CONFIG_BYTES as usize + 1],
+        )
+        .unwrap();
+
+        assert!(bun_config_cache_paths(&home, &home, None).is_err());
+    }
+
+    #[test]
+    fn ambiguous_bun_cache_config_is_rejected_without_echoing_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let private_value = "synthetic-secret-path";
+        for config in [
+            "[install.cache\ndir = \"/tmp/cache\"",
+            "[install.cache]\ndir = 42",
+            "[install.cache]\ndir = \"$HOME/cache\"",
+            "[install.cache]\ndir = \"/\"",
+        ] {
+            let error = parse_bun_cache_config(
+                config.replace("/tmp/cache", private_value).as_bytes(),
+                dir.path(),
+                dir.path(),
+            )
+            .unwrap_err();
+            assert!(!error.contains(private_value));
+        }
     }
 
     #[test]
@@ -4878,6 +7073,166 @@ mod tests {
             let error = parse_maven_settings(settings.as_bytes()).unwrap_err();
             assert!(!error.contains("secret"));
         }
+    }
+
+    #[test]
+    fn maven_option_detection_catches_repository_overrides_and_ambiguous_arguments() {
+        use std::ffi::OsStr;
+
+        for options in [
+            "-Dmaven.repo.local=/tmp/maven-cache",
+            "-Dmaven.ext.class.path=/tmp/extension.jar",
+            "-javaagent:/tmp/agent.jar",
+            "-Duser.home=/tmp/maven-home",
+            "-Djava.system.class.loader=example.Loader",
+            "-Djava.class.path=/tmp/loader.jar",
+            "-Djava.ext.dirs=/tmp/extensions",
+            "-Dmaven.home=/tmp/maven-install",
+            "-Dmaven.conf=/tmp/maven-conf",
+            "-Dmaven.installation.conf=/tmp/install-conf",
+            "-Dmaven.user.conf=/tmp/user-conf",
+            "-Dmaven.project.conf=/tmp/project-conf",
+            "-Dmaven.installation.extensions=/tmp/install-extensions.xml",
+            "-Dmaven.user.extensions=/tmp/user-extensions.xml",
+            "-Dmaven.project.extensions=/tmp/project-extensions.xml",
+            "-Dmaven.repo.local.head=/tmp/maven-head",
+            "-Dmaven.repo.local.tail=/tmp/maven-tail",
+            "-Dmaven.reactor.outputRepository=/tmp/reactor-repository",
+            "-Dmaven.project.settings=/tmp/project-settings.xml",
+            "-Dmaven.user.settings=/tmp/user-settings.xml",
+            "-Dmaven.installation.settings=/tmp/installation-settings.xml",
+            "-Dorg.apache.maven.user-settings=/tmp/user-settings.xml",
+            "-Dorg.apache.maven.global-settings=/tmp/global-settings.xml",
+            "--define=maven.repo.local=/tmp/maven-cache",
+            "--define maven.repo.local=/tmp/maven-cache",
+            "-D maven.repo.local=/tmp/maven-cache",
+            "-Dmaven.repo.local='/tmp/cache with spaces'",
+            "@maven-args",
+        ] {
+            assert!(
+                maven_options_may_override_local_repository(OsStr::new(options), false),
+                "{options} must be treated as an override or ambiguous"
+            );
+        }
+        for options in ["", "-Xmx2g", "-Duser.language=en"] {
+            assert!(
+                !maven_options_may_override_local_repository(OsStr::new(options), false),
+                "{options} does not set the local repository"
+            );
+        }
+        assert!(!maven_options_may_override_local_repository(
+            OsStr::new("-D user.language=en"),
+            true
+        ));
+        for options in [
+            "-s /tmp/settings.xml",
+            "--settings=/tmp/settings.xml",
+            "-gs /tmp/global-settings.xml",
+            "--global-settings=/tmp/global-settings.xml",
+            "-f /tmp/other/pom.xml",
+            "--file=/tmp/other/pom.xml",
+            "-ps /tmp/project-settings.xml",
+            "-is /tmp/install-settings.xml",
+        ] {
+            assert!(
+                maven_options_may_override_local_repository(OsStr::new(options), true),
+                "{options} may redirect Maven configuration or project root"
+            );
+        }
+        assert!(!maven_options_may_override_local_repository(
+            OsStr::new("-B -fn"),
+            true
+        ));
+        assert!(!maven_options_may_override_local_repository(
+            OsStr::new("-B -T2C"),
+            true
+        ));
+        assert!(maven_options_may_override_local_repository(
+            OsStr::new("-B -T invalid"),
+            true
+        ));
+        assert!(maven_options_may_override_local_repository(
+            OsStr::new("-Dcustom.property=value"),
+            true
+        ));
+        assert!(maven_options_may_override_local_repository(
+            OsStr::new("--unknown-maven-option"),
+            true
+        ));
+    }
+
+    #[test]
+    fn maven_project_configs_allow_safe_options_and_settings_only() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("workspace/project/module");
+        let project_config = root.path().join("workspace/project/.mvn");
+        std::fs::create_dir_all(&cwd).unwrap();
+        assert!(!maven_project_config_may_override_local_repository(&cwd).unwrap());
+
+        std::fs::create_dir_all(&project_config).unwrap();
+        std::fs::write(
+            project_config.join("jvm.config"),
+            "-Xmx2g\n-Xms512m\n-Duser.language=en\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project_config.join("maven.config"),
+            "--batch-mode -T 2 -Duser.language=en\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project_config.join("settings.xml"),
+            "<settings><offline>false</offline></settings>",
+        )
+        .unwrap();
+        assert!(!maven_project_config_may_override_local_repository(&cwd).unwrap());
+
+        std::fs::write(
+            project_config.join("jvm.config"),
+            "-javaagent:/tmp/agent.jar\n",
+        )
+        .unwrap();
+        assert!(maven_project_config_may_override_local_repository(&cwd).unwrap());
+        std::fs::write(project_config.join("jvm.config"), "-Xbogus\n").unwrap();
+        assert!(maven_project_config_may_override_local_repository(&cwd).unwrap());
+        std::fs::write(
+            project_config.join("jvm.config"),
+            "-Djava.system.class.loader=example.Loader\n",
+        )
+        .unwrap();
+        assert!(maven_project_config_may_override_local_repository(&cwd).unwrap());
+        std::fs::write(
+            project_config.join("jvm.config"),
+            "-Dcustom.property=value\n",
+        )
+        .unwrap();
+        assert!(maven_project_config_may_override_local_repository(&cwd).unwrap());
+        std::fs::write(project_config.join("jvm.config"), "-Xmx2g\n").unwrap();
+        std::fs::write(project_config.join("maven.config"), "--unknown-option\n").unwrap();
+        assert!(maven_project_config_may_override_local_repository(&cwd).unwrap());
+        std::fs::write(
+            project_config.join("maven.config"),
+            "--batch-mode -T invalid\n",
+        )
+        .unwrap();
+        assert!(maven_project_config_may_override_local_repository(&cwd).unwrap());
+        std::fs::write(project_config.join("maven.config"), "--batch-mode\n").unwrap();
+        std::fs::write(
+            project_config.join("settings.xml"),
+            "<settings><localRepository>/tmp/maven-cache</localRepository></settings>",
+        )
+        .unwrap();
+        assert!(maven_project_config_may_override_local_repository(&cwd).unwrap());
+
+        std::fs::write(project_config.join("settings.xml"), "<settings>").unwrap();
+        assert!(maven_project_config_may_override_local_repository(&cwd).is_err());
+        std::fs::remove_file(project_config.join("settings.xml")).unwrap();
+        std::fs::write(
+            project_config.join("maven-system.properties"),
+            "maven.repo.local=/tmp/maven-cache\n",
+        )
+        .unwrap();
+        assert!(maven_project_config_may_override_local_repository(&cwd).unwrap());
     }
 
     #[test]

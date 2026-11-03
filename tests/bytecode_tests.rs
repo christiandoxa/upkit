@@ -288,6 +288,9 @@ fn bytecode_fixture_namespace_worker() {
         Ok("cli_accepts_real_supported_cpython_timestamp_bytecode") => {
             cli_accepts_real_supported_cpython_timestamp_bytecode_in_namespace(&fixture);
         }
+        Ok("cli_removes_bytecode_with_non_identifier_source_stems") => {
+            cli_removes_bytecode_with_non_identifier_source_stems_in_namespace(&fixture);
+        }
         Ok("cli_verifies_and_removes_real_hash_based_cpython_bytecode") => {
             cli_verifies_and_removes_real_hash_based_cpython_bytecode_in_namespace();
         }
@@ -601,10 +604,10 @@ fn scheduled_bytecode_cleanup_requires_opt_in_and_rechecks_policy() {
     assert_eq!(dry["complete"], false);
     assert!(dry["items"].as_array().unwrap().iter().all(|item| {
         item["status"] == "skipped_unverified"
-            && item["detail"]
-                .as_str()
-                .is_some_and(|detail| detail.contains("Listed only;"))
+            && item.get("file").is_none()
+            && item.get("detail").is_none()
     }));
+    assert!(!dry.to_string().contains(root));
     assert!(dry["warnings"].as_array().unwrap().iter().any(|warning| {
         warning
             .as_str()
@@ -627,13 +630,30 @@ fn scheduled_bytecode_cleanup_requires_opt_in_and_rechecks_policy() {
     assert!(!full.status.success());
     let full: serde_json::Value = serde_json::from_slice(&full.stdout).unwrap();
     assert!(full["items"].as_array().unwrap().iter().any(|item| {
-        item["status"] == "not_attempted"
-            && item["detail"]
-                .as_str()
-                .is_some_and(|detail| detail.contains("History"))
+        item["status"] == "failed"
+            && item.get("file").is_none()
+            && item.get("detail").is_none()
+            && item.get("history_warning").is_none()
     }));
+    assert!(!full.to_string().contains(root));
     assert!(f.file.exists() && second.exists() && unchecked.exists());
     fs::remove_dir_all(&history).unwrap();
+    fs::remove_file(&config).unwrap();
+    for args in [&["--dry-run"][..], &[][..]] {
+        let output = run_cleanup(args, token);
+        assert!(!output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for text in [&stdout, &stderr] {
+            assert!(!text.contains(config.to_str().unwrap()));
+            assert!(!text.contains(root));
+        }
+        assert!(stdout.contains("details are redacted") || stderr.contains("details are redacted"));
+        assert!(f.file.exists() && second.exists() && unchecked.exists());
+    }
+    if history.exists() {
+        fs::remove_dir_all(&history).unwrap();
+    }
     write_config("7d", false);
     assert!(!run_cleanup(&[], token).status.success());
     assert!(f.file.exists() && second.exists() && unchecked.exists());
@@ -749,22 +769,24 @@ fn scheduled_cleanup_is_complete_when_the_last_file_uses_the_inspection_limit() 
     let report: serde_json::Value = serde_json::from_slice(&cleanup.stdout).unwrap();
     assert_eq!(report["inspected"], 32);
     assert_eq!(report["complete"], false);
-    assert!(
+    assert_eq!(
         report["warnings"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|warning| warning
+            .filter(|warning| warning
                 .as_str()
                 .unwrap()
                 .contains("inspected counts only filenames"))
+            .count(),
+        1
     );
     assert!(report["items"].as_array().unwrap().iter().all(|item| {
         item["status"] == "skipped_unverified"
-            && item["detail"]
-                .as_str()
-                .is_some_and(|detail| detail.contains("Listed only;"))
+            && item.get("file").is_none()
+            && item.get("detail").is_none()
     }));
+    assert!(!report.to_string().contains(root));
     assert!(f.file.exists());
     assert_eq!(fs::read_dir(cache).unwrap().count(), 32);
 }
@@ -773,7 +795,7 @@ fn scheduled_cleanup_is_complete_when_the_last_file_uses_the_inspection_limit() 
 fn scheduled_cleanup_rotates_a_bounded_file_window_without_mutating_dry_run() {
     use std::{
         hash::Hasher,
-        time::{Duration, SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime},
     };
 
     let Some(f) = Fixture::new() else {
@@ -830,14 +852,6 @@ fn scheduled_cleanup_rotates_a_bounded_file_window_without_mutating_dry_run() {
         String::from_utf8_lossy(&preview.stdout)
     );
     let plan: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
-    let week = || {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            / (7 * 24 * 60 * 60)
-    };
-    let before = week();
     let output = f.run(&[
         "--offline",
         "--dry-run",
@@ -851,7 +865,6 @@ fn scheduled_cleanup_rotates_a_bounded_file_window_without_mutating_dry_run() {
         plan["scheduled_scope_token"].as_str().unwrap(),
         f.repo.to_str().unwrap(),
     ]);
-    let after = week();
     assert!(!output.status.success());
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["inspected"], 32);
@@ -861,20 +874,11 @@ fn scheduled_cleanup_rotates_a_bounded_file_window_without_mutating_dry_run() {
     assert!(
         items
             .iter()
-            .all(|item| item["status"] == "skipped_unverified")
+            .all(|item| item["status"] == "skipped_unverified"
+                && item.get("file").is_none()
+                && item.get("detail").is_none())
     );
-    let first = Path::new(items[0]["file"].as_str().unwrap())
-        .file_name()
-        .unwrap()
-        .to_str()
-        .unwrap();
-    let expected = |week: u64| {
-        format!(
-            "a{:02}.cpython-311.pyc",
-            (u128::from(week) * 32 % 33) as usize
-        )
-    };
-    assert!(first == expected(before) || first == expected(after));
+    assert!(!report.to_string().contains(f.repo.to_str().unwrap()));
     assert_eq!(fs::read_dir(cache).unwrap().count(), 33);
     assert!(!f.home.join("data/upkit/history").exists());
 }
@@ -1136,6 +1140,67 @@ fn cli_batch_can_remove_files_from_different_caches_in_namespace(fixture: &Fixtu
 #[test]
 fn cli_accepts_real_supported_cpython_timestamp_bytecode() {
     run_fixture_namespace_worker("cli_accepts_real_supported_cpython_timestamp_bytecode");
+}
+
+#[test]
+fn cli_removes_bytecode_with_non_identifier_source_stems() {
+    run_fixture_namespace_worker("cli_removes_bytecode_with_non_identifier_source_stems");
+}
+
+fn cli_removes_bytecode_with_non_identifier_source_stems_in_namespace(fixture: &Fixture) {
+    let names = ["non-module-name", "package.module"];
+    let files = names
+        .iter()
+        .map(|name| fixture.add_file(name))
+        .collect::<Vec<_>>();
+    let root = fixture.repo.to_str().unwrap();
+    let mut preview_args = vec!["sweep", "bytecode-batch"];
+    preview_args.extend(files.iter().map(|file| file.to_str().unwrap()));
+    preview_args.extend(["--root", root]);
+    let preview = fixture.run(&preview_args);
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stdout)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert_eq!(plan["plan"]["files"].as_array().unwrap().len(), files.len());
+    for name in names {
+        assert!(
+            plan["plan"]["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|file| file["source"]
+                    == fixture.repo.join(format!("{name}.py")).to_str().unwrap()),
+            "preview omitted source {name:?}: {plan}"
+        );
+    }
+    let token = plan["plan"]["preview_token"].as_str().unwrap();
+    let mut remove_args = vec!["--yes", "sweep", "bytecode-batch"];
+    remove_args.extend(files.iter().map(|file| file.to_str().unwrap()));
+    remove_args.extend([
+        "--root",
+        root,
+        "--run",
+        "--authorize-bytecode-removal",
+        "--preview-token",
+        token,
+    ]);
+    let result = fixture.run(&remove_args);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(report["result"]["complete"], true);
+    assert!(files.iter().all(|file| !file.exists()));
+    assert!(
+        names
+            .iter()
+            .all(|name| fixture.repo.join(format!("{name}.py")).is_file())
+    );
 }
 
 fn cli_accepts_real_supported_cpython_timestamp_bytecode_in_namespace(fixture: &Fixture) {
@@ -1717,7 +1782,7 @@ fn cli_rejects_go_workspace_marker_in_bytecode_cache_in_namespace(fixture: &Fixt
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        output_text.contains("artifact inventory or identity is unsuitable for deletion"),
+        output_text.contains("selected target was not found in the scan"),
         "{output_text}"
     );
     assert!(fixture.file.is_file());

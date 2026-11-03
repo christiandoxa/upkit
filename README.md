@@ -42,6 +42,11 @@ open a new terminal:
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
+The installer replaces an existing regular `upkit` file, but refuses a
+directory, symbolic link, or other non-regular destination. The destination
+can still change between this check and the final move; use a trusted install
+directory.
+
 In Fish, run this once to add the directory for current and future sessions:
 
 ```fish
@@ -52,7 +57,7 @@ To install a specific release or choose a different directory:
 
 ```bash
 curl -fsSL https://github.com/christiandoxa/upkit/releases/latest/download/install.sh |
-  sh -s -- --release v0.4.15 --install-dir "$HOME/.local/bin"
+  sh -s -- --release v0.5.0 --install-dir "$HOME/.local/bin"
 ```
 
 ### Windows
@@ -74,7 +79,7 @@ To choose a release or install directory, set these variables before running
 the installer:
 
 ```powershell
-$env:UPKIT_RELEASE = 'v0.4.15'
+$env:UPKIT_RELEASE = 'v0.5.0'
 $env:UPKIT_INSTALL_DIR = "$env:LOCALAPPDATA\upkit\bin"
 irm https://github.com/christiandoxa/upkit/releases/latest/download/install.ps1 | iex
 ```
@@ -90,7 +95,7 @@ Linux binaries target glibc-based distributions.
 ### GitHub Actions
 
 ```yaml
-- uses: christiandoxa/upkit@v0.4.15
+- uses: christiandoxa/upkit@v0.5.0
   with:
     version: latest
 
@@ -143,14 +148,24 @@ the final record without following links. Windows rejects reparse points and
 hard-linked records and holds each record against concurrent writes or renames
 while reading. On macOS and Windows, parent path replacement can still race a
 read; Windows ownership and ACLs are not verified. Private read-only records
-remain readable. On Linux, inspect an age-based selection and its token before
-permanently removing old records:
+remain readable. History purge is implemented for Linux and macOS; the macOS
+path has not received native runtime verification yet. Inspect an age-based
+selection and its token before permanently removing old records:
 
 ```sh
 upkit --non-interactive --json report purge --older-than 30d --preview
 upkit --non-interactive --yes report purge --older-than 30d --run \
   --authorize-history-purge --preview-token TOKEN
 ```
+
+Linux purge uses `openat2`; macOS uses no-follow descriptor-relative opens and
+exclusive quarantine renames. Both require private, user-owned history,
+revalidate the preview, and lock the directory during removal. macOS also
+requires directory sync support: a sync failure during staging leaves a
+recoverable staged record, while a failure after unlink can leave the outcome
+unknown. The APIs compile for the Apple target, but this backend has not been
+run on a Mac. Windows history purge is not supported; existing records remain
+readable there.
 
 On a TTY, `upkit report purge --older-than 30d --preview` opens a read-only Reports preview using the requested age.
 
@@ -162,13 +177,12 @@ The token binds the selected records and their identities; changes require a
 new preview. Records without a finish timestamp are skipped. Linked, invalid,
 or unexpected history entries stop the operation. A purge records a summary
 after execution when there is room; a history-write failure is reported.
-`--dry-run` performs no deletion or history write. Linux purge uses `openat2`,
-private ownership and permissions, revalidation and a bounded lock shared with
-Upkit's history writer. A failure or interruption can leave a staged record;
-same-user changes and older writers that do not use the lock can still race.
-Purge is not supported on macOS or Windows. On Unix the history directory must
-not be accessible to group or other users. Reporting does not send data over
-the network.
+`--dry-run` performs no deletion or history write. A valid record left staged
+by an interrupted purge is shown with a warning and can be reviewed again for
+removal. Invalid files or conflicting slots are preserved and can require
+manual recovery. Same-user changes and older writers that do not use the lock
+can still race. On Unix the history directory must not be accessible to group
+or other users. Reporting does not send data over the network.
 
 Inspect Docker and Podman storage summaries without pruning resources:
 
@@ -324,14 +338,22 @@ corresponding screens. Use Tab or Shift+Tab to switch screens, arrow keys or
 `j`/`k` to navigate, Space to mark toolchains, Enter to review an update, and
 `q` to quit. Press `?` for contextual keyboard help. Updates require confirmation. Non-terminal output retains the CLI
 behavior; `--non-interactive` explicitly disables the dashboard and prompts.
+When a confirmation first opens, Upkit discards pending input before drawing the
+plan and discards early confirmation input after drawing; navigation and
+cancellation remain available. Review the displayed details and then press the confirmation key.
+Terminal input has no timestamp, so delayed input can still arrive later.
 The dashboard summarizes toolchain status, available maintenance information,
-loaded artifact and cache inventories, Doctor results, and the latest local
-operation. It does not scan workspaces automatically; `r` refreshes history.
+loaded artifact and cache inventories, Doctor results, and recent local
+operations. It does not scan workspaces automatically; `r` refreshes history
+and `c` opens the cache screen and starts an inventory.
 
 Automatic pruning of older managed tool directories is currently suspended
 because their ownership cannot yet be verified. Archive installs use unique
 staging directories and retain existing versions. An activation failure may
-leave a staged directory that requires review.
+leave a staged directory that requires review. Toolchain archive downloads are
+limited to 8 GiB even when the server does not advertise a size; a larger release
+cannot be installed until that limit is revisited. Release metadata and other
+HTTP text responses are limited to 32 MiB; larger responses fail the check.
 Node archive installs fetch `SHASUMS256.txt` from nodejs.org for the selected
 version and compare its SHA-256 entry before extraction. They limit extraction
 to 100,000 entries and 3 GiB, and check the expected archive root and required
@@ -378,7 +400,9 @@ permission. Windows managed updates install a new archive and retain the prior
 version; Upkit does not modify the Windows PATH. As of 2026-11-01, Flutter's
 latest stable metadata did not offer a Windows ARM64 archive. Windows and macOS
 installation and update behavior have not been tested natively. Python archive installs
-likewise require the SHA-256 digest supplied by GitHub's release API. Extraction
+prefer the standard `install_only` gzip distribution and require the SHA-256
+digest supplied by GitHub's release API. Free-threaded builds are not selected.
+Extraction
 rejects unsafe paths, links, and special files, including dangling or cyclic
 symlinks, and is limited to 100,000 entries and 3 GiB. The HTML fallback can check versions but cannot install when the API
 digest is unavailable. A checksum from the same release is not an independent
@@ -389,7 +413,15 @@ use `python -m pip`. Creating the active and binary links requires Windows
 symbolic-link permission. Native Windows installation and execution remain
 unverified.
 
-The `install` alias runs the update command. To inspect generated project files
+The `install` alias runs the update command. Set `UPKIT_NO_PATH_UPDATE=1` to
+prevent Upkit from editing shell PATH configuration during toolchain updates.
+On Linux, Upkit refuses to replace a shell configuration when its metadata
+cannot be preserved, including linked files and files with extended attributes;
+it also refuses a linked or shared-writable configuration directory. Add the
+PATH entry manually in these cases. Concurrent changes can still race the final
+replacement. Automatic profile writes on other platforms are not covered by
+this Linux safeguard.
+To inspect generated project files
 without deleting anything, provide one or more workspace roots:
 
 ```bash
@@ -402,8 +434,8 @@ upkit --json sweep scan ~/projects --older-than 30d
 Scan and preview JSON use tagged objects for non-Unicode paths, as described
 under cache management below.
 
-The scanner recognizes selected manifest-backed Cargo, Zig, Maven, Gradle,
-sbt, CMake, Meson, .NET, Flutter/Dart, Python, and JavaScript artifacts. It skips
+The scanner recognizes selected manifest-backed Cargo, Go, Zig, Maven, Gradle,
+sbt, CMake, Meson, Ninja, .NET, Flutter/Dart, Python, and JavaScript artifacts. It skips
 symlinks and filesystem boundaries, and on Linux skips nested mount points.
 On Windows it also skips reparse points and will not descend into directories
 whose volume cannot be verified or differs from the scan root. Path replacement
@@ -417,22 +449,41 @@ not prove that a directory contains no source, especially when measurement is
 incomplete or the tree changes after scanning. Preview flags changed or
 unavailable identity and incomplete inventories as unsuitable for removal.
 Logical sizes count regular-file bytes; on Unix, allocated-size estimates count
-blocks for distinct regular files. On Unix, the first observed multiply linked
-file is reported because other links may keep its blocks allocated. Detection
-is a scan-time observation and is unavailable on other platforms. Estimates
+blocks for distinct regular files. On Unix and Windows, the first observed
+multiply linked file is reported because other links may keep its blocks
+allocated. Detection is a scan-time observation, and a failed Windows link-count
+query marks the estimate incomplete. Estimates
 can be incomplete when access fails and
 are not guaranteed reclaimed space. `--older-than` accepts hours (`h`), days
 (`d`), or weeks (`w`) and uses the newest measured modification in the entire
 artifact tree. Artifacts with incomplete or unknown ages are omitted and
-reported as warnings. Age does not establish that a build is inactive. Go project
-outputs and many custom output locations are not yet inventoried by this scanner;
-the shared Go build cache appears in `cache status`. CMake and
+reported as warnings. Age does not establish that a build is inactive. At a Go
+project root, `build/` and `bin/` are listed as review-only possibilities; their
+contents may be source or user data, so Upkit cannot remove them. Other custom Go
+output locations remain undiscovered; the shared Go build cache appears in
+`cache status`. CMake and
 Meson build directories with generated metadata can be discovered under nested
-paths or custom names; their contents still require review. A Gradle project's
+paths or custom names; their contents still require review. For standalone Ninja
+projects, a root `build.ninja` and a direct `build/.ninja_log` identify a possible
+build directory for inspection only. Upkit does not remove it, and custom build
+directories are not discovered. Ninja's [build log documentation](https://ninja-build.org/manual.html#_the_ninja_log)
+explains that its location can be configured. A Gradle project's
 root `.gradle` directory is also listed for review; its name and manifest do not
 prove that every entry can be regenerated. sbt projects with `build.sbt` expose
 their root `target/` directory as review-only; custom and subproject target
 directories are not discovered. See the [sbt directory reference](https://www.scala-sbt.org/1.x/docs/Directories.html).
+For Cargo, a single project-local `.cargo/config.toml` or `.cargo/config` may
+identify a relative custom target directory within the project. Upkit inventories
+that directory for review only and will not remove it. Ambiguous or unsupported
+local configuration also makes the default `target/` review-only. An ancestor
+or Cargo home config, a known output-directory environment override, or an
+uncheckable configuration also prevents Cargo removal; these checks are repeated
+during removal. Cargo command-line overrides from other processes cannot be
+determined, so the inventory may not reflect the target Cargo currently uses.
+Cargo cleanup requires a workspace root confirmed within the selected scan
+scope; workspace members, excluded packages, and standalone packages without a
+confirmed workspace root remain review-only. Local configuration identity is
+rechecked during removal, but configuration sources can still change between checks.
 Exclusions are paths relative to each root or
 absolute paths. Prefix a root-relative pattern with `glob:`, for example
 `--exclude 'glob:**/vendor'`; `*` does not cross directory separators and `**`
@@ -466,9 +517,28 @@ For JavaScript projects, the default Parcel `.parcel-cache` directory is also
 review-only: its name and `package.json` do not prove that its contents are
 generated. Custom Parcel cache paths are not discovered automatically. See
 [Parcel's cache documentation](https://parceljs.org/features/development/#caching).
+Project-root `coverage/` directories with known coverage report filenames are
+also shown for review. Such a filename does not prove every file in the
+directory is disposable; custom coverage locations are not discovered. See
+[Jest coverage configuration](https://jestjs.io/docs/configuration#coveragedirectory-string).
+The same review applies to `.next` and `.nuxt`: names alone do not prove the
+contents are generated, and custom [Next.js](https://nextjs.org/docs/pages/api-reference/config/next-config-js/distDir)
+or [Nuxt](https://nuxt.com/docs/2.x/api/configuration/configuration-builddir)
+output paths are not discovered.
 The default Vite `node_modules/.vite` directory is likewise review-only;
 its contents are not verified as generated, and custom `cacheDir` paths are
 not discovered. See [Vite's cacheDir documentation](https://vite.dev/config/shared-options#cachedir).
+Angular CLI's default `.angular/cache` is a review candidate in a project with
+`package.json` and a bounded, readable `angular.json` identifying a workspace.
+Its contents are not verified as disposable, and custom cache paths are not
+discovered. See [Angular's cache configuration](https://angular.dev/cli/cache).
+SvelteKit's `.svelte-kit` output is also review-only and cannot be removed by
+Upkit. Discovery requires a direct `@sveltejs/kit` package manifest; manifests
+over 1 MiB are skipped. The [SvelteKit configuration](https://svelte.dev/docs/kit/@sveltejs-kit-vite)
+documents `.svelte-kit` as the default configurable `outDir`. Linux kernels
+without `openat2` skip this discovery. The Windows reader checks reparse points
+and volume boundaries, but concurrent path replacement can still race its checks;
+native Windows behavior has not yet been verified.
 In projects with `build.zig`, Upkit recognizes `.zig-cache` and marks `zig-out`
 for review because installed output can include user data. Neither directory is
 removed without an explicit selection and confirmation.
@@ -549,16 +619,52 @@ Readers inspect path components without following links, but directories can
 still change between checks. Linux and macOS size estimates may be incomplete
 and do not guarantee reclaimed space.
 
+Empty or relative values for recognized cache-directory environment overrides
+and `XDG_CACHE_HOME` are reported as unresolved and block Linux shared-cache
+removal. On Linux, Cargo output paths configured by environment variables or by
+the current directory's ancestor Cargo configuration and `CARGO_HOME` are
+inventoried without granting removal permission. An overlap blocks shared-cache
+removal; unreadable, ambiguous, included, or templated configuration can also
+block it. Cargo command-line overrides and configuration outside that search
+are not visible to Upkit, so other output paths may be missed.
+
+npm environment paths containing unsupported variable expansion are also
+unresolved. npm cache and log-directory keys are matched without regard to case;
+conflicting absolute cache values are inventoried as possible locations but cannot
+be removed until the conflict is resolved. Upkit reads the user `.npmrc`, bounded
+ancestor project `.npmrc` files, absolute `npm_config_userconfig` and
+`npm_config_globalconfig` paths, and their user/global redirects with a bounded
+parser. It accepts absolute paths, `~/`, and `${HOME}` when the home value is
+known; unresolved paths, unsupported syntax, unreadable files, or exceeded limits
+block shared-cache removal. Cache paths found only in npm configuration are
+inspection-only, and npm log directories are protected. When `NPM_CONFIG_PREFIX`,
+`PREFIX`, or a readable `.npmrc` sets an absolute prefix, Upkit also reads
+`$PREFIX/etc/npmrc` as a possible global config path, following npm's documented
+default ([npm v6](https://docs.npmjs.com/cli/v6/configuring-npm/npmrc/),
+[current npm](https://docs.npmjs.com/cli/using-npm/config/)). That candidate does
+not verify the effective global config: npm loads builtin config before env
+settings, so a builtin `globalconfig` can replace the default, and CLI options are
+not visible to Upkit. See [npm's config loader](https://github.com/npm/cli/blob/latest/workspaces/config/lib/index.js).
+Shared-cache removal still requires
+`NPM_CONFIG_GLOBALCONFIG` to name an absolute path. Conflicting prefix environment
+aliases, relative or unresolved prefixes, and symlinked candidate paths block
+removal. Warnings do not print configured values. Unset environment variables
+continue to use their defaults.
+
 Maven discovery reads only the user-level `~/.m2/settings.xml`, capped at
 256 KiB, and uses its direct `<localRepository>` value when it is an absolute
 path or uses `${user.home}`. Missing settings use Maven's default repository.
 Malformed, linked, oversized, relative, duplicate, DTD-based, or otherwise
 ambiguous settings leave the location unverified: Maven is omitted from the
 inventory and Linux shared-cache removal is blocked until the settings can be
-resolved. Diagnostics never print settings contents or credentials. Maven
-global settings, `MAVEN_OPTS`, and command-line `-Dmaven.repo.local` overrides
-are not inspected, so they may select a different repository. Concurrent
-replacement of `.m2` can still race the settings inspection.
+resolved. Diagnostics never print settings contents or credentials. Linux
+shared-cache removal also stops when recognized Maven or Java environment
+options, observed project/user configuration, or installation configuration
+may redirect the repository. This conservative check can block removal even
+when a detected configuration does not actually change the repository. Maven
+installation paths not exposed in the environment, other projects and command
+lines of other processes remain uninspected. Concurrent configuration changes
+can still race these checks.
 
 The pnpm inventory uses `PNPM_CONFIG_STORE_DIR`, `PNPM_HOME`, `XDG_DATA_HOME`,
 or platform defaults in that order. It does not read pnpm configuration files or
@@ -575,13 +681,17 @@ uv advises against modifying it directly and provides its own cache commands.
 See [uv's cache documentation](https://docs.astral.sh/uv/concepts/cache/).
 
 The Bun package cache is inventory-only. Upkit checks the documented default or
-an absolute or `~/`-prefixed `BUN_INSTALL_CACHE_DIR`, and separately tracks a different
-`BUN_INSTALL` cache-command target. Unresolvable environment paths block Linux
-shared-cache removal; known Bun paths are also protected from overlapping
-removal. Bun configuration files and command-line overrides are not inspected
-and may choose other locations that overlap a selected cache. Bun can hard-link
-packages into projects, so cache sizes do not guarantee reclaimed space. See
-Bun's [global cache](https://bun.com/docs/pm/global-cache) and
+an absolute or `~/`-prefixed `BUN_INSTALL_CACHE_DIR`, tracks a `BUN_INSTALL`
+cache-command target, and protects cache paths from the global `.bunfig.toml`,
+`bunfig.toml` files in the current directory's ancestor chain, and `.npmrc`
+cache settings, including the XDG user config location. It unions observed paths
+without inferring which setting wins;
+unreadable, linked, malformed, ambiguous, or unresolved config blocks Linux
+shared-cache removal. Bun's per-command `--cache-dir` and `--config` options,
+and cache paths supplied through `.env`, may still point elsewhere. Bun can
+hard-link packages into projects, so cache sizes do not guarantee reclaimed
+space. See Bun's [global cache](https://bun.com/docs/pm/global-cache),
+[configuration](https://bun.com/docs/runtime/bunfig), [.npmrc support](https://bun.com/docs/pm/npmrc), and
 [cache commands](https://bun.com/docs/pm/cli/pm) documentation.
 
 NuGet package folders and local feeds are inventory-only. Upkit includes the
@@ -654,11 +764,13 @@ UTF-16 code unit and unescaped printable ASCII for the rest. This applies to
 scan and preview roots, candidate paths, marker paths, and Cargo workspace
 evidence. Linux artifact and CPython bytecode removal plans, scope paths,
 bytecode batch results, cache inventory and Go test-cache preview paths, and
-Trash location paths use the same representation; their preview tokens retain
+Trash location paths use the same representation; `paths --json` uses it for
+home, binary directory, and path-check entries as well. Preview tokens retain
 the original path bytes. Bytecode filenames must still use a supported CPython
 name. These objects are for reporting; `--select` and other path arguments still
-require the original OS path. Other commands do not yet consistently support
-non-Unicode paths.
+require the original OS path. Non-Unicode paths are not automatically written
+to shell configuration; add them manually. Other commands do not yet consistently
+support non-Unicode paths.
 
 On Linux, cache inventory and artifact previews also report a bounded snapshot
 of same-user process working directories, executables, and open handles under each target.
@@ -894,9 +1006,10 @@ to apply the new frequency.
 An optional `enabled_ecosystems` list can also be set globally or in a profile.
 When both are present, only their intersection is scanned. Omit the field for
 all supported ecosystems, or use `[]` for none. Accepted names are `cargo`, `go`, `zig`,
-`cmake`, `meson`, `gradle`, `maven`, `sbt`, `dotnet`, `flutter`, `dart`,
-`python`, and `javascript`. Go project artifacts are not yet discovered, even
-when `go` is enabled. Flutter `build` and Dart `.dart_tool` are separate entries.
+`cmake`, `meson`, `ninja`, `gradle`, `maven`, `sbt`, `dotnet`, `flutter`, `dart`,
+`python`, and `javascript`. With `go` enabled, only root `build/` and `bin/`
+directories are listed for inspection; they cannot be removed. Other Go output
+locations are not discovered. Flutter `build` and Dart `.dart_tool` are separate entries.
 Recognized artifact subtrees belonging to disabled ecosystems are skipped to
 avoid walking large generated trees; the scan warns that nested projects may
 not be detected there and is marked incomplete.
@@ -921,17 +1034,22 @@ upkit update dotnet
 Java targets the latest Eclipse Temurin LTS JDK. Upkit verifies the archive
 SHA-256 from the [Adoptium release metadata](https://adoptium.net/installation/gpg-verification)
 before extracting it into a new managed directory. Extraction is limited to
-100,000 entries and 3 GiB. Selected JDK executables are linked into the Upkit
+100,000 entries and 3 GiB. The initial archive URL must use GitHub or the
+Adoptium API; HTTP redirects are not restricted to those hosts. Selected JDK executables are linked into the Upkit
 binary directory; `JAVA_HOME` is not changed. Earlier managed versions remain
 in place. A checksum from the same metadata is not independent signature
 verification.
 
 .NET targets the latest supported LTS SDK using [Microsoft release metadata](https://github.com/dotnet/core/blob/main/release-notes/README.md).
 Upkit verifies the archive's SHA-512 before extraction, limited to 100,000 entries
-and 3 GiB. The checksum is not independent signature verification. Detection
+and 3 GiB. The initial archive URL must use an identified Microsoft download
+host; HTTP redirects are not restricted to that host. The checksum is not
+independent signature verification. Detection
 infers stable SDK versions from directories beside the resolved executable
-without running it; it does not verify their integrity. Earlier managed versions
-remain, and `DOTNET_ROOT` is not changed. The SDK may require additional system
+without running it. A version counts only if its SDK directory contains a
+nonempty `dotnet.dll` resolved inside that installation root; this layout check
+does not verify integrity. Earlier managed versions remain, and `DOTNET_ROOT` is
+not changed. The SDK may require additional system
 libraries provided by the operating system.
 
 For both providers, Windows ZIP extraction rejects links, unsafe or duplicate
@@ -961,7 +1079,8 @@ upkit uninstall
 
 In an interactive Linux terminal, these commands open the Toolchains screen.
 On the Toolchains screen, `/` filters by tool name, version, status, or notes.
-Marks remain selected when hidden by the filter. On the Toolchains screen,
+Press `r` to refresh the toolchain inventory in the background. Marks remain
+selected when hidden by the filter. On the Toolchains screen,
 `Space` marks a cleanup target and `D` opens one combined preview for all marked
 targets; if none are marked, `D` previews the selected tool. Use `d` to preview
 only the selected tool. The combined preview lists every selected root, its
@@ -985,12 +1104,18 @@ limits can prevent cleanup. A failed seal does not prevent installation. If the
 receipt directory is missing or damaged, or the configured binary directory has
 changed, preview fails closed. Restore the original binary directory and inspect
 the old links and receipts before repairing them manually. These receipts do not
-authenticate data against another process running as the same user.
+authenticate data against another process running as the same user. The read-only
+preview reports whether the managed home, tool root, or binary directory is
+writable by group or others. Removal refuses an eligible plan with such a
+directory and checks the opened directory modes again before staging and after
+staging; a detected change restores the staged paths.
 
 Before a batch begins removing anything, Upkit rechecks every target plan and
-process activity. A changed plan or observed process using any selected root
-vetoes the entire batch before its first removal; stop the process and preview
-again. An incomplete process inspection is a warning and can miss active use.
+process activity. A changed plan, an eligible target with a group/other-writable
+managed path, or an observed process using any selected root vetoes the entire
+batch before its first removal; fix the directory permissions or stop the
+process, then preview again. An incomplete process inspection is a warning and
+can miss active use.
 Each target is checked again as it is processed. Process visibility, concurrent
 filesystem changes, and mounts can still race with cleanup. A failure,
 unverified result, history warning, or cancellation stops later targets;
@@ -1128,6 +1253,12 @@ is the `upkit-scan.timer` LaunchAgent; on Windows it is `\Upkit-Workspace-Scan`.
 Windows status is available only when the task path, task XML,
 current-user SID, task owner, access rules, and state can all be verified. A
 missing or unavailable manager is reported separately.
+On Linux, manager output reads have a timeout. A timed-out schedule change may
+still have taken effect; inspect the manager state before retrying. A child
+process spawned by an external manager can outlive the timeout.
+On macOS, timed-out `launchctl` calls attempt to stop their process group.
+External child reaping can release process IDs before this signal, so that
+protection is not a guarantee in environments that reap Upkit's children.
 
 In a terminal, the `schedule preview*` commands open a scrollable, read-only
 Ratatui preview. The `add`, `enable`, `disable`, `edit`, and `remove` commands
@@ -1245,9 +1376,23 @@ there are more than 32 caches or files, cache order rotates weekly in UTC and th
 file window advances after each full cache cycle, without storing a cursor.
 Repeated runs in the same week can inspect the same
 ineligible entries; additions or removals can shift the window, so this does not
-guarantee every file will be cleaned. Cleanup stops
-when history is unavailable or lacks room; history can still become unavailable
-after its capacity check, leaving an already completed removal without a local record.
+guarantee every file will be cleaned. Each removal reserves an unfinished local
+history record before it starts; an interrupted operation or history write can
+leave that record unfinished. Cleanup stops if a record cannot be reserved.
+
+For scheduled project artifact cleanup on Linux, a profile can instead or also
+set `scheduled_artifact_cleanup = true`, list its enabled ecosystems, and set
+`artifact_retention` to at least `30d`. Review and authorize the same schedule
+preview before installation. Each run selects at most eight eligible Maven
+`target`, Zig `.zig-cache`, Dart `.dart_tool`, or Python `.pytest_cache`
+and `.mypy_cache` directories within the approved roots. The scope and policy,
+Git evidence, activity, identity and contents are rechecked before removal. A
+failure stops subsequent artifact removals and can leave files in quarantine.
+History records an attempt before each removal; a crash or failed history write
+can leave an unfinished record that the in-app history purge skips and that may
+require manual recovery. Reclaimed space is not guaranteed by the size estimate.
+Scheduled Cargo removal is unavailable until Cargo's inherited configuration and
+target identity can be verified across preview and execution.
 
 In the Automation screen, `d` opens the same disable preview. Review the wrapped
 plan with the arrow or Page Up/Down keys; `y` confirms only after the complete
@@ -1332,8 +1477,8 @@ entry with the same mount point and filesystem type. Duplicate, malformed,
 missing, or unmatched entries remain unknown. `not_observed` describes only
 that entry; it does not prove the entry applies, the timer honors it, or that
 FITRIM is supported.
-In the maintenance screen, select a mount and press Enter to review a TRIM plan; `y`
-confirms it. On Linux, manual TRIM is also available through an explicit
+On Linux, the maintenance screen lets you select a mount and press Enter to
+review a TRIM plan; `y` confirms it. Manual TRIM is also available through an explicit
 non-interactive preview and authorization:
 
 ```bash
@@ -1350,6 +1495,17 @@ not elevate privileges or change timers. TRIM affects unused blocks throughout
 the filesystem and does not increase its free-space figure. A mount can still
 change between the final check and the system command. Manual TRIM on other
 platforms is not implemented.
+
+On macOS, status reads the root filesystem type and available space, and checks
+direct children of `/Volumes` for mounts on a different device. This is a partial
+inventory: other mount locations and mounts sharing a device identity can be
+omitted. It does not establish device TRIM support or the system maintenance
+schedule. On Windows, the read-only `fsutil` query reports filesystem
+delete-notification settings, not device support. Windows also inventories
+filesystem types and user-available space on fixed volumes with drive letters;
+network drives, removable drives and volumes mounted only in folders are omitted.
+Failed volume queries are marked incomplete. Dry-run skips these queries. Native
+macOS and Windows behavior has not yet been verified.
 
 Inspect Trash without deleting items:
 
@@ -1368,15 +1524,24 @@ It estimates the total logical size of regular files without reading their
 contents, within a 100,000-entry and 128-level limit. Symlinks, special files,
 and entries on different devices are skipped and mark the estimate incomplete;
 same-device mounts are not detected, and hard links are counted per entry.
-Trash on other volumes and per-item sizes are not available.
+Upkit also checks direct mounted children of `/Volumes` for a user-owned
+`.Trashes/<effective UID>` directory. This undocumented layout is a heuristic,
+not a complete Finder inventory: same-device mounts, other mount paths and
+other Trash layouts can be omitted. Volume inspection is capped at 256 entries,
+10,000 listed Trash items and 100,000 size-walk entries across volumes; limits
+or inaccessible locations are reported as incomplete. Per-item sizes are not
+available.
 Access may be denied by macOS privacy controls, and a slow filesystem can delay
 inspection. This integration has not been tested natively.
 
 On Windows, status uses the system PowerShell host and the Shell's virtual
-Recycle Bin to report an item count. No filesystem path is assumed; JSON reports
-the virtual location's path as `null`. Item names, sizes, dates, and removal are
-not available. The query has a two-second process timeout; resolving the system
-host or starting a process can still be delayed, including on a mapped drive.
+Recycle Bin to report an item count and an estimated total logical size of
+measurable files. Folders and unmeasurable entries are excluded and mark the
+size incomplete; inspection is limited to 100,000 items. No filesystem path is
+assumed; JSON reports the virtual location's path as `null`. Item names,
+individual sizes, dates, and removal are not available. The query has a
+two-second process timeout; resolving the system host or starting a process can
+still be delayed, including on a mapped drive.
 This Windows integration has not been tested natively.
 
 On Linux this inventories the FreeDesktop home Trash and accessible user-owned
@@ -1559,6 +1724,11 @@ upkit self-update
 Standalone self-update runs the release installer and compares the binary with
 that release's `SHA256SUMS` before replacing it; this does not independently
 authenticate the release. Cargo installations continue using Cargo.
+In an interactive terminal, the command opens a Ratatui preview. You can also
+press `U` on the Toolchains screen. The preview identifies the program and
+operation; it must fit on screen before confirmation. The selected executable
+can still change at the same path after review. Non-interactive use retains the
+existing `--yes` requirement.
 You can also update a standalone installation by running its installer again.
 
 Generate shell completions:
@@ -1590,6 +1760,12 @@ Rustup, because those programs can write files. Installed versions may therefore
 be reported as unknown, and an update plan may need a normal check before it can
 identify the exact action. Release metadata may still be fetched unless offline
 mode is enabled.
+
+In offline mode, Upkit skips its network requests and does not run Go, Rust or
+Flutter version commands that can bootstrap or download toolchains. Their
+installed versions may be unknown; managed Windows Flutter metadata can still
+be read locally. Other external executables may have their own network behavior,
+so `--offline` is not a network sandbox.
 
 ## Paths
 

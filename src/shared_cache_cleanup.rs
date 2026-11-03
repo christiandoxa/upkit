@@ -542,6 +542,7 @@ mod linux {
                 .env_clear()
                 .env("HOME", &home)
                 .env("PATH", "/usr/bin:/bin")
+                .env("NPM_CONFIG_GLOBALCONFIG", home.join("npm-global.npmrc"))
                 .env("GOENV", &go_env)
                 .env("GOCACHE", &target)
                 .env("XDG_CONFIG_HOME", home.join("config"))
