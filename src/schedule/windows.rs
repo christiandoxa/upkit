@@ -2399,43 +2399,30 @@ mod tests {
         // users. This security test must provision the *private* directory
         // that the production Task Scheduler workflow requires, not weaken
         // ACL verification to accept the runner's inherited ACL.
-        let restrict_acl = r#"
-$ErrorActionPreference = 'Stop'
-$identity = [System.Security.Principal.SecurityIdentifier]::new($env:UPKIT_TASK_SID)
-$acl = Get-Acl -LiteralPath $env:UPKIT_TASK_ACL_PATH
-$acl.SetAccessRuleProtection($true, $false)
-foreach ($rule in @($acl.Access)) {
-    [void]$acl.RemoveAccessRuleSpecific($rule)
-}
-foreach ($trusted in @($env:UPKIT_TASK_SID, 'S-1-5-18', 'S-1-5-32-544')) {
-    $principal = [System.Security.Principal.SecurityIdentifier]::new($trusted)
-    $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
-        $principal,
-        [System.Security.AccessControl.FileSystemRights]::FullControl,
-        [System.Security.AccessControl.InheritanceFlags]3,
-        [System.Security.AccessControl.PropagationFlags]::None,
-        [System.Security.AccessControl.AccessControlType]::Allow
-    )
-    $acl.AddAccessRule($rule)
-}
-$acl.SetOwner($identity)
-Set-Acl -LiteralPath $env:UPKIT_TASK_ACL_PATH -AclObject $acl
-"#;
-        let configured = std::process::Command::new(&powershell)
-            .args([
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                restrict_acl,
-            ])
-            .env("UPKIT_TASK_SID", &sid)
-            .env("UPKIT_TASK_ACL_PATH", &directory_path)
+        let icacls = system_binary("icacls.exe").unwrap();
+        // Grant the current user and the two trusted built-in principals
+        // before removing inherited entries, so the test directory stays
+        // accessible throughout ACL setup.
+        let grant = std::process::Command::new(&icacls)
+            .arg(&directory_path)
+            .arg("/grant:r")
+            .arg(format!("*{sid}:(OI)(CI)F"))
+            .arg("*S-1-5-18:(OI)(CI)F")
+            .arg("*S-1-5-32-544:(OI)(CI)F")
             .output()
             .unwrap();
         assert!(
-            configured.status.success(),
-            "could not create a private Task Scheduler ACL test fixture"
+            grant.status.success(),
+            "could not grant the private Task Scheduler ACL fixture permissions"
+        );
+        let restrict = std::process::Command::new(&icacls)
+            .arg(&directory_path)
+            .arg("/inheritance:r")
+            .output()
+            .unwrap();
+        assert!(
+            restrict.status.success(),
+            "could not remove inherited Task Scheduler ACL fixture permissions"
         );
         verify_private_acl(&directory_path, &sid, &powershell).unwrap();
         let (path, stored) = with_safe_task_xml(&directory_path, &xml, &sid, &powershell, |path| {
