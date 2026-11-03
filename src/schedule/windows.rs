@@ -1725,7 +1725,8 @@ fn with_safe_task_xml<T>(
     const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const SHARE_READ: u32 = 0x0000_0001;
     let directory_identity = file_identity(directory, true)?;
-    verify_private_acl(directory, sid, powershell)?;
+    verify_private_acl(directory, sid, powershell)
+        .context("verify private Task Scheduler XML parent-directory ACL")?;
     let mut temp = tempfile::NamedTempFile::new_in(directory)
         .context("create private Task Scheduler XML file")?;
     temp.write_all(xml.as_bytes())?;
@@ -1753,7 +1754,8 @@ fn with_safe_task_xml<T>(
     if bytes.len() > TASK_XML_LIMIT || bytes != xml.as_bytes() {
         bail!("Task Scheduler XML file changed before registration");
     }
-    verify_private_acl(&temp_path, sid, powershell)?;
+    verify_private_acl(&temp_path, sid, powershell)
+        .context("verify private Task Scheduler XML temporary-file ACL")?;
     if file_identity(directory, true)? != directory_identity
         || file_identity(&temp_path, false)? != original_identity
     {
@@ -2536,6 +2538,10 @@ try {
             let diagnostic = format!("{error:#}");
             let category = if diagnostic.contains("canonical absolute Windows paths") {
                 "path_noncanonical"
+            } else if diagnostic.contains("temporary-file ACL") {
+                "temp_file_acl"
+            } else if diagnostic.contains("parent-directory ACL") {
+                "parent_directory_acl"
             } else if diagnostic.contains("XML path ACL") {
                 "file_or_directory_acl"
             } else if diagnostic.contains("utility timed out") {
