@@ -3578,31 +3578,28 @@ fn windows_go_environment_components(
     if !path.is_absolute() {
         return Err(());
     }
-    let components = path.components().collect::<Vec<_>>();
-    if components
-        .iter()
+    if path
+        .components()
         .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
+        || path.file_name().is_none()
     {
         return Err(());
     }
-    let last_normal = components
-        .iter()
-        .rposition(|part| matches!(part, Component::Normal(_)))
-        .ok_or(())?;
-    let mut current = PathBuf::new();
+    // An absolute Windows path may begin with a verbatim prefix such as
+    // `\\?\C:\`. Rebuilding it from its prefix component creates an
+    // invalid intermediate `\\?\C:` and fails before we inspect the file.
+    // Existing ancestors give complete paths, including the volume root.
     let mut identities = Vec::new();
-    for (index, part) in components.into_iter().enumerate() {
-        current.push(part.as_os_str());
-        if !matches!(part, Component::Normal(_)) {
+    for current in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
+        if current.file_name().is_none() {
             continue;
         }
-        let directory = index != last_normal;
-        if fs::symlink_metadata(&current)
-            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-        {
-            return Ok(None);
+        let directory = current != path;
+        match fs::symlink_metadata(current) {
+            Ok(_) => identities.push(windows_go_path_identity(current, directory)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(()),
         }
-        identities.push(windows_go_path_identity(&current, directory)?);
     }
     Ok(Some(identities))
 }

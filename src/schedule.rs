@@ -597,8 +597,9 @@ mod launchd_plist_tests {
         use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
         let fixture = tempfile::tempdir().unwrap();
-        let directory_path = fixture.path().join("LaunchAgents");
-        let root = fixture.path().join("workspace");
+        let fixture_root = fixture.path().canonicalize().unwrap();
+        let directory_path = fixture_root.join("LaunchAgents");
+        let root = fixture_root.join("workspace");
         fs::create_dir(&directory_path).unwrap();
         fs::set_permissions(&directory_path, fs::Permissions::from_mode(0o700)).unwrap();
         fs::create_dir(&root).unwrap();
@@ -626,7 +627,7 @@ mod launchd_plist_tests {
         assert!(!directory_path.join(LAUNCHD_PLIST).exists());
         assert!(!directory_path.join(".fixture.plist").exists());
 
-        let target = fixture.path().join("outside");
+        let target = fixture_root.join("outside");
         fs::write(&target, "fixture").unwrap();
         symlink(&target, directory_path.join(LAUNCHD_PLIST)).unwrap();
         assert!(launchd_read_plist(&directory, LAUNCHD_PLIST).is_err());
@@ -753,7 +754,8 @@ esac
         use std::os::unix::fs::symlink;
 
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("workspace");
+        let fixture_root = directory.path().canonicalize().unwrap();
+        let root = fixture_root.join("workspace");
         fs::create_dir(&root).unwrap();
         let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
         let token = scheduled_scope_token(&executable, std::slice::from_ref(&root), &[]).unwrap();
@@ -762,11 +764,11 @@ esac
             scheduled_scope_token(&executable, std::slice::from_ref(&root), &[]).unwrap()
         );
 
-        let link = directory.path().join("workspace-link");
+        let link = fixture_root.join("workspace-link");
         symlink(&root, &link).unwrap();
         assert!(scheduled_scope_token(&executable, &[link], &[]).is_err());
 
-        fs::rename(&root, directory.path().join("old-workspace")).unwrap();
+        fs::rename(&root, fixture_root.join("old-workspace")).unwrap();
         fs::create_dir(&root).unwrap();
         assert_ne!(
             token,
@@ -778,8 +780,9 @@ esac
     #[test]
     fn macos_preview_rejects_automatic_bytecode_cleanup_policy() {
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("workspace");
-        let config = directory.path().join("config.toml");
+        let fixture_root = directory.path().canonicalize().unwrap();
+        let root = fixture_root.join("workspace");
+        let config = fixture_root.join("config.toml");
         fs::create_dir(&root).unwrap();
         let settings = crate::config::Settings {
             workspace_roots: vec![root],
