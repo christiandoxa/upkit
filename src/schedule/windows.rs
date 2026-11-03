@@ -1666,7 +1666,15 @@ fn disable_preview_from_existing(existing: &ExistingTask) -> Result<DisableSched
 const TASK_ACL_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 $sid = $env:UPKIT_TASK_SID
-$acl = Get-Acl -LiteralPath $env:UPKIT_TASK_ACL_PATH
+$aclPath = $env:UPKIT_TASK_ACL_PATH
+# Do not rely on Get-Acl: it requires PowerShell module autoload, which can
+# fail under restricted Windows CI or user environments. The .NET Framework
+# filesystem ACL APIs are available to the trusted system PowerShell host.
+if ([System.IO.Directory]::Exists($aclPath)) {
+    $acl = [System.IO.Directory]::GetAccessControl($aclPath)
+} else {
+    $acl = [System.IO.File]::GetAccessControl($aclPath)
+}
 $sections = [System.Security.AccessControl.AccessControlSections]::Access -bor [System.Security.AccessControl.AccessControlSections]::Owner
 $sddl = $acl.GetSecurityDescriptorSddlForm($sections)
 if (-not (Test-UpkitTaskAcl $sddl $sid)) { exit 4 }
