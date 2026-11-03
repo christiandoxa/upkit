@@ -1062,9 +1062,20 @@ fn system_binary(name: &str) -> Result<PathBuf> {
 
 #[cfg(target_os = "windows")]
 fn run_command(
+    command: std::process::Command,
+    input: Option<&[u8]>,
+    limit: usize,
+) -> Result<Vec<u8>> {
+    // Production commands keep the strict ten-second deadline.
+    run_command_with_timeout(command, input, limit, std::time::Duration::from_secs(10))
+}
+
+#[cfg(target_os = "windows")]
+fn run_command_with_timeout(
     mut command: std::process::Command,
     input: Option<&[u8]>,
     limit: usize,
+    timeout: std::time::Duration,
 ) -> Result<Vec<u8>> {
     use std::{
         io::{Read, Write},
@@ -1083,7 +1094,7 @@ fn run_command(
         .stderr(Stdio::null())
         .spawn()
         .context("start Windows Task Scheduler utility")?;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + timeout;
     let input_result = if let Some(input) = input {
         let mut stdin = child.stdin.take().context("open Task Scheduler input")?;
         let input = input.to_vec();
@@ -2714,6 +2725,12 @@ try {
             "-Command",
             &script,
         ]);
-        assert_eq!(run_command(command, None, 4096).unwrap(), b"ERROR");
+        // Hosted Windows ARM64 may take more than ten seconds to initialize
+        // cold PowerShell/COM; allow a test-only bounded 45-second window.
+        assert_eq!(
+            run_command_with_timeout(command, None, 4096, std::time::Duration::from_secs(45))
+                .unwrap(),
+            b"ERROR"
+        );
     }
 }

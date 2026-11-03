@@ -4,7 +4,20 @@
 
 The stable release remains gated on 90% line coverage and final review.
 
-## 0.5.0-rc.1 (2026-11-03) — prerelease
+## 0.5.0-rc.2 (2026-11-03) — prerelease
+
+- Release candidate replacing the unpublished `rc.1` attempt, whose build
+  matrix did not finish successfully.
+- Make the Windows ARM64 Task Scheduler PowerShell lookup test tolerant of
+  slow hosted-runner cold starts; production utility timeout remains 10 seconds.
+- Do not run the interactive dashboard PTY smoke on macOS release runners
+  because it stalled there; native macOS tests, binary verification, standalone
+  linkage checks and binary smoke tests remain required. Interactive macOS TUI
+  smoke remains a known limitation of this prerelease.
+- Line coverage remains below the 90% stable-release gate; this is **not a
+  stable release** and must not replace the current stable `Latest` release.
+
+## 0.5.0-rc.1 (2026-11-03) — tagged, not published
 
 Release candidate for cross-platform evaluation. All six primary CI jobs
 passed on 2026-11-03, but line coverage was **83.42%**, short of the 90%

@@ -6,7 +6,7 @@ Upkit is a standalone developer environment manager with a keyboard-first
 terminal dashboard, toolchain management, workspace artifact discovery, and
 selected maintenance operations.
 
-This document describes the current source tree. The `v0.5.0-rc.1`
+This document describes the current source tree. The `v0.5.0-rc.2`
 release candidate is intended for evaluation and is **not** the stable channel.
 Line coverage remains below the 90% stable-release requirement. The install
 examples below use the latest published stable release (`v0.4.15`), not the
