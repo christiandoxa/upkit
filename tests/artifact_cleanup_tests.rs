@@ -1360,6 +1360,7 @@ fn nested_bind_mount_makes_artifact_inventory_incomplete_and_refuses_removal() {
         .arg(&f.project)
         .arg(&f.target)
         .env_clear()
+            .envs(std::env::vars_os().filter(|(key, _)| key == "LLVM_PROFILE_FILE"))
         .env("HOME", &f.home)
         .env("XDG_CONFIG_HOME", f.home.join("config"))
         .env("XDG_DATA_HOME", f.home.join("data"))

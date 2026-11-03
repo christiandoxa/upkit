@@ -17,6 +17,14 @@ import time
 from pathlib import Path
 
 
+def coverage_env(env):
+    """Forward only the opt-in coverage output path to isolated TUI children."""
+    profile = os.environ.get("LLVM_PROFILE_FILE")
+    if profile is None:
+        return env
+    return {**env, "LLVM_PROFILE_FILE": profile}
+
+
 def controlling_pty_preexec(slave_fd):
     """Give a PTY child its own controlling terminal for accurate size checks."""
     def attach():
@@ -192,7 +200,7 @@ def build_terminal_test_binary(target_dir):
     build = subprocess.run(
         [cargo, "test", "--locked", "--offline", "--lib", "--no-run", "--message-format=json"],
         cwd=repository,
-        env=build_env,
+        env=coverage_env(build_env),
         capture_output=True,
         text=True,
     )
@@ -242,7 +250,7 @@ def terminal_restoration_pty_test():
                     stdin=slave,
                     stdout=slave,
                     stderr=slave,
-                    env=env,
+                    env=coverage_env(env),
                     preexec_fn=controlling_pty_preexec(slave),
                 )
                 output = bytearray()
@@ -336,7 +344,7 @@ def doctor_configuration_pty_test(binary):
             stdin=slave,
             stdout=slave,
             stderr=slave,
-            env=env,
+            env=coverage_env(env),
             preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
@@ -388,7 +396,7 @@ def build_managed_install_fixture_worker(target_dir):
             "--message-format=json",
         ],
         cwd=repository,
-        env=build_env,
+        env=coverage_env(build_env),
         capture_output=True,
         text=True,
     )
@@ -435,7 +443,7 @@ def create_managed_install_fixture(worker, fixture_root, tools, namespace_prefix
             "--nocapture",
         ],
         cwd=Path(__file__).resolve().parents[1],
-        env=env,
+        env=coverage_env(env),
         capture_output=True,
         text=True,
     )
@@ -516,7 +524,7 @@ def trim_preview_read_only_pty_test(binary):
             stdin=slave,
             stdout=slave,
             stderr=slave,
-            env=env,
+            env=coverage_env(env),
             preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
@@ -605,7 +613,7 @@ def go_test_preview_read_only_pty_test(binary):
             stdin=slave,
             stdout=slave,
             stderr=slave,
-            env=env,
+            env=coverage_env(env),
             preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
@@ -700,7 +708,7 @@ def artifact_preview_read_only_pty_test(binary):
             stdin=slave,
             stdout=slave,
             stderr=slave,
-            env=env,
+            env=coverage_env(env),
             preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
@@ -794,7 +802,7 @@ def go_output_preview_fails_closed_pty_test(binary):
             stdin=slave,
             stdout=slave,
             stderr=slave,
-            env=env,
+            env=coverage_env(env),
             preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
@@ -893,7 +901,7 @@ def temp_cleanup_review_pty_test(binary):
             stdin=slave,
             stdout=slave,
             stderr=slave,
-            env=env,
+            env=coverage_env(env),
             preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
@@ -1050,7 +1058,7 @@ def history_purge_pty_test(binary):
             stdin=preview_slave,
             stdout=preview_slave,
             stderr=preview_slave,
-            env=env,
+            env=coverage_env(env),
             preexec_fn=controlling_pty_preexec(preview_slave),
         )
         preview_output = bytearray()
@@ -1104,7 +1112,7 @@ def history_purge_pty_test(binary):
             stdin=slave,
             stdout=slave,
             stderr=slave,
-            env=env,
+            env=coverage_env(env),
             preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
@@ -1223,7 +1231,7 @@ def structured_settings_form_pty_test(binary):
             stdin=slave,
             stdout=slave,
             stderr=slave,
-            env=env,
+            env=coverage_env(env),
             preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
@@ -1422,7 +1430,7 @@ def managed_cleanup_pty_test(binary):
             command = [binary, "--timeout", "1", "--retries", "0", "--home", str(managed), "--bindir", str(bindir), "clean", "go"]
             if isolated:
                 command = [unshare, *namespace_args, *command]
-            child = subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=controlling_pty_preexec(slave))
+            child = subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave, env=coverage_env(env), preexec_fn=controlling_pty_preexec(slave))
             output = bytearray()
             try:
                 deadline = time.monotonic() + 15
@@ -1524,7 +1532,7 @@ def managed_cleanup_pty_test(binary):
                 assert not (bindir / "go").is_symlink()
                 assert shell.read_text() == "# upkit (go GOBIN)\nexport PATH=\"/fixture:$PATH\"\n"
                 assert unrelated.read_text() == "keep"
-                history = subprocess.run([binary, "--non-interactive", "--json", "--home", str(managed), "report"], env=env, capture_output=True, check=True)
+                history = subprocess.run([binary, "--non-interactive", "--json", "--home", str(managed), "report"], env=coverage_env(env), capture_output=True, check=True)
                 assert any(record["operation"] == "managed_tool_cleanup" for record in json.loads(history.stdout)["records"])
             finally:
                 if child.poll() is None:
@@ -1563,7 +1571,7 @@ def managed_cleanup_pty_test(binary):
                 stdin=slave,
                 stdout=slave,
                 stderr=slave,
-                env=env,
+                env=coverage_env(env),
                 preexec_fn=controlling_pty_preexec(slave),
             )
             output = bytearray()
@@ -1628,7 +1636,7 @@ def managed_cleanup_pty_test(binary):
                 assert termios.tcgetattr(slave) == before
                 history = subprocess.run(
                     [binary, "--non-interactive", "--json", "--home", str(managed), "report"],
-                    env=env,
+                    env=coverage_env(env),
                     capture_output=True,
                     check=True,
                 )
@@ -1696,7 +1704,7 @@ def cache_tui_pty_smoke_test(binary, unshare, mount, namespace_args):
             stdin=slave,
             stdout=slave,
             stderr=slave,
-            env=env,
+            env=coverage_env(env),
             cwd=home,
             preexec_fn=controlling_pty_preexec(slave),
         )
@@ -1905,7 +1913,7 @@ def shared_cache_review_removal_pty_test(binary, unshare, mount, namespace_args)
             stdin=slave,
             stdout=slave,
             stderr=slave,
-            env=env,
+            env=coverage_env(env),
             cwd=home,
             preexec_fn=controlling_pty_preexec(slave),
         )
@@ -2015,7 +2023,7 @@ def shared_cache_review_removal_pty_test(binary, unshare, mount, namespace_args)
             stdin=slave,
             stdout=slave,
             stderr=slave,
-            env=env,
+            env=coverage_env(env),
             cwd=home,
             preexec_fn=controlling_pty_preexec(slave),
         )
@@ -2070,7 +2078,7 @@ esac
         child = subprocess.Popen(
             [binary, "--timeout", "2", "--retries", "0", "containers", "preview-remove",
              "--engine", "docker", "--id", container_id],
-            cwd=home, env=env, stdin=slave, stdout=slave, stderr=slave,
+            cwd=home, env=coverage_env(env), stdin=slave, stdout=slave, stderr=slave,
             preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
@@ -2132,7 +2140,7 @@ def self_update_pty_test(binary):
         before = termios.tcgetattr(slave)
         child = subprocess.Popen(
             [binary, "--timeout", "1", "--retries", "0", "self-update"],
-            cwd=home, env=env, stdin=slave, stdout=slave, stderr=slave,
+            cwd=home, env=coverage_env(env), stdin=slave, stdout=slave, stderr=slave,
             preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
@@ -2197,7 +2205,7 @@ def self_update_pty_test(binary):
         before = termios.tcgetattr(slave)
         child = subprocess.Popen(
             [binary, "--timeout", "1", "--retries", "0", "self-update"],
-            cwd=home, env=env, stdin=slave, stdout=slave, stderr=slave,
+            cwd=home, env=coverage_env(env), stdin=slave, stdout=slave, stderr=slave,
             preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
@@ -2236,7 +2244,7 @@ def self_update_pty_test(binary):
         before = termios.tcgetattr(slave)
         child = subprocess.Popen(
             [binary, "--timeout", "1", "--retries", "0", "self-update"],
-            cwd=home, env=env, stdin=slave, stdout=slave, stderr=slave,
+            cwd=home, env=coverage_env(env), stdin=slave, stdout=slave, stderr=slave,
             preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
@@ -2266,7 +2274,7 @@ def self_update_pty_test(binary):
         before = termios.tcgetattr(slave)
         child = subprocess.Popen(
             [binary, "--timeout", "1", "--retries", "0", "self-update"],
-            cwd=home, env=env, stdin=slave, stdout=slave, stderr=slave,
+            cwd=home, env=coverage_env(env), stdin=slave, stdout=slave, stderr=slave,
             preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
@@ -2358,7 +2366,7 @@ def dashboard_recent_activity_pty_test(binary):
             stdin=slave,
             stdout=slave,
             stderr=slave,
-            env=env,
+            env=coverage_env(env),
             preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
@@ -2467,7 +2475,7 @@ def main():
         env.pop("CI", None)
         child = subprocess.Popen(
             [binary, "--timeout", "1", "--retries", "0"],
-            stdin=slave, stdout=slave, stderr=slave, env=env,
+            stdin=slave, stdout=slave, stderr=slave, env=coverage_env(env),
             preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
@@ -2620,7 +2628,7 @@ def main():
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 140, 0, 0))
         before = termios.tcgetattr(slave)
         env = {"HOME": temporary, "TERM": "xterm", "PATH": "", "XDG_DATA_HOME": str(home / "data"), "XDG_CONFIG_HOME": str(home / "config")}
-        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "--config", str(config)], stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=controlling_pty_preexec(slave))
+        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "--config", str(config)], stdin=slave, stdout=slave, stderr=slave, env=coverage_env(env), preexec_fn=controlling_pty_preexec(slave))
         output = bytearray()
         try:
             deadline = time.monotonic() + 10
@@ -2664,7 +2672,7 @@ def main():
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 160, 0, 0))
         before = termios.tcgetattr(slave)
         env = {"HOME": temporary, "TERM": "xterm", "PATH": "", "XDG_DATA_HOME": str(home / "data"), "XDG_CONFIG_HOME": str(home / "config")}
-        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "--config", str(config), "config", "show"], stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=controlling_pty_preexec(slave))
+        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "--config", str(config), "config", "show"], stdin=slave, stdout=slave, stderr=slave, env=coverage_env(env), preexec_fn=controlling_pty_preexec(slave))
         output = bytearray()
         try:
             deadline = time.monotonic() + 10
@@ -2737,7 +2745,7 @@ def main():
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 110, 0, 0))
         before = termios.tcgetattr(slave)
         env = {"HOME": str(home), "TERM": "xterm", "PATH": "", "TZ": "UTC", "XDG_DATA_HOME": str(home), "XDG_CONFIG_HOME": str(home / "config")}
-        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "trash", "preview", "--older-than", "30d"], stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=controlling_pty_preexec(slave))
+        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "trash", "preview", "--older-than", "30d"], stdin=slave, stdout=slave, stderr=slave, env=coverage_env(env), preexec_fn=controlling_pty_preexec(slave))
         output = bytearray()
         try:
             deadline = time.monotonic() + 10
@@ -2772,7 +2780,7 @@ def main():
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 160, 0, 0))
         before = termios.tcgetattr(slave)
         env = {"HOME": str(home), "TERM": "xterm", "PATH": "", "TZ": "UTC", "XDG_DATA_HOME": str(home), "XDG_CONFIG_HOME": str(home / "config")}
-        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "trash", "preview-retention", "--location", str(trash), "--older-than", "30d"], stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=controlling_pty_preexec(slave))
+        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "trash", "preview-retention", "--location", str(trash), "--older-than", "30d"], stdin=slave, stdout=slave, stderr=slave, env=coverage_env(env), preexec_fn=controlling_pty_preexec(slave))
         output = bytearray()
         try:
             deadline = time.monotonic() + 10
@@ -2819,7 +2827,7 @@ def main():
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 160, 0, 0))
         before = termios.tcgetattr(slave)
         env = {"HOME": str(home), "TERM": "xterm", "PATH": "", "TZ": "UTC", "XDG_DATA_HOME": str(home), "XDG_CONFIG_HOME": str(home / "config")}
-        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "trash", "empty", "--location", str(trash)], stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=controlling_pty_preexec(slave))
+        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "trash", "empty", "--location", str(trash)], stdin=slave, stdout=slave, stderr=slave, env=coverage_env(env), preexec_fn=controlling_pty_preexec(slave))
         output = bytearray()
         try:
             deadline = time.monotonic() + 10
@@ -2882,7 +2890,7 @@ def main():
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 160, 0, 0))
         before = termios.tcgetattr(slave)
         env = {"HOME": str(home), "TERM": "xterm", "PATH": "", "TZ": "UTC", "XDG_DATA_HOME": str(home), "XDG_CONFIG_HOME": str(home / "config")}
-        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "trash", "empty", "--location", str(trash)], stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=controlling_pty_preexec(slave))
+        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "trash", "empty", "--location", str(trash)], stdin=slave, stdout=slave, stderr=slave, env=coverage_env(env), preexec_fn=controlling_pty_preexec(slave))
         output = bytearray()
         try:
             deadline = time.monotonic() + 10
@@ -2937,7 +2945,7 @@ def main():
         # read-only JSON inventory before exercising the interactive TUI.
         inventory = subprocess.run(
             [binary, "--non-interactive", "--json", "trash", "preview", "--older-than", "30d"],
-            env=env, capture_output=True, check=True,
+            env=coverage_env(env), capture_output=True, check=True,
         )
         preview_items = json.loads(inventory.stdout)["items"]
         fixture_location = trash.resolve()
@@ -2947,7 +2955,7 @@ def main():
         ]
         assert len(fixture_positions) == 1, "fixture Trash location was not discovered uniquely"
         fixture_position = fixture_positions[0]
-        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "trash", "preview", "--older-than", "30d"], stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=controlling_pty_preexec(slave))
+        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "trash", "preview", "--older-than", "30d"], stdin=slave, stdout=slave, stderr=slave, env=coverage_env(env), preexec_fn=controlling_pty_preexec(slave))
         output = bytearray()
         try:
             deadline = time.monotonic() + 10
@@ -3071,7 +3079,7 @@ def main():
             env.pop("CI", None)
             child = subprocess.Popen(
                 [binary, "--timeout", "1", "--retries", "0", "--config", str(config), "--profile", "work", "sweep", command],
-                stdin=slave, stdout=slave, stderr=slave, env=env,
+                stdin=slave, stdout=slave, stderr=slave, env=coverage_env(env),
                 preexec_fn=controlling_pty_preexec(slave),
             )
             output = bytearray()
@@ -3151,7 +3159,7 @@ esac
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
         before = termios.tcgetattr(slave)
         env = {"HOME": str(home), "TERM": "xterm", "PATH": str(bin_dir), "IMAGE_ID": image_id, "XDG_DATA_HOME": str(home / "data"), "XDG_CONFIG_HOME": str(home / "config")}
-        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "containers", "status"], stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=controlling_pty_preexec(slave))
+        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "containers", "status"], stdin=slave, stdout=slave, stderr=slave, env=coverage_env(env), preexec_fn=controlling_pty_preexec(slave))
         output = bytearray()
         try:
             deadline = time.monotonic() + 10
@@ -3229,7 +3237,7 @@ esac
             stdin=slave,
             stdout=slave,
             stderr=slave,
-            env=env,
+            env=coverage_env(env),
             preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
@@ -3289,7 +3297,7 @@ esac
         fcntl.ioctl(direct_slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 110, 0, 0))
         direct_before = termios.tcgetattr(direct_slave)
         direct_env = {"HOME": str(home), "TERM": "xterm", "PATH": str(bin_dir), "EXPECTED_ID": container_id, "XDG_DATA_HOME": str(home / "data"), "XDG_CONFIG_HOME": str(home / "config")}
-        direct = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "containers", "preview-remove", "--engine", "docker", "--id", container_id], stdin=direct_slave, stdout=direct_slave, stderr=direct_slave, env=direct_env, preexec_fn=controlling_pty_preexec(direct_slave))
+        direct = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "containers", "preview-remove", "--engine", "docker", "--id", container_id], stdin=direct_slave, stdout=direct_slave, stderr=direct_slave, env=coverage_env(direct_env), preexec_fn=controlling_pty_preexec(direct_slave))
         direct_output = bytearray()
         try:
             os.write(direct_master, b"y" * 64)
@@ -3315,7 +3323,7 @@ esac
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 110, 0, 0))
         before = termios.tcgetattr(slave)
         env = {"HOME": str(home), "TERM": "xterm", "PATH": str(bin_dir), "EXPECTED_ID": container_id, "XDG_DATA_HOME": str(home / "data"), "XDG_CONFIG_HOME": str(home / "config")}
-        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "containers", "status"], stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=controlling_pty_preexec(slave))
+        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "containers", "status"], stdin=slave, stdout=slave, stderr=slave, env=coverage_env(env), preexec_fn=controlling_pty_preexec(slave))
         output = bytearray()
         try:
             deadline = time.monotonic() + 10
@@ -3397,12 +3405,12 @@ esac
 ''')
         systemctl.chmod(0o755)
         env = {"HOME": str(home), "TERM": "xterm", "PATH": str(bin_dir), "XDG_DATA_HOME": str(home / "data"), "XDG_CONFIG_HOME": str(home / "config")}
-        preview = subprocess.run([binary, "--json", "--non-interactive", "schedule", "preview", "--frequency", "daily", str(workspace)], env=env, capture_output=True, check=True)
+        preview = subprocess.run([binary, "--json", "--non-interactive", "schedule", "preview", "--frequency", "daily", str(workspace)], env=coverage_env(env), capture_output=True, check=True)
         plan = json.loads(preview.stdout)
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 240, 0, 0))
         before = termios.tcgetattr(slave)
-        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "schedule", "list"], stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=controlling_pty_preexec(slave))
+        child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "schedule", "list"], stdin=slave, stdout=slave, stderr=slave, env=coverage_env(env), preexec_fn=controlling_pty_preexec(slave))
         output = bytearray()
 
         def wait_for_schedule_review(marker):
@@ -3801,14 +3809,14 @@ esac
             os.close(slave)
         direct_workspace = home / "direct-workspace"
         direct_workspace.mkdir()
-        expected = subprocess.run([binary, "--json", "--non-interactive", "schedule", "preview", "--frequency", "weekly", "--exclude", "private", str(direct_workspace)], env=env, capture_output=True, check=True)
+        expected = subprocess.run([binary, "--json", "--non-interactive", "schedule", "preview", "--frequency", "weekly", "--exclude", "private", str(direct_workspace)], env=coverage_env(env), capture_output=True, check=True)
         expected_plan = json.loads(expected.stdout)
-        dry = subprocess.run([binary, "--dry-run", "--json", "schedule", "add", "--frequency", "weekly", "--exclude", "private", str(direct_workspace)], env=env, capture_output=True, check=True)
+        dry = subprocess.run([binary, "--dry-run", "--json", "schedule", "add", "--frequency", "weekly", "--exclude", "private", str(direct_workspace)], env=coverage_env(env), capture_output=True, check=True)
         assert json.loads(dry.stdout)["dry_run"]
         assert not (unit_dir / "upkit-scan.timer").exists()
         input_master, input_slave = pty.openpty()
         try:
-            redirected = subprocess.run([binary, "schedule", "preview", "--frequency", "weekly", str(direct_workspace)], stdin=input_slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=10, check=True)
+            redirected = subprocess.run([binary, "schedule", "preview", "--frequency", "weekly", str(direct_workspace)], stdin=input_slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=coverage_env(env), timeout=10, check=True)
             assert b"Preview token:" in redirected.stdout and b"\x1b[?1049h" not in redirected.stdout
         finally:
             os.close(input_master)
@@ -3818,7 +3826,7 @@ esac
             master, slave = pty.openpty()
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 70, 300, 0, 0))
             before = termios.tcgetattr(slave)
-            child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "schedule", *command], stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=controlling_pty_preexec(slave))
+            child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "schedule", *command], stdin=slave, stdout=slave, stderr=slave, env=coverage_env(env), preexec_fn=controlling_pty_preexec(slave))
             output = bytearray()
             try:
                 deadline = time.monotonic() + 15
@@ -3931,7 +3939,7 @@ esac
             stdin=slave,
             stdout=slave,
             stderr=slave,
-            env=env,
+            env=coverage_env(env),
             preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
@@ -4075,7 +4083,7 @@ esac
         preview = subprocess.run(
             [binary, "--json", "--non-interactive", "--config", str(config), "--profile", "work",
              "schedule", "preview", "--frequency", "daily"],
-            env=env,
+            env=coverage_env(env),
             capture_output=True,
             check=True,
         )
@@ -4094,7 +4102,7 @@ esac
         cleanup_preview = subprocess.run(
             [binary, "--json", "--non-interactive", "--config", str(config), "--profile", "work",
              "schedule", "preview", "--frequency", "daily"],
-            env=env,
+            env=coverage_env(env),
             capture_output=True,
             check=True,
         )
@@ -4112,7 +4120,7 @@ esac
             stdin=slave,
             stdout=slave,
             stderr=slave,
-            env=env,
+            env=coverage_env(env),
             preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
@@ -4203,7 +4211,7 @@ esac
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 12 if not readonly else 24, 50 if not readonly else 120, 0, 0))
             before = termios.tcgetattr(slave)
             child = subprocess.Popen([binary, "containers", command, "--builder", "fixture", "--id", cache_id],
-                                     stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=controlling_pty_preexec(slave))
+                                     stdin=slave, stdout=slave, stderr=slave, env=coverage_env(env), preexec_fn=controlling_pty_preexec(slave))
             output = bytearray()
             try:
                 title = b"Build cache preview" if readonly else b"Confirm build cache removal"
@@ -4267,7 +4275,7 @@ esac
         before = termios.tcgetattr(slave)
         child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "containers",
                                   "preview-network", "--engine", "docker", "--id", network_id],
-                                 stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=controlling_pty_preexec(slave))
+                                 stdin=slave, stdout=slave, stderr=slave, env=coverage_env(env), preexec_fn=controlling_pty_preexec(slave))
         output = bytearray()
         try:
             deadline = time.monotonic() + 10
@@ -4337,7 +4345,7 @@ esac
             git_env = {"HOME": temporary, "PATH": "/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
             git_args = [real_git, "-C", str(project), "-c", "core.hooksPath=/dev/null", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgSign=false"]
             for args in (["init", "-q"], ["add", "pyproject.toml", "example.py"], ["commit", "-qm", "fixture"]):
-                subprocess.run([*git_args, *args], env=git_env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                subprocess.run([*git_args, *args], env=coverage_env(git_env), check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             bindir = home / "bin"
             bindir.mkdir(mode=0o700)
             wrapper = bindir / "git"
@@ -4350,7 +4358,7 @@ esac
             master, slave = pty.openpty()
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 12, 50, 0, 0))
             before = termios.tcgetattr(slave)
-            child = subprocess.Popen([unshare, *namespace_args, binary, "--timeout", "1", "--retries", "0", "--config", str(config), "sweep", "bytecode", str(bytecode), "--root", str(project)], stdin=slave, stdout=slave, stderr=slave, env=env, cwd=temporary, preexec_fn=controlling_pty_preexec(slave))
+            child = subprocess.Popen([unshare, *namespace_args, binary, "--timeout", "1", "--retries", "0", "--config", str(config), "sweep", "bytecode", str(bytecode), "--root", str(project)], stdin=slave, stdout=slave, stderr=slave, env=coverage_env(env), cwd=temporary, preexec_fn=controlling_pty_preexec(slave))
             output = bytearray()
             try:
                 deadline = time.monotonic() + 15
@@ -4389,7 +4397,7 @@ esac
             master, slave = pty.openpty()
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 160, 0, 0))
             before = termios.tcgetattr(slave)
-            child = subprocess.Popen([unshare, *namespace_args, binary, "--timeout", "1", "--retries", "0", "--config", str(config), "sweep", "bytecode", str(bytecode), "--root", str(project)], stdin=slave, stdout=slave, stderr=slave, env=env, cwd=temporary, preexec_fn=controlling_pty_preexec(slave))
+            child = subprocess.Popen([unshare, *namespace_args, binary, "--timeout", "1", "--retries", "0", "--config", str(config), "sweep", "bytecode", str(bytecode), "--root", str(project)], stdin=slave, stdout=slave, stderr=slave, env=coverage_env(env), cwd=temporary, preexec_fn=controlling_pty_preexec(slave))
             output = bytearray()
             try:
                 deadline = time.monotonic() + 15
@@ -4431,7 +4439,7 @@ esac
             master, slave = pty.openpty()
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 160, 0, 0))
             before = termios.tcgetattr(slave)
-            child = subprocess.Popen([unshare, *namespace_args, binary, "--timeout", "1", "--retries", "0", "--config", str(config), "sweep", "scan", str(project)], stdin=slave, stdout=slave, stderr=slave, env=env, cwd=temporary, preexec_fn=controlling_pty_preexec(slave))
+            child = subprocess.Popen([unshare, *namespace_args, binary, "--timeout", "1", "--retries", "0", "--config", str(config), "sweep", "scan", str(project)], stdin=slave, stdout=slave, stderr=slave, env=coverage_env(env), cwd=temporary, preexec_fn=controlling_pty_preexec(slave))
             output = bytearray()
             try:
                 deadline = time.monotonic() + 15
@@ -4497,7 +4505,7 @@ esac
             master, slave = pty.openpty()
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 160, 0, 0))
             before = termios.tcgetattr(slave)
-            child = subprocess.Popen([unshare, *namespace_args, binary, "--timeout", "1", "--retries", "0", "--config", str(config), "sweep", "scan", str(project)], stdin=slave, stdout=slave, stderr=slave, env=env, cwd=temporary, preexec_fn=controlling_pty_preexec(slave))
+            child = subprocess.Popen([unshare, *namespace_args, binary, "--timeout", "1", "--retries", "0", "--config", str(config), "sweep", "scan", str(project)], stdin=slave, stdout=slave, stderr=slave, env=coverage_env(env), cwd=temporary, preexec_fn=controlling_pty_preexec(slave))
             output = bytearray()
             try:
                 deadline = time.monotonic() + 15
@@ -4594,7 +4602,7 @@ esac
             git_env = {"HOME": temporary, "PATH": "/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
             git_args = [real_git, "-C", str(project), "-c", "core.hooksPath=/dev/null", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgSign=false"]
             for args in (["init", "-q"], ["add", "Cargo.toml"], ["commit", "-qm", "fixture"]):
-                subprocess.run([*git_args, *args], env=git_env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                subprocess.run([*git_args, *args], env=coverage_env(git_env), check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             bindir = home / "bin"
             bindir.mkdir(mode=0o700)
             shutil.copy(real_git, bindir / "git")
@@ -4606,7 +4614,7 @@ esac
             master, slave = pty.openpty()
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 160, 0, 0))
             before = termios.tcgetattr(slave)
-            child = subprocess.Popen([unshare, *namespace_args, binary, "--timeout", "1", "--retries", "0", "--config", str(config), "sweep", "run", "--scope", "artifacts", "--select", str(target), "--root", str(project)], stdin=slave, stdout=slave, stderr=slave, env=env, cwd=temporary, preexec_fn=controlling_pty_preexec(slave))
+            child = subprocess.Popen([unshare, *namespace_args, binary, "--timeout", "1", "--retries", "0", "--config", str(config), "sweep", "run", "--scope", "artifacts", "--select", str(target), "--root", str(project)], stdin=slave, stdout=slave, stderr=slave, env=coverage_env(env), cwd=temporary, preexec_fn=controlling_pty_preexec(slave))
             output = bytearray()
             try:
                 deadline = time.monotonic() + 20
@@ -4695,7 +4703,7 @@ esac
                 git_env = {"HOME": temporary, "PATH": "/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
                 git_args = [real_git, "-C", str(project), "-c", "core.hooksPath=/dev/null", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgSign=false"]
                 for args in (["init", "-q"], ["add", "Cargo.toml"], ["commit", "-qm", "fixture"]):
-                    subprocess.run([*git_args, *args], env=git_env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                    subprocess.run([*git_args, *args], env=coverage_env(git_env), check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             bindir = home / "bin"
             bindir.mkdir(mode=0o700)
             shutil.copy(real_git, bindir / "git")
@@ -4707,7 +4715,7 @@ esac
             master, slave = pty.openpty()
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 12, 160, 0, 0))
             before = termios.tcgetattr(slave)
-            child = subprocess.Popen([unshare, *namespace_args, binary, "--timeout", "1", "--retries", "0", "--config", str(config)], stdin=slave, stdout=slave, stderr=slave, env=env, cwd=temporary, preexec_fn=controlling_pty_preexec(slave))
+            child = subprocess.Popen([unshare, *namespace_args, binary, "--timeout", "1", "--retries", "0", "--config", str(config)], stdin=slave, stdout=slave, stderr=slave, env=coverage_env(env), cwd=temporary, preexec_fn=controlling_pty_preexec(slave))
             output = bytearray()
 
             def wait_for(marker, timeout=15):

@@ -3483,6 +3483,7 @@ fn preview_checks_git_index_without_running_fsmonitor_hooks() {
     let git_command = |args: &[&std::ffi::OsStr]| {
         Command::new(&git)
             .env_clear()
+            .envs(std::env::vars_os().filter(|(key, _)| key == "LLVM_PROFILE_FILE"))
             .env("PATH", &system_path)
             .env("HOME", dir.path())
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -3673,6 +3674,7 @@ fn preview_head_detects_staged_deletion_without_fetching_or_deleting_files() {
     let git_command = |args: &[&OsStr]| {
         Command::new(&git)
             .env_clear()
+            .envs(std::env::vars_os().filter(|(key, _)| key == "LLVM_PROFILE_FILE"))
             .env("PATH", &system_path)
             .env("HOME", dir.path())
             .env("GIT_CONFIG_NOSYSTEM", "1")

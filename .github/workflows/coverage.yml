@@ -27,7 +27,14 @@ jobs:
       - name: Run coverage
         run: |
           set -euo pipefail
-          cargo llvm-cov --lcov --output-path coverage.out
+          # Collect coverage from Rust tests AND the subprocess-based Ratatui
+          # tests, which otherwise run an instrumented CLI with no profile
+          # output recorded when the fixtures intentionally clear the env.
+          cargo llvm-cov --no-report
+          eval "$(cargo llvm-cov show-env)"
+          export LLVM_PROFILE_FILE="$CARGO_LLVM_COV_TARGET_DIR/llvm-cov-target/upkit-%p-%12m.profraw"
+          UPKIT_TUI_TEST_BINARY="$CARGO_LLVM_COV_TARGET_DIR/llvm-cov-target/debug/upkit" python3 tests/test_tui_pty.py
+          cargo llvm-cov report --lcov --output-path coverage.out
           cargo llvm-cov report -q | awk '/^Filename/ { next } /^TOTAL/ { printf "total: (lines) %.2f%%\n", $10; next } NF > 0 { printf "✓ %s (lines: %.2f%%)\n", $1, $10 }'
           total=$(cargo llvm-cov report -q | awk '/^TOTAL/ { print $10 }')
           total=${total%%%}

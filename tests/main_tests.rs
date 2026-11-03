@@ -57,6 +57,7 @@ fn offline_check_skips_version_probes_that_can_download_toolchains() {
             .arg(&bin)
             .arg("check")
             .env_clear()
+            .envs(std::env::vars_os().filter(|(key, _)| key == "LLVM_PROFILE_FILE"))
             .env("HOME", dir.path())
             .env("PATH", &bin)
             .env("XDG_CONFIG_HOME", dir.path().join("config"))
