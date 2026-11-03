@@ -2448,9 +2448,19 @@ mod tests {
         } else {
             "verified"
         };
+        let stderr = String::from_utf8_lossy(&check.stderr);
+        // PowerShell emits a static FullyQualifiedErrorId for command and
+        // method failures. Keep only that ID, never an error line containing
+        // a fixture path or current user identity.
+        let error_id = stderr
+            .lines()
+            .find(|line| line.contains("FullyQualifiedErrorId"))
+            .and_then(|line| line.split_once(':'))
+            .map(|(_, id)| id.trim().chars().take(96).collect::<String>())
+            .unwrap_or_else(|| "unavailable".into());
         assert!(
             check.status.success() && check.stdout == b"OK",
-            "private ACL fixture verification failed: code={:?}, category={category}",
+            "private ACL fixture verification failed: code={:?}, category={category}, error_id={error_id}",
             check.status.code()
         );
         verify_private_acl(&directory_path, &sid, &powershell).unwrap();
