@@ -795,7 +795,7 @@ esac
         let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
         let error = preview_configured_install(&executable, Some(&config), None, Frequency::Daily)
             .unwrap_err();
-        assert!(error.to_string().contains("scheduled bytecode cleanup"));
+        assert!(error.to_string().contains("automatic scheduled cleanup"));
         assert!(error.to_string().contains("only on Linux"));
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
     }

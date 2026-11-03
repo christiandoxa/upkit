@@ -3097,7 +3097,33 @@ fn windows_go_environment_reads_default_and_override_with_process_precedence() {
             .unwrap()
             .iter()
             .find(|entry| entry["name"] == name)
-            .unwrap()["path"]
+            .unwrap_or_else(|| {
+                // Log only classification labels, never paths or values from
+                // the user's environment. This fixture uses synthetic paths.
+                let reasons: Vec<_> = report["warnings"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|warning| warning.as_str())
+                    .filter(|warning| warning.contains("Go"))
+                    .map(|warning| {
+                        if warning.contains("location is unsafe or unavailable") {
+                            "goenv_location_unsafe"
+                        } else if warning.contains("is unreadable, unsafe") {
+                            "goenv_read_unverified"
+                        } else if warning.contains("contains unsupported values") {
+                            "goenv_parse_unverified"
+                        } else if warning.contains("cache configuration is incomplete") {
+                            "cache_scope_unverified"
+                        } else if warning.contains("default build cache is unavailable") {
+                            "build_cache_unavailable"
+                        } else {
+                            "other_go_warning"
+                        }
+                    })
+                    .collect();
+                panic!("fixture expected {name} inventory, but it is absent; Go diagnostics: {reasons:?}")
+            })["path"]
             .as_str()
             .unwrap()
             .to_owned()
@@ -3248,7 +3274,33 @@ fn windows_go_environment_requires_known_gopath_and_follows_localappdata() {
             .unwrap()
             .iter()
             .find(|entry| entry["name"] == name)
-            .unwrap()["path"]
+            .unwrap_or_else(|| {
+                // Log only classification labels, never paths or values from
+                // the user's environment. This fixture uses synthetic paths.
+                let reasons: Vec<_> = report["warnings"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|warning| warning.as_str())
+                    .filter(|warning| warning.contains("Go"))
+                    .map(|warning| {
+                        if warning.contains("location is unsafe or unavailable") {
+                            "goenv_location_unsafe"
+                        } else if warning.contains("is unreadable, unsafe") {
+                            "goenv_read_unverified"
+                        } else if warning.contains("contains unsupported values") {
+                            "goenv_parse_unverified"
+                        } else if warning.contains("cache configuration is incomplete") {
+                            "cache_scope_unverified"
+                        } else if warning.contains("default build cache is unavailable") {
+                            "build_cache_unavailable"
+                        } else {
+                            "other_go_warning"
+                        }
+                    })
+                    .collect();
+                panic!("fixture expected {name} inventory, but it is absent; Go diagnostics: {reasons:?}")
+            })["path"]
             .as_str()
             .unwrap()
             .to_owned()
