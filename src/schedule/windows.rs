@@ -2382,6 +2382,9 @@ mod tests {
     #[test]
     fn task_xml_temp_file_fixture_checks_acl_and_removes_the_file() {
         let directory = tempfile::tempdir().unwrap();
+        // The Windows temporary directory can use a verbatim (\\?\) path
+        // even though scheduling requires a normalized canonical path.
+        let directory_path = normalized_path(directory.path()).unwrap();
         let xml = task_xml(
             r#"C:\Program Files\Upkit\upkit.exe"#,
             "\"--non-interactive\"",
@@ -2392,11 +2395,10 @@ mod tests {
         .unwrap();
         let sid = current_user_sid().unwrap();
         let powershell = system_binary("WindowsPowerShell\\v1.0\\powershell.exe").unwrap();
-        let (path, stored) =
-            with_safe_task_xml(directory.path(), &xml, &sid, &powershell, |path| {
-                Ok((path.to_path_buf(), std::fs::read_to_string(path)?))
-            })
-            .unwrap();
+        let (path, stored) = with_safe_task_xml(&directory_path, &xml, &sid, &powershell, |path| {
+            Ok((path.to_path_buf(), std::fs::read_to_string(path)?))
+        })
+        .unwrap();
         assert_eq!(stored, xml);
         assert!(!path.exists());
     }
