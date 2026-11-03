@@ -2530,7 +2530,30 @@ try {
         let (path, stored) = with_safe_task_xml(&directory_path, &xml, &sid, &powershell, |path| {
             Ok((path.to_path_buf(), std::fs::read_to_string(path)?))
         })
-        .unwrap();
+        .unwrap_or_else(|error| {
+            // Never echo an OS error or a local absolute path into CI logs.
+            // Categorize which of the fail-closed guards rejected the fixture.
+            let diagnostic = format!("{error:#}");
+            let category = if diagnostic.contains("canonical absolute Windows paths") {
+                "path_noncanonical"
+            } else if diagnostic.contains("XML path ACL") {
+                "file_or_directory_acl"
+            } else if diagnostic.contains("utility timed out") {
+                "powershell_timeout"
+            } else if diagnostic.contains("utility failed") {
+                "powershell_failed"
+            } else if diagnostic.contains("against replacement") {
+                "file_lock"
+            } else if diagnostic.contains("identity changed") || diagnostic.contains("file changed")
+            {
+                "file_identity_changed"
+            } else if diagnostic.contains("Task Scheduler XML directory or file") {
+                "directory_or_file_identity"
+            } else {
+                "other_safety_veto"
+            };
+            panic!("private Task Scheduler XML fixture rejected: {category}")
+        });
         assert_eq!(stored, xml);
         assert!(!path.exists());
     }
@@ -2572,34 +2595,34 @@ try {
     fn powershell_task_acl_predicate_rejects_untrusted_read_and_execute_aces() {
         use std::process::Command;
 
-        let sid = "S-1-5-21-42-1001";
-        let untrusted = "S-1-5-21-42-1002";
         let powershell = system_binary("WindowsPowerShell\\v1.0\\powershell.exe").unwrap();
+        // Evaluate all three ACLs in one bounded process. Starting three
+        // PowerShell hosts serially can exhaust the ten-second test-command
+        // deadline on loaded hosted Windows runners.
         let script = task_powershell_script(
             r#"
-$safe = Test-UpkitTaskAcl $env:UPKIT_TEST_SDDL $env:UPKIT_TASK_SID
-if ($safe) { [Console]::Out.Write('SAFE') } else { [Console]::Out.Write('UNSAFE') }
+$sid = 'S-1-5-21-42-1001'
+$untrusted = 'S-1-5-21-42-1002'
+$prefix = "O:${sid}G:SYD:P(A;;FA;;;${sid})"
+$results = @(
+    (Test-UpkitTaskAcl ($prefix + "(A;;0x1;;;${untrusted})") $sid),
+    (Test-UpkitTaskAcl ($prefix + "(A;;0x20;;;${untrusted})") $sid),
+    (Test-UpkitTaskAcl $prefix $sid)
+)
+foreach ($safe in $results) {
+    if ($safe) { [Console]::Out.Write('S') } else { [Console]::Out.Write('U') }
+}
 "#,
         );
-        for (extra_ace, expected) in [
-            (format!("(A;;0x1;;;{untrusted})"), &b"UNSAFE"[..]),
-            (format!("(A;;0x20;;;{untrusted})"), &b"UNSAFE"[..]),
-            (String::new(), &b"SAFE"[..]),
-        ] {
-            let sddl = format!("O:{sid}G:SYD:P(A;;FA;;;{sid}){extra_ace}");
-            let mut command = Command::new(&powershell);
-            command
-                .args([
-                    "-NoLogo",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    &script,
-                ])
-                .env("UPKIT_TASK_SID", sid)
-                .env("UPKIT_TEST_SDDL", sddl);
-            assert_eq!(run_command(command, None, 4096).unwrap(), expected);
-        }
+        let mut command = Command::new(&powershell);
+        command.args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &script,
+        ]);
+        assert_eq!(run_command(command, None, 4096).unwrap(), b"UUS");
     }
 
     #[cfg(target_os = "windows")]
