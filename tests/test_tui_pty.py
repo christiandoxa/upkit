@@ -1753,11 +1753,28 @@ def cache_tui_pty_smoke_test(binary, unshare, mount, namespace_args):
             assert b"1 of 2 caches" in terminal_text(output), terminal_text(output).decode(errors="replace")
             output.clear()
             os.write(master, b"d")
-            deadline = time.monotonic() + 10
+            deadline = time.monotonic() + 15
+            retry_at = time.monotonic() + 1.25
+            redraw_at = time.monotonic() + 0.5
+            size = 24
             while b"Enter: review" not in terminal_text(output) and time.monotonic() < deadline:
+                # A namespaced worker can finish between filter application
+                # and the chooser key. Do not depend on a single event or on
+                # Ratatui resending unchanged lines during incremental draws.
+                if time.monotonic() >= retry_at and b"Select shared cache" not in terminal_text(output):
+                    os.write(master, b"d")
+                    retry_at = time.monotonic() + 1.5
+                if time.monotonic() >= redraw_at:
+                    size = 25 if size == 24 else 24
+                    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", size, 100, 0, 0))
+                    resize_child()
+                    redraw_at = time.monotonic() + 1
                 if select.select([master], [], [], 0.2)[0]:
                     output.extend(os.read(master, 65536))
-            assert b"Enter: review" in terminal_text(output), terminal_text(output).decode(errors="replace")
+            assert b"Enter: review" in terminal_text(output), (
+                "cache chooser did not render after d: "
+                + terminal_text(output)[-2500:].decode(errors="replace")
+            )
             output.clear()
             os.write(master, b"sj")
             deadline = time.monotonic() + 10
@@ -2915,6 +2932,21 @@ def main():
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 120, 0, 0))
         before = termios.tcgetattr(slave)
         env = {"HOME": str(home), "TERM": "xterm", "PATH": "", "TZ": "UTC", "XDG_DATA_HOME": str(home), "XDG_CONFIG_HOME": str(home / "config")}
+        # Host runners can have additional Trash mounts. The first preview
+        # row need not be our fixture, so resolve its index with the same
+        # read-only JSON inventory before exercising the interactive TUI.
+        inventory = subprocess.run(
+            [binary, "--non-interactive", "--json", "trash", "preview", "--older-than", "30d"],
+            env=env, capture_output=True, check=True,
+        )
+        preview_items = json.loads(inventory.stdout)["items"]
+        fixture_location = trash.resolve()
+        fixture_positions = [
+            index for index, item in enumerate(preview_items)
+            if item["name"] == "fixture" and Path(item["location"]).resolve() == fixture_location
+        ]
+        assert len(fixture_positions) == 1, "fixture Trash location was not discovered uniquely"
+        fixture_position = fixture_positions[0]
         child = subprocess.Popen([binary, "--timeout", "1", "--retries", "0", "trash", "preview", "--older-than", "30d"], stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=controlling_pty_preexec(slave))
         output = bytearray()
         try:
@@ -2923,6 +2955,9 @@ def main():
                 if select.select([master], [], [], 0.2)[0]:
                     output.extend(os.read(master, 65536))
             assert b"older_than_threshold" in output, "Trash preview did not render"
+            for _ in range(fixture_position):
+                os.write(master, b"j")
+                time.sleep(0.04)
             os.write(master, b"A")
             deadline = time.monotonic() + 10
             size = 24

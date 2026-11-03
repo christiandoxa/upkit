@@ -24,7 +24,7 @@ POWERSHELL = "powershell.exe" if WINDOWS else os.environ.get("UPKIT_PWSH") or sh
 class Installers(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="upkit installer test ")
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(self.cleanup_temp)
         self.root = pathlib.Path(self.temp.name)
         self.bin_dir = self.root / "bin"
         arch = "aarch64" if platform.machine().lower() in ("arm64", "aarch64") else "x86_64"
@@ -81,6 +81,20 @@ class Installers(unittest.TestCase):
                 HOMEDRIVE=self.root.drive,
                 HOMEPATH=str(self.root)[len(self.root.drive):],
             )
+
+    def cleanup_temp(self):
+        # Windows Go may keep a short-lived telemetry counter open after an
+        # isolated Upkit child exits. Retry only this fixture directory's
+        # cleanup; do not ignore persistent locks or delete outside the test.
+        deadline = time.monotonic() + (8 if WINDOWS else 0)
+        while True:
+            try:
+                self.temp.cleanup()
+                return
+            except PermissionError:
+                if not WINDOWS or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.2)
 
     def run_command(self, command):
         return subprocess.run(command, env=self.env, cwd=ROOT, capture_output=True, text=True, timeout=90)

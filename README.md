@@ -6,8 +6,10 @@ Upkit is a standalone developer environment manager with a keyboard-first
 terminal dashboard, toolchain management, workspace artifact discovery, and
 selected maintenance operations.
 
-This document describes the current source tree. A published release may not
-yet include all of these features; check the release notes for its version.
+This document describes the current source tree. The `0.5.0` changes are
+still unreleased and may not be available in the latest published binary.
+The installation examples below use the latest published stable release
+(`v0.4.15`); consult its release notes for the features it includes.
 
 ## Features
 
@@ -57,7 +59,7 @@ To install a specific release or choose a different directory:
 
 ```bash
 curl -fsSL https://github.com/christiandoxa/upkit/releases/latest/download/install.sh |
-  sh -s -- --release v0.5.0 --install-dir "$HOME/.local/bin"
+  sh -s -- --release v0.4.15 --install-dir "$HOME/.local/bin"
 ```
 
 ### Windows
@@ -79,7 +81,7 @@ To choose a release or install directory, set these variables before running
 the installer:
 
 ```powershell
-$env:UPKIT_RELEASE = 'v0.5.0'
+$env:UPKIT_RELEASE = 'v0.4.15'
 $env:UPKIT_INSTALL_DIR = "$env:LOCALAPPDATA\upkit\bin"
 irm https://github.com/christiandoxa/upkit/releases/latest/download/install.ps1 | iex
 ```
@@ -95,7 +97,7 @@ Linux binaries target glibc-based distributions.
 ### GitHub Actions
 
 ```yaml
-- uses: christiandoxa/upkit@v0.5.0
+- uses: christiandoxa/upkit@v0.4.15
   with:
     version: latest
 
