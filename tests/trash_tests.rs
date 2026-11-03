@@ -450,6 +450,13 @@ fn retention_cli_previews_age_scope_and_rejects_changed_selection() {
     create("future", Some("2999-01-01T00:00:00"));
     create("unknown", None);
     fs::hard_link(trash.join("files/hard"), dir.path().join("outside-link")).unwrap();
+    // Retention must refuse this directory regardless of the host umask.
+    // A writable-by-group item cannot be safely cleared by Upkit.
+    fs::set_permissions(
+        trash.join("files/folder"),
+        fs::Permissions::from_mode(0o770),
+    )
+    .unwrap();
     let location = trash.to_str().unwrap();
     let run = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_upkit"))

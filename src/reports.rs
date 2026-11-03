@@ -1,7 +1,7 @@
 //! Bounded local records for explicitly confirmed maintenance operations.
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::sync::atomic::Ordering;
 use std::{
     fs,
