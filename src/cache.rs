@@ -7137,9 +7137,16 @@ dir = "~/bun-global"
         );
         assert!(validated_windows_inventory_root(OsStr::new("relative/cache")).is_none());
         assert!(validated_windows_inventory_root(OsStr::new("../private")).is_none());
+        // A Windows PathBuf may normalize `..` while joining, before the
+        // function under test receives the input. Supply the raw Windows
+        // spelling to exercise the pre-normalization security guard.
+        let raw_parent_traversal = format!(r"{}\..\outside", canonical.display());
         assert!(
-            validated_windows_inventory_root(canonical.join("../outside").as_os_str()).is_none()
+            raw_parent_traversal
+                .split(['/', '\\'])
+                .any(|segment| segment == "..")
         );
+        assert!(validated_windows_inventory_root(OsStr::new(&raw_parent_traversal)).is_none());
     }
 
     #[cfg(windows)]

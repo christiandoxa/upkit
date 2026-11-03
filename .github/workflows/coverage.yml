@@ -28,7 +28,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo llvm-cov --lcov --output-path coverage.out
-          cargo llvm-cov -q | awk '/^Filename/ { next } /^TOTAL/ { printf "total: (lines) %.2f%%\n", $10; next } NF > 0 { printf "✓ %s (lines: %.2f%%)\n", $1, $10 }'
-          total=$(cargo llvm-cov -q | awk '/^TOTAL/ { print $10 }')
+          cargo llvm-cov report -q | awk '/^Filename/ { next } /^TOTAL/ { printf "total: (lines) %.2f%%\n", $10; next } NF > 0 { printf "✓ %s (lines: %.2f%%)\n", $1, $10 }'
+          total=$(cargo llvm-cov report -q | awk '/^TOTAL/ { print $10 }')
           total=${total%%%}
           awk -v t="$total" 'BEGIN { exit (t + 0 < 90) }'
