@@ -2787,18 +2787,36 @@ fn scan_stays_on_the_verified_root_volume_for_descendant_directories() {
     fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
 
     let report = scan(&[dir.path().to_owned()]).unwrap();
-
+    // Scan roots are canonicalized, including the extended-length Windows
+    // prefix (\\?\C:\). The fixture's original path spelling need
+    // not compare equal to a discovered canonical candidate.
+    let canonical_target = target.canonicalize().unwrap();
+    let warning_kinds: Vec<_> = report
+        .warnings
+        .iter()
+        .map(|warning| {
+            if warning.contains("volume differs or could not be verified") {
+                "volume_guard"
+            } else if warning.contains("filesystem boundary") {
+                "filesystem_boundary"
+            } else if warning.contains("Cargo target-dir configuration") {
+                "cargo_configuration_unresolved"
+            } else {
+                "other"
+            }
+        })
+        .collect();
     assert!(
         report
             .candidates
             .iter()
-            .any(|candidate| candidate.target == target)
+            .any(|candidate| candidate.target == canonical_target),
+        "canonical target missing; candidates={}, warning kinds={warning_kinds:?}",
+        report.candidates.len()
     );
     assert!(
-        !report
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("volume differs or could not be verified"))
+        !warning_kinds.contains(&"volume_guard"),
+        "same-volume fixture was rejected: {warning_kinds:?}"
     );
 }
 
