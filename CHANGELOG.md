@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.5.1 (2026-11-04) — stable UX polish update
+
+- Highlight the currently selected navigation page and label `←/→` and `Tab`
+  as ways to change sections, without occupying additional content height.
+- Preserve page-specific hotkeys after toolchain refresh or other actions by
+  showing status separately in the footer border. Brief successful refresh
+  notices dismiss automatically; error messages remain visible.
+- Simplify shared-cache inventory into readable sizes, names, and statuses;
+  press `w` to inspect the full warnings, ownership, and diagnostic details.
+  Removal still requires a separate review and confirmation. Clarify toolchain
+  statuses and action wording to avoid suggesting immediate deletion.
+- Strengthen interactive PTY regression tests and cleanup of orphaned test
+  subprocesses without changing user-facing cleanup safety controls.
+- **Known quality limitations:** most recent line coverage is **83.45%**
+  (below the existing 90% target); interactive macOS dashboard PTY smoke
+  remains unverified. Native macOS CI passed. Coverage enforcement is unchanged.
+
 ## 0.5.0 (2026-11-03) — stable release
 
 This release is being published as the stable channel by project-owner

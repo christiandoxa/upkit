@@ -6,9 +6,9 @@ Upkit is a standalone developer environment manager with a keyboard-first
 terminal dashboard, toolchain management, workspace artifact discovery, and
 selected maintenance operations.
 
-The stable `v0.5.0` standalone release includes the developer-environment
+The stable `v0.5.1` standalone release includes the developer-environment
 manager and Ratatui dashboard. Known quality limitations are documented in
-[CHANGELOG.md](CHANGELOG.md): measured line coverage is still **83.42%**
+[CHANGELOG.md](CHANGELOG.md): measured line coverage is still **83.45%**
 against the 90% target, and interactive macOS dashboard PTY smoke remains
 unverified. Review every maintenance action before approving deletion.
 

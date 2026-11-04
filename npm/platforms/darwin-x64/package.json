@@ -1,6 +1,6 @@
 {
   "name": "@christiandoxa/upkit-darwin-x64",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Native upkit binary for x86_64-apple-darwin",
   "license": "MIT OR Apache-2.0",
   "os": [
