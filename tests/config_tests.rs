@@ -500,13 +500,15 @@ fn explicit_scan_roots_override_configured_roots() {
 }
 
 #[test]
-fn absent_roots_never_trigger_a_default_scan() {
+fn absent_roots_without_any_project_never_trigger_a_home_wide_scan() {
     let dir = tempdir().unwrap();
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_upkit"))
         .args(["--json", "sweep", "scan"])
         .env("HOME", dir.path())
+        .env("USERPROFILE", dir.path())
         .env("XDG_CONFIG_HOME", dir.path())
         .env("APPDATA", dir.path())
+        .current_dir(dir.path())
         .output()
         .unwrap();
     assert!(!output.status.success());

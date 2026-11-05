@@ -128,6 +128,54 @@ installed with npm, remove the old package with
 `npm uninstall -g @christiandoxa/upkit`, then run the standalone installer so the
 old npm launcher does not take precedence on `PATH`.
 
+## Clean build artifacts and caches without setup
+
+> **Development preview:** the `tidy` / `cleanup` commands and automatic
+> project discovery are currently available from the `master` source tree.
+> They are **not** part of the already published `v0.5.1` standalone binary.
+
+Run Upkit **inside a project** to detect common generated build directories and
+shared package caches, without creating a configuration file or scanning your
+entire home directory:
+
+```sh
+upkit tidy
+```
+
+Upkit lists the recognized project artifacts, sizes and shared cache locations.
+It only scans the **nearest manifest-backed project** or roots explicitly
+passed with `--root`. It never deletes anything by default. To review one
+rebuildable artifact or cache, use a unique name from the overview or its exact
+absolute path:
+
+```sh
+upkit tidy --select cargo
+# Or scan a specific project from outside its directory:
+upkit tidy --root /absolute/path/to/project
+```
+
+A successful preview includes a short-lived, selection-bound token. After
+reviewing the target contents and warnings, an explicit CLI execution requires
+both `--yes` and that same token:
+
+```sh
+upkit --non-interactive --yes tidy --select cargo --run --preview-token TOKEN_FROM_PREVIEW
+```
+
+The application independently rechecks project identity, version-control
+history, active processes, filesystem boundaries, permissions and potential
+links before deletion. Targets whose safety cannot be established are **blocked**,
+not silently skipped or force-cleaned. Shared caches are used by multiple
+projects and may require downloading dependencies again; their inventory is
+read-only until you request a separate preview. Do not run with administrator
+privileges or loosen your filesystem permissions to bypass a block.
+
+For an interactive workflow, open `upkit tui` and use **Artifacts** (`r` to
+scan the current project) or **Caches** (`d` to preview a selected cache).
+`config init` is optional; use it only to remember multiple workspace roots or
+custom retention policies. Scheduled/deletion features remain opt-in and require
+separate review. Unsupported or unverified targets remain untouched.
+
 ## Usage
 
 View local maintenance history with `upkit report`, `upkit sweep report`, or

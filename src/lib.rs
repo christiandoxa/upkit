@@ -26,6 +26,7 @@ pub mod shared_cache_cleanup;
 pub mod sweep;
 pub mod temp_cleanup;
 pub mod test_support;
+mod tidy;
 pub mod tools;
 pub mod trash;
 pub mod tui;

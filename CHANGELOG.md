@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased — zero-config safe cleaning
+
+- Add `upkit tidy` / `upkit cleanup`: recognize the nearest manifest-backed
+  project automatically, inventory rebuildable output and shared caches in a
+  single place, and show per-target reasons when a safe preview is blocked.
+- A unique artifact or cache name can be used instead of copying a long path.
+  Never delete by default; require reviewed exact selection, fresh preview
+  token, confirmation and the existing guarded deletion checks. No automatic
+  cleaning of unrelated HOME directories, caches with unverified settings, or
+  artifacts with embedded projects, links or unresolved process activity.
+- Make `sweep scan`, `sweep preview` and the TUI Artifacts view infer a narrow
+  project scope from the current directory when no settings are saved.
+  Explicit settings, profiles, and scheduled cleanup scopes are preserved.
+  `config show` reports inferred defaults separately from persisted settings.
+- Add isolated regression fixtures for no-config scanning, project boundaries,
+  safe named selection, invalid authorization and no-deletion defaults.
+
 ## 0.5.1 (2026-11-04) — stable UX polish update
 
 - Highlight the currently selected navigation page and label `←/→` and `Tab`

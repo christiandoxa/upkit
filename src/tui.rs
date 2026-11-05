@@ -7263,7 +7263,7 @@ fn draw_for_platform(frame: &mut Frame<'_>, app: &App, platform: SchedulePlatfor
                 "Scanning workspace… {} directories inspected.\nEsc: cancel",
                 app.scan_visited
             ),
-            None => "Press r to scan configured roots, or choose roots with: upkit sweep scan <path>\nConfigure roots with: upkit config init <path>\nNo paths are scanned by default."
+            None => "Press r to find rebuildable artifacts in the current project.\nNo setup needed: Upkit uses the nearest project manifest.\nFor other folders: upkit tidy --root PATH (always previews first)."
                 .into(),
             Some(Err(err)) => format!("Scan failed: {err}"),
             Some(Ok(report)) => {
@@ -8765,7 +8765,7 @@ fn draw_for_platform(frame: &mut Frame<'_>, app: &App, platform: SchedulePlatfor
         frame.render_widget(Clear, area);
         let context = match app.page {
             Start::Dashboard => {
-                "Dashboard: s scans configured roots; c opens Caches and starts its read-only inventory; ↑/↓ scrolls details; r refreshes history; Tab opens the next page."
+                "Dashboard: s scans the current project (or configured roots) without setup; c opens Caches in read-only mode; ↑/↓ scroll; r refreshes history; Tab switches pages."
             }
             Start::Toolchains if app.managed_mode => {
                 "Toolchains: / filters tool names, versions, status, or notes; Space marks allowed cleanup targets. Enter or d previews the selected tool; D reviews marked targets together."
@@ -8781,7 +8781,7 @@ fn draw_for_platform(frame: &mut Frame<'_>, app: &App, platform: SchedulePlatfor
                 "Artifacts preview: / filters; s sorts; ↑/↓ selects; Space marks up to 32 targets; d previews marked targets (or current target if none are marked); b lists Python bytecode; Enter opens details."
             }
             Start::Artifacts => {
-                "Artifacts: r scans; / filters; s sorts; ↑/↓ selects; Space marks up to 32 targets; d previews marked targets (or current target if none are marked); b lists Python bytecode. Esc cancels an active scan."
+                "Artifacts: r scans the current project by default (no config required); / filters; s sorts; ↑/↓ selects; Space marks; d previews, then separately confirms cleanup. b lists Python bytecode; Esc cancels scanning."
             }
             Start::Maintenance if app.temp_mode => {
                 "Temporary links: r inventories stale Upkit staging directories; Space marks eligible candidates; PgUp/PgDn scrolls the full inventory and Home/End jumps to its top or bottom; d previews selected paths. Review every candidate and warning, then continue to a separate confirmation. Esc cancels or returns to Maintenance; cancellation may finish the current item."

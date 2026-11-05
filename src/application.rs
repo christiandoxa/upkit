@@ -147,6 +147,22 @@ pub enum Commands {
         #[command(subcommand)]
         command: TrashCommand,
     },
+    /// Zero-config cleanup overview for rebuildable project artifacts and shared caches
+    #[command(visible_alias = "cleanup")]
+    Tidy {
+        /// Workspace roots (defaults to nearest manifest-backed project in the current directory)
+        #[arg(long)]
+        root: Vec<PathBuf>,
+        /// Select a unique discovered name or an exact absolute path for guarded review
+        #[arg(long)]
+        select: Option<PathBuf>,
+        /// Execute a previously reviewed exact selection
+        #[arg(long, requires = "preview_token")]
+        run: bool,
+        /// Token from the previous preview
+        #[arg(long, requires = "run")]
+        preview_token: Option<String>,
+    },
     /// Inspect shared developer caches
     Cache {
         #[command(subcommand)]
@@ -195,7 +211,7 @@ pub enum Commands {
         #[arg(long)]
         force: bool,
     },
-    /// Remove managed tool installs and symlinks
+    /// Remove managed tool installs and symlinks (not build artifacts or shared caches)
     Clean {
         /// Tools to clean (skips interactive selection)
         tools: Vec<ToolKind>,
@@ -868,6 +884,26 @@ pub(crate) fn resolve_scan_config(
 ) -> Result<crate::config::ResolvedScan> {
     let config_path = crate::config::config_path(config)?;
     let settings = crate::config::load(&config_path, config.is_some())?;
+    // First-run default: discover only the nearest manifest-backed project
+    // from CWD. Never silently scan HOME, arbitrary ancestor directories, or
+    // ignore explicit profiles or config-file requests.
+    let inferred = if config.is_none()
+        && profile.is_none()
+        && paths.is_empty()
+        && settings.workspace_roots.is_empty()
+    {
+        env::current_dir()
+            .ok()
+            .and_then(|cwd| crate::sweep::nearest_project_root(&cwd, dirs::home_dir().as_deref()))
+    } else {
+        None
+    };
+    let defaults = inferred.into_iter().collect::<Vec<_>>();
+    let paths = if paths.is_empty() && !defaults.is_empty() {
+        defaults.as_slice()
+    } else {
+        paths
+    };
     let (paths, exclusions, age) =
         crate::config::profile_scan_options(&settings, profile, paths, exclude, age)?;
     let enabled = crate::config::enabled_ecosystems(&settings, profile)?;
@@ -2286,6 +2322,21 @@ pub fn run(cli: &Cli, ctx: &mut Ctx) -> Result<()> {
         bail!("non-interactive mode: use --yes to confirm this operation");
     }
     match cli.cmd.clone().unwrap_or(Commands::Check) {
+        Commands::Tidy {
+            root,
+            select,
+            run,
+            preview_token,
+        } => {
+            crate::tidy::run(
+                cli,
+                ctx,
+                &root,
+                select.as_deref(),
+                run,
+                preview_token.as_deref(),
+            )?;
+        }
         Commands::Schedule {
             command: ScheduleCommand::TrashRetention { command },
         } => run_trash_retention_schedule(cli, ctx, command)?,
@@ -4886,10 +4937,41 @@ pub fn run(cli: &Cli, ctx: &mut Ctx) -> Result<()> {
             match command {
                 ConfigCommand::Show => {
                     let settings = crate::config::load(&path, cli.config.is_some())?;
+                    let inferred = if cli.config.is_none()
+                        && cli.profile.is_none()
+                        && settings.workspace_roots.is_empty()
+                    {
+                        env::current_dir().ok().and_then(|cwd| {
+                            crate::sweep::nearest_project_root(&cwd, dirs::home_dir().as_deref())
+                        })
+                    } else {
+                        None
+                    };
+                    let selected_roots = cli
+                        .profile
+                        .as_ref()
+                        .and_then(|name| settings.profiles.get(name))
+                        .map_or(&settings.workspace_roots, |profile| {
+                            &profile.workspace_roots
+                        });
+                    let scan_scope_source = if inferred.is_some() {
+                        "current_project"
+                    } else if selected_roots.is_empty() {
+                        "not_configured"
+                    } else {
+                        "configured"
+                    };
+                    let effective_roots = inferred
+                        .as_ref()
+                        .map_or_else(|| selected_roots.clone(), |root| vec![root.clone()]);
                     if cli.json {
                         emit_json(
                             ctx,
-                            serde_json::json!({ "path": path, "settings": settings }),
+                            serde_json::json!({
+                                "path": path, "settings": settings,
+                                "effective_workspace_roots": effective_roots,
+                                "scan_scope_source": scan_scope_source,
+                            }),
                         )?;
                     } else {
                         info(
@@ -4900,6 +4982,20 @@ pub fn run(cli: &Cli, ctx: &mut Ctx) -> Result<()> {
                                 toml::to_string_pretty(&settings)?
                             ),
                         );
+                        if let Some(root) = inferred {
+                            info(
+                                ctx,
+                                format!(
+                                    "Default scan (not saved to config): {}",
+                                    crate::sweep::display_path(&root),
+                                ),
+                            );
+                        } else if effective_roots.is_empty() {
+                            info(
+                                ctx,
+                                "No workspace configured. Run inside a project, or use upkit cleanup --root PATH.",
+                            );
+                        }
                     }
                 }
                 ConfigCommand::Init {

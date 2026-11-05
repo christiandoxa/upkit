@@ -954,6 +954,40 @@ fn cargo_target_dir_with_home(
     (Some(target), Some(config), false)
 }
 
+/// A narrow, read-only default for users who run Upkit inside a project.
+/// Never infer a home-wide or filesystem-root scan from missing config.
+pub(crate) fn nearest_project_root(cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let cwd = cwd.canonicalize().ok()?;
+    // A HOME/USERPROFILE override in an isolated environment can differ from
+    // the OS known-folder API. Treat *both* as boundaries so neither is ever
+    // accidentally scanned merely because it contains a project manifest.
+    let mut homes = home
+        .and_then(|home| home.canonicalize().ok())
+        .into_iter()
+        .collect::<Vec<_>>();
+    for key in ["HOME", "USERPROFILE"] {
+        if let Some(path) = std::env::var_os(key)
+            && let Some(path) = Path::new(&path).canonicalize().ok()
+            && !homes.contains(&path)
+        {
+            homes.push(path);
+        }
+    }
+    for (depth, parent) in cwd.ancestors().enumerate() {
+        if depth >= 16 || parent.parent().is_none() || homes.iter().any(|home| home == parent) {
+            break;
+        }
+        let metadata = fs::symlink_metadata(parent).ok()?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            break;
+        }
+        if project_at(parent).is_some() {
+            return Some(parent.to_path_buf());
+        }
+    }
+    None
+}
+
 fn project_at(path: &Path) -> Option<Project> {
     let has = |name: &str| is_regular(&path.join(name));
     let dotnet = fs::read_dir(path)
