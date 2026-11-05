@@ -16301,8 +16301,13 @@ mod tests {
         );
         assert!(startup_dashboard_project(&home, Some(&home), None, None).is_none());
         assert!(
-            startup_dashboard_project(&nested, Some(&home), Some(Path::new("/some/config")), None)
-                .is_none()
+            startup_dashboard_project(
+                &nested,
+                Some(&home),
+                Some(std::path::Path::new("/some/config")),
+                None
+            )
+            .is_none()
         );
         assert!(startup_dashboard_project(&nested, Some(&home), None, Some("work")).is_none());
     }
