@@ -5390,12 +5390,17 @@ impl App {
                 self.history = None;
                 Action::RefreshHistory
             }
-            KeyCode::Char('c') if self.page == Start::Dashboard && !self.cache_running => {
+            KeyCode::Char('c') if self.page == Start::Dashboard => {
                 self.page = Start::Cache;
-                self.cache_running = true;
-                self.cache = None;
-                self.cache_scroll = 0;
-                Action::StartCache
+                if self.cache_running || self.cache.is_some() {
+                    // Reuse the cached or in-flight dashboard inventory.
+                    Action::None
+                } else {
+                    self.cache_running = true;
+                    self.cache = None;
+                    self.cache_scroll = 0;
+                    Action::StartCache
+                }
             }
             KeyCode::Char('r') if self.page == Start::Settings && !self.settings_loading => {
                 self.settings_loading = true;
@@ -6242,7 +6247,9 @@ fn dashboard_cards(app: &App) -> [(&'static str, String); 4] {
             ),
             Some(Err(_)) => "Artifact scan failed; see Artifacts.".into(),
             None if app.scan_running => "Artifact scan in progress.".into(),
-            None => "Artifacts: no scan yet; choose workspace roots.".into(),
+            None => "No project detected here.
+s: scan / open in a project"
+                .into(),
         }
     };
     let mut cleanup = vec![cleanup];
@@ -6253,9 +6260,10 @@ fn dashboard_cards(app: &App) -> [(&'static str, String); 4] {
             if report.cancelled { " (partial)" } else { "" }
         ),
         None if app.cache_running => "Cache inventory in progress.".into(),
-        None => "Caches: inventory not yet loaded.".into(),
+        None => "Caches: c to inspect shared caches.".into(),
     });
-    cleanup.push("Sizes are snapshots; cleanup needs a reviewed action.".into());
+    cleanup.push("s: artifacts  c: caches  d: preview within each list".into());
+    cleanup.push("Cleaning is never automatic; confirmation required.".into());
 
     let mut activity = match &app.issues {
         None => vec!["Doctor: checking…".into()],
@@ -11937,6 +11945,23 @@ pub fn run(
     )
 }
 
+/// Scan only a manifest-backed current project on first dashboard launch.
+/// No HOME-wide scan or implicit cleanup is permitted.
+fn startup_dashboard_project(
+    cwd: &std::path::Path,
+    home: Option<&std::path::Path>,
+    config: Option<&std::path::Path>,
+    profile: Option<&str>,
+) -> Option<ScanRequest> {
+    if config.is_some() || profile.is_some() {
+        return None;
+    }
+    let project = crate::sweep::nearest_project_root(cwd, home)?;
+    let (paths, exclude, age, enabled) =
+        crate::application::resolve_scan_config(None, None, &[project], &[], None).ok()?;
+    Some((paths, exclude, age, enabled, None))
+}
+
 pub(crate) fn run_with_config(
     ctx: &Ctx,
     start: Start,
@@ -12293,7 +12318,11 @@ pub(crate) fn run_with_config(
             let _ = tx.send(WorkerEvent::TrashRemovalPreview(result));
         });
     }
-    let cache_running = start == Start::Cache && shared_cache_target.is_none();
+    // An ordinary `upkit` launch shows cache inventory in the dashboard
+    // immediately, without waiting for a manual c keypress.
+    let cache_running = matches!(start, Start::Cache | Start::Dashboard)
+        && shared_cache_target.is_none()
+        && !self_update_requested;
     if cache_running {
         let cancel = cache_cancel.clone();
         let tx = tx.clone();
@@ -12309,6 +12338,21 @@ pub(crate) fn run_with_config(
             let _ = tx.send(WorkerEvent::GoTestPreview(result));
         });
     }
+    // The first dashboard view preloads a *read-only* project inventory if
+    // launched inside a known project. No saved settings or home-wide sweep.
+    let scan_request = scan_request.or_else(|| {
+        (start == Start::Dashboard && !self_update_requested)
+            .then(|| std::env::current_dir().ok())
+            .flatten()
+            .and_then(|cwd| {
+                startup_dashboard_project(
+                    &cwd,
+                    dirs::home_dir().as_deref(),
+                    config.as_deref(),
+                    profile.as_deref(),
+                )
+            })
+    });
     let scan_running = scan_request.is_some();
     let scan_progress = Arc::new(AtomicUsize::new(0));
     let cli_preview_read_only = scan_request
@@ -16235,6 +16279,61 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_autoload_scope_is_local_project_only_and_never_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let project = dir.path().join("workspace");
+        let nested = project.join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname='test'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        let scope = startup_dashboard_project(&nested, Some(&home), None, None)
+            .expect("project in the current directory is inferred without config");
+        assert_eq!(scope.0, vec![project.canonicalize().unwrap()]);
+        assert!(scope.1.is_empty());
+        assert!(
+            scope.4.is_none(),
+            "autoload must never select a cleanup target"
+        );
+        assert!(startup_dashboard_project(&home, Some(&home), None, None).is_none());
+        assert!(
+            startup_dashboard_project(&nested, Some(&home), Some(Path::new("/some/config")), None)
+                .is_none()
+        );
+        assert!(startup_dashboard_project(&nested, Some(&home), None, Some("work")).is_none());
+    }
+
+    #[test]
+    fn dashboard_cache_key_reuses_loading_or_ready_inventory() {
+        let mut app = app();
+        app.page = Start::Dashboard;
+        app.cache_running = true;
+        assert!(matches!(
+            app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+            Action::None
+        ));
+        assert!(app.page == Start::Cache);
+        assert!(app.cache_running);
+        app.page = Start::Dashboard;
+        app.cache_running = false;
+        app.cache = Some(crate::cache::CacheReport {
+            entries: vec![],
+            warnings: vec![],
+            cancelled: false,
+        });
+        assert!(matches!(
+            app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+            Action::None
+        ));
+        assert!(app.page == Start::Cache);
+        assert!(!app.cache_running);
+    }
+
+    #[test]
     fn dashboard_cache_shortcut_opens_the_screen_and_starts_inventory() {
         let mut app = app();
         app.page = Start::Dashboard;
@@ -16526,8 +16625,12 @@ mod tests {
         let output = format!("{:?}", terminal.backend().buffer());
         assert!(output.contains("Toolchains: 0/1 installed"));
         assert!(output.contains("Checking maintenance status…"));
-        assert!(output.contains("Artifacts: no scan yet"));
-        assert!(output.contains("Caches: inventory not yet loaded"));
+        // The content can scroll when a narrow card wraps. Assert the
+        // underlying quick-start guidance instead of a particular viewport.
+        let cards = dashboard_cards(&app);
+        let cleanup = &cards[2].1;
+        assert!(cleanup.contains("No project detected here."));
+        assert!(cleanup.contains("Caches: c to inspect shared caches."));
     }
 
     #[test]

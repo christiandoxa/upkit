@@ -6,7 +6,7 @@ Upkit is a standalone developer environment manager with a keyboard-first
 terminal dashboard, toolchain management, workspace artifact discovery, and
 selected maintenance operations.
 
-The stable `v0.5.1` standalone release includes the developer-environment
+The stable `v0.5.2` standalone release includes the developer-environment
 manager and Ratatui dashboard. Known quality limitations are documented in
 [CHANGELOG.md](CHANGELOG.md): measured line coverage is still **83.45%**
 against the 90% target, and interactive macOS dashboard PTY smoke remains
@@ -60,7 +60,7 @@ To install a specific release or choose a different directory:
 
 ```bash
 curl -fsSL https://github.com/christiandoxa/upkit/releases/latest/download/install.sh |
-  sh -s -- --release v0.5.0 --install-dir "$HOME/.local/bin"
+  sh -s -- --release v0.5.2 --install-dir "$HOME/.local/bin"
 ```
 
 ### Windows
@@ -82,7 +82,7 @@ To choose a release or install directory, set these variables before running
 the installer:
 
 ```powershell
-$env:UPKIT_RELEASE = 'v0.4.15'
+$env:UPKIT_RELEASE = 'v0.5.2'
 $env:UPKIT_INSTALL_DIR = "$env:LOCALAPPDATA\upkit\bin"
 irm https://github.com/christiandoxa/upkit/releases/latest/download/install.ps1 | iex
 ```
@@ -98,7 +98,7 @@ Linux binaries target glibc-based distributions.
 ### GitHub Actions
 
 ```yaml
-- uses: christiandoxa/upkit@v0.4.15
+- uses: christiandoxa/upkit@v0.5.2
   with:
     version: latest
 
@@ -130,9 +130,11 @@ old npm launcher does not take precedence on `PATH`.
 
 ## Clean build artifacts and caches without setup
 
-> **Development preview:** the `tidy` / `cleanup` commands and automatic
-> project discovery are currently available from the `master` source tree.
-> They are **not** part of the already published `v0.5.1` standalone binary.
+**Works immediately after installation:** launch `upkit` in a terminal. The
+Dashboard automatically inventories shared caches. When launched from inside
+a recognized project, it also scans local build artifacts (read-only) and
+shows the results without requiring `config init` or additional flags. Press
+`c` for cache details or `s` for project artifacts. No deletion is automatic.
 
 Run Upkit **inside a project** to detect common generated build directories and
 shared package caches, without creating a configuration file or scanning your

@@ -2373,6 +2373,15 @@ def dashboard_recent_activity_pty_test(binary):
             path.write_text(json.dumps(record))
             path.chmod(0o600)
 
+        # An ordinary `upkit` launch from a project must preload its build
+        # outputs and cache inventory without config, `s`, or `c` setup.
+        project = root / "project"
+        (project / "src").mkdir(parents=True)
+        (project / "target" / "debug").mkdir(parents=True)
+        (project / "Cargo.toml").write_text("[package]\nname = 'ootb-fixture'\nversion = '0.1.0'\n")
+        (project / "src" / "main.rs").write_text("fn main() {}\n")
+        (project / "target" / "debug" / "artifact.bin").write_bytes(b"rebuildable fixture\n")
+
         cargo_home = root / ".cargo"
         cargo_registry = cargo_home / "registry"
         cargo_registry.mkdir(parents=True, mode=0o700)
@@ -2397,6 +2406,7 @@ def dashboard_recent_activity_pty_test(binary):
             stdout=slave,
             stderr=slave,
             env=coverage_env(env),
+            cwd=project / "src",
             preexec_fn=controlling_pty_preexec(slave),
         )
         output = bytearray()
@@ -2409,12 +2419,18 @@ def dashboard_recent_activity_pty_test(binary):
                 rendered = terminal_screen_text(output, 30, 120)
                 if all(
                     marker in rendered
-                    for marker in (b"newest_operation", b"middle_operation", b"older_operation")
+                    for marker in (
+                        b"newest_operation", b"middle_operation", b"older_operation",
+                        b"Artifacts: 1 candidates", b"Caches: 1 entries",
+                    )
                 ):
                     break
             assert all(
                 marker in rendered
-                for marker in (b"newest_operation", b"middle_operation", b"older_operation")
+                for marker in (
+                    b"newest_operation", b"middle_operation", b"older_operation",
+                    b"Artifacts: 1 candidates", b"Caches: 1 entries",
+                )
             ), rendered.decode(errors="replace")
             positions = [
                 rendered.index(marker)
@@ -2423,11 +2439,14 @@ def dashboard_recent_activity_pty_test(binary):
             assert positions == sorted(positions), "recent operations are not newest-first"
             assert b"oldest_operation" not in rendered
             assert b"/private/" not in rendered
-            output.clear()
+            # Preserve the terminal's earlier frame. The dashboard now
+            # preloads cache inventory, so switching pages may emit only a
+            # small incremental Ratatui redraw instead of a full frame.
             os.write(master, b"c")
             deadline = time.monotonic() + 15
             rendered = b""
-            while b"Cargo registry: 13 B snapshot" not in rendered and time.monotonic() < deadline:
+            while (b"Cargo registry: 13 B snapshot" not in rendered
+                   or b"w: warnings" not in rendered) and time.monotonic() < deadline:
                 if select.select([master], [], [], 0.2)[0]:
                     output.extend(os.read(master, 65536))
                 rendered = terminal_screen_text(output, 30, 120)

@@ -1,6 +1,27 @@
 # Changelog
 
-## Unreleased — zero-config safe cleaning
+## 0.5.2 (2026-11-05) — stable out-of-the-box cleanup
+
+- **No setup required:** `upkit` now automatically loads the shared-cache
+  inventory in the dashboard. If launched inside a recognized project, it also
+  scans that project's rebuildable artifacts in the background, read-only.
+  No filesystem-wide or HOME-wide scan is attempted by default.
+- `c` immediately opens the cached or in-progress cache list rather than
+  starting another scan; `s` opens the current project's artifact inventory.
+  Dashboard guidance explains what to do if no project is detected.
+- Add `upkit cleanup` / `upkit tidy` for a unified, config-free inventory,
+  clear per-target eligibility, and named or path-based preview selection.
+  `upkit config show` distinguishes automatically inferred roots from saved
+  settings. Existing explicit profiles and scopes remain in effect.
+- Every removal remains **opt-in**, requires a reviewed token and approval,
+  and fails closed on uncertain Git, process, ownership, link, or mount checks.
+  Shared caches may be needed by other projects and are not removed by default.
+- Add regression and PTY fixtures covering first-run project and cache
+  discovery, incremental redraw, safe selections, and no implicit deletion.
+- **Known limitations:** line coverage has not yet reached the unchanged
+  90% target; the interactive macOS dashboard PTY smoke remains unverified on
+  release runners. Native macOS CI and binary smoke are still required.
+
 
 - Add `upkit tidy` / `upkit cleanup`: recognize the nearest manifest-backed
   project automatically, inventory rebuildable output and shared caches in a
