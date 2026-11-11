@@ -1177,6 +1177,19 @@ fn update_go_secures_legacy_group_writable_directories() {
     fs::create_dir_all(&old).unwrap();
     std::os::unix::fs::symlink(&old, root.join("active")).unwrap();
     fs::create_dir(&wrappers).unwrap();
+    for name in ["go", "gofmt"] {
+        let wrapper = wrappers.join(name);
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/usr/bin/env sh\nexport GOROOT=\"{}\"\nexec \"{}/bin/{name}\" \"$@\"\n",
+                root.join("active").display(),
+                root.join("active").display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    }
     fs::set_permissions(&root, fs::Permissions::from_mode(0o775)).unwrap();
     fs::set_permissions(&wrappers, fs::Permissions::from_mode(0o775)).unwrap();
     set_which("go", None);
@@ -1211,6 +1224,47 @@ fn update_go_secures_legacy_group_writable_directories() {
         0
     );
     assert!(ctx.bindir.join("go").exists());
+    assert!(
+        fs::read_to_string(wrappers.join("go"))
+            .unwrap()
+            .contains("GOROOT=\"")
+    );
+    let wrapper = wrappers.join("gofmt");
+    let tampered = fs::read_to_string(&wrapper)
+        .unwrap()
+        .replace("gofmt\"", "gofmx\"");
+    fs::write(&wrapper, &tampered).unwrap();
+    assert!(upkit::tools::go::ensure_go_wrappers(&ctx, &root, &root.join("active")).is_err());
+    assert_eq!(fs::read_to_string(wrapper).unwrap(), tampered);
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_go_wrapper_with_shell_expansion_is_rejected() {
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = reset_guard();
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("tool$(touch INJECTED)");
+    let root = home.join("go");
+    let active = root.join("active");
+    let wrappers = root.join("wrappers");
+    let bindir = dir.path().join("bin");
+    let ctx = base_ctx(home, bindir.clone(), Arc::new(TestPrompt::default()));
+    fs::create_dir_all(&wrappers).unwrap();
+    fs::create_dir_all(&bindir).unwrap();
+    secure_fixture_dir(&root);
+    secure_fixture_dir(&wrappers);
+    let wrapper = wrappers.join("go");
+    let legacy = format!(
+        "#!/usr/bin/env sh\nexport GOROOT=\"{}\"\nexec \"{}/bin/go\" \"$@\"\n",
+        active.display(),
+        active.display()
+    );
+    fs::write(&wrapper, &legacy).unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(upkit::tools::go::ensure_go_wrappers(&ctx, &root, &active).is_err());
+    assert_eq!(fs::read_to_string(wrapper).unwrap(), legacy);
+    assert!(!dir.path().join("INJECTED").exists());
 }
 
 #[test]

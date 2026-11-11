@@ -6,7 +6,7 @@ Upkit is a standalone developer environment manager with a keyboard-first
 terminal dashboard, toolchain management, workspace artifact discovery, and
 selected maintenance operations.
 
-The stable `v0.5.3` standalone release includes the developer-environment
+The stable `v0.5.4` standalone release includes the developer-environment
 manager and Ratatui dashboard. Known quality limitations are documented in
 [CHANGELOG.md](CHANGELOG.md): measured line coverage is still **83.45%**
 against the 90% target, and interactive macOS dashboard PTY smoke remains
@@ -60,7 +60,7 @@ To install a specific release or choose a different directory:
 
 ```bash
 curl -fsSL https://github.com/christiandoxa/upkit/releases/latest/download/install.sh |
-  sh -s -- --release v0.5.3 --install-dir "$HOME/.local/bin"
+  sh -s -- --release v0.5.4 --install-dir "$HOME/.local/bin"
 ```
 
 ### Windows
@@ -82,7 +82,7 @@ To choose a release or install directory, set these variables before running
 the installer:
 
 ```powershell
-$env:UPKIT_RELEASE = 'v0.5.3'
+$env:UPKIT_RELEASE = 'v0.5.4'
 $env:UPKIT_INSTALL_DIR = "$env:LOCALAPPDATA\upkit\bin"
 irm https://github.com/christiandoxa/upkit/releases/latest/download/install.ps1 | iex
 ```
@@ -98,7 +98,7 @@ Linux binaries target glibc-based distributions.
 ### GitHub Actions
 
 ```yaml
-- uses: christiandoxa/upkit@v0.5.3
+- uses: christiandoxa/upkit@v0.5.4
   with:
     version: latest
 
@@ -431,8 +431,9 @@ On Linux and macOS, updates remove those write permissions from existing
 directories owned by the current user, which may affect shared installations;
 existing wrappers must be singly linked, executable, and not group/other writable.
 Linux also requires current-user ownership. Existing wrappers must match the
-current generated scripts, so older or customized wrappers may require manual
-review before updating. On Windows, Go ZIP installs link `go.exe` and
+current generated scripts or the exact legacy scripts with shell-safe paths;
+customized wrappers and unsafe legacy paths require manual review before updating.
+On Windows, Go ZIP installs link `go.exe` and
 `gofmt.exe` directly instead of creating shell wrappers; creating these links
 requires symlink permission. [Go discovers its SDK from the executable](https://go.dev/src/cmd/go/internal/cfg/cfg.go),
 but an existing `GOROOT` setting can override that discovery. Native Windows behavior

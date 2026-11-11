@@ -408,7 +408,7 @@ pub fn ensure_go_wrappers(
     }
     check_go_wrappers(tool_root, active)?;
     for name in ["go", "gofmt"] {
-        write_go_wrapper(&wrapper_dir.join(name), &go_wrapper_script(active, name)?)?;
+        write_go_wrapper(&wrapper_dir.join(name), active, name)?;
     }
     link_managed_tool_bins(
         ctx,
@@ -434,6 +434,19 @@ fn go_wrapper_script(active: &Path, name: &str) -> Result<String> {
         "#!/usr/bin/env sh\nexport GOROOT={}\nexec {} \"$@\"\n",
         quote(active)?,
         quote(&target)?
+    ))
+}
+
+fn legacy_go_wrapper_script(active: &Path, name: &str) -> Option<String> {
+    let active = active.to_str()?;
+    if active
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '"' | '$' | '`' | '\\'))
+    {
+        return None;
+    }
+    Some(format!(
+        "#!/usr/bin/env sh\nexport GOROOT=\"{active}\"\nexec \"{active}/bin/{name}\" \"$@\"\n"
     ))
 }
 
@@ -497,7 +510,11 @@ fn check_go_wrappers(tool_root: &Path, active: &Path) -> Result<()> {
         let path = dir.join(name);
         let script = go_wrapper_script(active, name)?;
         match fs::symlink_metadata(&path) {
-            Ok(_) => verify_go_wrapper(&path, script.as_bytes())?,
+            Ok(_) => verify_go_wrapper(
+                &path,
+                &script,
+                legacy_go_wrapper_script(active, name).as_deref(),
+            )?,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(err).context("inspect Go wrapper"),
         }
@@ -505,10 +522,11 @@ fn check_go_wrappers(tool_root: &Path, active: &Path) -> Result<()> {
     Ok(())
 }
 
-fn verify_go_wrapper(path: &Path, expected: &[u8]) -> Result<()> {
+fn verify_go_wrapper(path: &Path, expected: &str, legacy: Option<&str>) -> Result<()> {
     let before = fs::symlink_metadata(path).context("inspect Go wrapper")?;
-    if !before.is_file() || before.file_type().is_symlink() || before.len() != expected.len() as u64
-    {
+    let valid_len =
+        |len| len == expected.len() as u64 || legacy.is_some_and(|s| len == s.len() as u64);
+    if !before.is_file() || before.file_type().is_symlink() || !valid_len(before.len()) {
         bail!(
             "refusing to replace an unrelated Go wrapper: {}",
             path.display()
@@ -526,7 +544,7 @@ fn verify_go_wrapper(path: &Path, expected: &[u8]) -> Result<()> {
     #[cfg(not(target_os = "linux"))]
     let mut file = fs::File::open(path)?;
     let opened = file.metadata()?;
-    if !opened.is_file() || opened.len() != expected.len() as u64 {
+    if !opened.is_file() || !valid_len(opened.len()) {
         bail!("Go wrapper changed during inspection");
     }
     #[cfg(unix)]
@@ -557,9 +575,9 @@ fn verify_go_wrapper(path: &Path, expected: &[u8]) -> Result<()> {
     }
     let mut contents = Vec::new();
     (&mut file)
-        .take(expected.len() as u64 + 1)
+        .take(expected.len().max(legacy.map_or(0, str::len)) as u64 + 1)
         .read_to_end(&mut contents)?;
-    if contents != expected {
+    if contents != expected.as_bytes() && !legacy.is_some_and(|s| contents == s.as_bytes()) {
         bail!(
             "refusing to replace an unrelated Go wrapper: {}",
             path.display()
@@ -568,9 +586,16 @@ fn verify_go_wrapper(path: &Path, expected: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn write_go_wrapper(wrapper_path: &Path, script: &str) -> Result<()> {
+fn write_go_wrapper(wrapper_path: &Path, active: &Path, name: &str) -> Result<()> {
+    let script = go_wrapper_script(active, name)?;
     match fs::symlink_metadata(wrapper_path) {
-        Ok(_) => return verify_go_wrapper(wrapper_path, script.as_bytes()),
+        Ok(_) => {
+            return verify_go_wrapper(
+                wrapper_path,
+                &script,
+                legacy_go_wrapper_script(active, name).as_deref(),
+            );
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(err).context("inspect Go wrapper"),
     }

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.4 (2026-11-11) — legacy Go wrappers
+
+- Recognize intact Go wrappers created by older Upkit releases during updates.
+  Unsafe legacy shell paths and modified wrappers remain blocked for review.
+
 ## 0.5.3 (2026-11-11) — Go update permissions
 
 - Repair legacy group- or world-writable Go root and wrapper directory permissions
