@@ -1164,6 +1164,55 @@ fn update_go_sha_mismatch_and_success() {
     assert!(ctx.home.join("go").exists());
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn update_go_secures_legacy_group_writable_directories() {
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = reset_guard();
+    let (mut ctx, _dir) = ctx_with_dirs();
+    let root = ctx.home.join("go");
+    let wrappers = root.join("wrappers");
+    let old = root.join("old");
+    fs::create_dir_all(&ctx.bindir).unwrap();
+    fs::create_dir_all(&old).unwrap();
+    std::os::unix::fs::symlink(&old, root.join("active")).unwrap();
+    fs::create_dir(&wrappers).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o775)).unwrap();
+    fs::set_permissions(&wrappers, fs::Permissions::from_mode(0o775)).unwrap();
+    set_which("go", None);
+    let archive = make_go_tar_gz();
+    let json = go_json("go1.2.3", &hex::encode(Sha256::digest(&archive)));
+    let plan = || {
+        set_http_plan(
+            "https://go.dev/dl/?mode=json",
+            vec![
+                Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+                Ok(MockResponse::new(json.as_bytes().to_vec(), None)),
+            ],
+        );
+        set_http_plan(
+            "https://go.dev/dl/go1.2.3.linux-amd64.tar.gz",
+            vec![Ok(MockResponse::new(archive.clone(), None))],
+        );
+    };
+    ctx.dry_run = true;
+    plan();
+    update_go(&ctx).unwrap();
+    assert_eq!(
+        fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+        0o775
+    );
+    ctx.dry_run = false;
+    plan();
+    update_go(&ctx).unwrap();
+    assert_eq!(fs::metadata(&root).unwrap().permissions().mode() & 0o022, 0);
+    assert_eq!(
+        fs::metadata(&wrappers).unwrap().permissions().mode() & 0o022,
+        0
+    );
+    assert!(ctx.bindir.join("go").exists());
+}
+
 #[test]
 fn go_env_value_uses_env() {
     let _guard = reset_guard();

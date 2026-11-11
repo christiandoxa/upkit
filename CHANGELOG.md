@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.3 (2026-11-11) — Go update permissions
+
+- Repair legacy group- or world-writable Go root and wrapper directory permissions
+  during updates on Linux and macOS, while retaining wrapper validation.
+- Dry runs leave existing permissions unchanged. Removing write access may affect
+  users who intentionally shared these directories.
+
 ## 0.5.2 (2026-11-05) — stable out-of-the-box cleanup
 
 - **No setup required:** `upkit` now automatically loads the shared-cache

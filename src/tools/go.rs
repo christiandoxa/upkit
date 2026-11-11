@@ -161,6 +161,10 @@ pub fn update_go(ctx: &Ctx) -> Result<()> {
     let tool_root = ctx.home.join("go");
     let active = tool_root.join("active");
     crate::infrastructure::validate_active_install(&tool_root)?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if !ctx.dry_run && ctx.os != "windows" && tool_root.exists() {
+        secure_go_directories(ctx, &tool_root)?;
+    }
     if tool_root.exists() && active.exists() {
         ensure_go_wrappers(ctx, &tool_root, &active)?;
     }
@@ -253,6 +257,42 @@ pub fn update_go(ctx: &Ctx) -> Result<()> {
     }
 
     info(ctx, format!("go updated to {}", latest));
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn secure_go_directories(ctx: &Ctx, tool_root: &Path) -> Result<()> {
+    use rustix::fs::{Mode, OFlags, fchmod, fstat, open, openat};
+    use rustix::io::Errno;
+
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let root = open(tool_root, flags, Mode::empty()).context("open Go tool root")?;
+    let secure = |fd: &rustix::fd::OwnedFd, path: &Path| -> Result<()> {
+        let stat = fstat(fd)?;
+        if stat.st_uid != rustix::process::geteuid().as_raw() {
+            bail!(
+                "Go directory must be owned by the current user: {}",
+                path.display()
+            );
+        }
+        if stat.st_mode & 0o022 != 0 {
+            fchmod(fd, Mode::from_raw_mode(stat.st_mode & !0o022))?;
+            warn(
+                ctx,
+                format!(
+                    "Removed group/other write permission from {}",
+                    path.display()
+                ),
+            );
+        }
+        Ok(())
+    };
+    secure(&root, tool_root)?;
+    match openat(&root, "wrappers", flags, Mode::empty()) {
+        Ok(wrappers) => secure(&wrappers, &tool_root.join("wrappers"))?,
+        Err(Errno::NOENT) => {}
+        Err(err) => return Err(err).context("open Go wrapper directory"),
+    }
     Ok(())
 }
 
